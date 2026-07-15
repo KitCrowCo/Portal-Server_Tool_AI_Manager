@@ -30,15 +30,23 @@ def _base(conn) -> str:
     v = conn.get("values",{})
     return f"{'https' if v.get('tls') else 'http'}://{v.get('host','127.0.0.1')}:{v.get('port', 11434)}{v.get('base_path','')}"
 
-def list_models_sync(conn) -> list:
-    with httpx.Client(timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)) as c:
-        r = c.get(f"{_base(conn)}/api/tags")
-        return sorted(m["name"] for m in r.json().get("models",[])) if r.status_code==200 else []
-
 async def list_models_async(conn) -> list:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=4.0, read=8.0, write=4.0, pool=4.0)) as c:
-        r = await c.get(f"{_base(conn)}/api/tags")
-        return sorted(m["name"] for m in r.json().get("models",[])) if r.status_code==200 else []
+    if not conn: return []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=4.0, read=8.0, write=4.0, pool=4.0)) as c:
+            r = await c.get(f"{_base(conn)}/api/tags")
+            return sorted(m["name"] for m in r.json().get("models",[])) if r.status_code==200 else []
+    except Exception:
+        return []  # unreachable backend is an external failure, not a program bug - caller shows an empty list and lets the user pick another connection
+
+def list_models_sync(conn) -> list:
+    if not conn: return []
+    try:
+        with httpx.Client(timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)) as c:
+            r = c.get(f"{_base(conn)}/api/tags")
+            return sorted(m["name"] for m in r.json().get("models",[])) if r.status_code==200 else []
+    except Exception:
+        return []
 
 def tok_estimate(text: str) -> int: return max(1, len(str(text)) // 4) # Fast 4-chars-per-token estimate for English prose.
 

@@ -10,12 +10,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-# import sys, os
-# sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from flow import Flow
 from steps import get_step_type
-# from .flow import Flow
-# from .steps import get_step_type
 
 ENV: dict = {}
 PIPE_DIR = Path("./data/ai_manager/pipelines")
@@ -34,6 +30,7 @@ def load_pipeline(pid: str) -> Optional[dict]: p = _pdp(pid); return json.loads(
 def save_pipeline(doc: dict): doc["modified"] = datetime.utcnow().isoformat(); _pdp(doc["id"]).write_text(json.dumps(doc, indent=2))
 def list_pipelines(tag: str = None) -> list: return [p for p in (json.loads(f.read_text()) for f in sorted(PIPE_DIR.glob("*.json"))) if not tag or tag in p.get("tags", [])]
 def new_pipeline(owner: str, name: str = "New Pipeline") -> dict: return {"id": f"pl_{uuid.uuid4().hex[:10]}", "name": name, "owner": owner, "tags": [], "flow": Flow().to_dict(), "created": datetime.utcnow().isoformat()}
+def delete_pipeline(pid: str): _pdp(pid).unlink(missing_ok=True)
 
 # -- Jobs --
 
