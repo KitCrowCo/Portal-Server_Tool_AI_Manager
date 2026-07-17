@@ -10,8 +10,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from flow import Flow
-from steps import get_step_type
+from tools.ai_manager.flow import Flow
+from tools.ai_manager.steps import get_step_type
 
 ENV: dict = {}
 PIPE_DIR = Path("./data/ai_manager/pipelines")
@@ -52,7 +52,7 @@ class StepContext:
     async def push(self, event: str, payload: dict): await ENV["push_to_client"](self.username, {"t": "pipeline_event", "job_id": self.job_id, "event": event, "payload": payload})
     async def stream(self, key: str, delta: str): await ENV["push_to_client"](self.username, {"t": "pipeline_stream", "job_id": self.job_id, "key": key, "delta": delta})
 
-def submit(username: str, kind: str = "id", pipeline_id: str = "", inline_flow: dict = None, inputs: dict = None, allowed_tags: list = None, allowed_ids: list = None) -> tuple:
+def submit(username: str, kind: str = "id", pipeline_id: str = "", inline_flow: dict = None, inputs: dict = None, allowed_tags: list = None, allowed_ids: list = None, extra_config: dict = None) -> tuple:
     if kind == "id":
         pdef = load_pipeline(pipeline_id)
         if not pdef: return None, "pipeline not found"
@@ -62,6 +62,9 @@ def submit(username: str, kind: str = "id", pipeline_id: str = "", inline_flow: 
     else:
         flow_data = inline_flow
         if not flow_data: return None, "no inline flow provided"
+
+    if extra_config:  # merged at execution time only - never persisted back into the saved pipeline definition
+        for n in flow_data.get("nodes", []): n.setdefault("config", {}).update(extra_config)
 
     job_id = f"job_{uuid.uuid4().hex[:10]}"
     job = {"id": job_id, "username": username, "flow": flow_data, "status": "queued", "scratch": {"input": (inputs or {}).get("input", "")}, "log": [], "created": datetime.utcnow().isoformat()}

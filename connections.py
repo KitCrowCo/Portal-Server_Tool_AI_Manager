@@ -27,8 +27,19 @@ def get_conn(conn_id="", conn_type="ollama"):
     return next(iter(list_conns(conn_type)), None)
 
 def _base(conn) -> str:
-    v = conn.get("values",{})
-    return f"{'https' if v.get('tls') else 'http'}://{v.get('host','127.0.0.1')}:{v.get('port', 11434)}{v.get('base_path','')}"
+    v = conn.get("values", {})
+    host = str(v.get("host", "127.0.0.1")).strip().rstrip("/")
+    if "://" in host: return f"{host}{v.get('base_path','')}"  # full origin pasted directly
+    has_port = ":" in host
+    scheme = "https" if v.get("tls") else "http"
+    port = "" if has_port else (f":{v['port']}" if v.get("port") else "")
+    base_path = str(v.get("base_path", "")).strip()
+    if base_path and not base_path.startswith("/"): base_path = "/" + base_path
+    return f"{scheme}://{host}{port}{base_path}"
+
+# def _base(conn) -> str:
+#     v = conn.get("values",{})
+#     return f"{'https' if v.get('tls') else 'http'}://{v.get('host','127.0.0.1')}:{v.get('port', 11434)}{v.get('base_path','')}"
 
 async def list_models_async(conn) -> list:
     if not conn: return []

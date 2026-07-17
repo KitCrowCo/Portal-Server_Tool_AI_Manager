@@ -8,30 +8,38 @@ import sys, os
 from pathlib import Path
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-import engine
-import steps
-from connections import list_conns, get_conn, list_models_async
+from tools.ai_manager import engine
+from tools.ai_manager import steps
+# from tools.ai_manager.connections import list_conns, get_conn, list_models_async, conn_opts_html, _base,
+from tools.ai_manager import connections
 
 TOOL_META = {"label": "AI Manager", "icon": "&#x1F9E0;", "description": "Centralized AI connections, steps, and pipeline execution"}
 router = APIRouter()
 _P = "/tool/ai_manager"
 TOOL_ROOT = Path("./data/ai_manager/_selftest")
+PROMPT_BLOCKS_PATH = Path("./data/ai_manager/prompt_blocks.json")
 
-ENV, UI, BI, FM = {}, None, None, None
+ENV = globals().get("ENV", {})
+UI = globals().get("UI", None)
+BI = globals().get("BI", None)
+FM = globals().get("FM", None)
+_PB = globals().get("_PB", None)
 
 def init_module(env: dict):
-    global ENV, UI, BI, CM, FM
+    global ENV, UI, BI, FM, _PB
     ENV.update(env)
     UI = ENV["templates"].env.globals.get("UI")
     BI = ENV["tools"]["built_ins"]
     FM = BI.FileManager(TOOL_ROOT)
+    _PB = BI.PromptBlockLibrary(PROMPT_BLOCKS_PATH)
     engine.init(env)
     steps.init(env)
     steps.register_builtins()
     print(f"[ai_manager] ready | step types: {[s['type'] for s in steps.list_step_types()]}")
 
 def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
+
+def prompt_block_picker_fragment(textarea_id: str) -> str: return BI.prompt_block_picker_html(_PB, textarea_id, f"{_P}/prompt_blocks/save")
 
 # -- Pipeline CRUD (consumed by Tessa's builder; kept here since ai_manager owns the data) --
 
@@ -56,6 +64,17 @@ async def api_job_status(job_id: str): return JSONResponse(engine.load_job(job_i
 
 @router.post("/job/{job_id}/stop", response_class=JSONResponse)
 async def api_job_stop(job_id: str): engine.stop(job_id); return JSONResponse({"status": "stopping"})
+
+@router.post("/prompt_blocks/save", response_class=HTMLResponse)
+async def prompt_blocks_save(name: str = Form(...), text: str = Form(...), target: str = Form(...)):
+    _PB.save(name, text)
+    return HTMLResponse(BI.prompt_block_picker_html(_PB, target, f"{_P}/prompt_blocks/save"))
+
+@router.get("/prompt_blocks", response_class=JSONResponse)
+async def prompt_blocks_list(): return JSONResponse(_PB.list())
+
+@router.delete("/prompt_blocks/{block_id}", response_class=JSONResponse)
+async def prompt_blocks_delete(block_id: str): _PB.delete(block_id); return JSONResponse({"status": "ok"})
 
 # -- Simple Chat (working demonstration: chat with an optional attached knowledge base) --
 # This is intentionally minimal - a 1-or-2-node inline Flow, not a saved pipeline, not routed through Tessa/Kimi UI.
@@ -116,8 +135,6 @@ async def chat_page(request: Request):
                                 </script>
                             </div>""")
 
-# document.getElementById('chat-conn').dispatchEvent(new Event('change'));
-
 @router.get("/chat/models", response_class=HTMLResponse)
 async def chat_models(conn_id: str = ""):
     conn = get_conn(conn_id)
@@ -134,9 +151,7 @@ async def chat_send(request: Request, conn_id: str = Form(...), model: str = For
                                                                                            "system_prompt": "Use the retrieved context if relevant to answer the user's question." if kg_id else "",
                                                                                            "user_template": ("Context:\n{kq.kg_context}\n\nQuestion: {input}" if kg_id else "{input}")}}
     flow["nodes"].append(chat_node)
-    print("***************************************************", flow)
     job_id, err = engine.submit(username=user.username, kind="inline", inline_flow=flow, inputs={"input": text})
-    print("***************************************************", job_id, err)
     if err: return JSONResponse({"error": err}, status_code=400)
     return JSONResponse({"job_id": job_id})
 
@@ -150,6 +165,10 @@ async def selftest(request: Request):
     job_id, err = engine.submit(request.state.user.username, kind="inline", inline_flow=flow, inputs={"input": "hello"})
     if err: return JSONResponse({"error": err}, status_code=400)
     return JSONResponse({"job_id": job_id, "poll": f"{_P}/job/{job_id}"})
+
+# ai_manager.py — add a plain query-param job-status route (the existing one is path-param only)
+@router.get("/job_status", response_class=JSONResponse)
+async def job_status_qs(job_id: str): return JSONResponse(engine.load_job(job_id) or {"error": "not found"})
 
 # --- Shadow Memory ---
 

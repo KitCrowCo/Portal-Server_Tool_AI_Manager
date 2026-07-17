@@ -4,7 +4,7 @@ The engine never special-cases behavior; it only sequences and reports.
 Config values may reference upstream results with {node_id.key} templating, resolved by ctx.resolve() before the step runs - keeps step implementations free of graph-walking logic."""
 
 import httpx, re, json
-from connections import get_conn, lightrag_query, lightrag_insert_text, _base
+from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, _base
 
 _STEP_TYPES: dict = {}
 ENV: dict = {}
@@ -62,6 +62,7 @@ def register_builtins():
     register_step_type("knowledge_insert_text", step_knowledge_insert_text, "Knowledge Insert Text", {"conn_id": "select", "text_template": "textarea", "source_label": "text"})
     register_step_type("echo", step_echo, "Echo / Passthrough", {"template": "textarea", "result_key": "text"})
     register_step_type("file_write", step_file_write, "File Write (shadow-staged)", {"fm_root": "text", "shadow_dir": "text", "path": "text", "content_key": "text", "auto_accept": "checkbox"})
+    register_step_type("python_exec", step_python_exec, "Python Script (deterministic)", {"script_path": "text", "input_template": "textarea", "timeout_s": "number", "result_key": "text"})
 
 async def step_echo(config: dict, ctx) -> dict:
     """No-op passthrough: resolves its template against current scratch and returns it under result_key.
@@ -84,3 +85,29 @@ async def step_file_write(config: dict, ctx) -> dict:
     result_key = config.get("result_key", "file_write")
     ctx.scratch[result_key] = {"path": rel_path, "status": entry["status"]}
     return ctx.scratch[result_key]
+
+# steps.py — add to imports
+import sys, asyncio, uuid   # uuid was already used in step_image_generate but never imported - real bug, fixed here too
+
+async def step_python_exec(config: dict, ctx) -> dict:
+    """Runs a local script for deterministic processing an LLM shouldn't be doing (bulk file ops, exact formatting, upload workflows).
+    script_path only, never inline code - keeps this auditable and grep-able.
+    Contract: script receives one resolved argv string; must print a single line of JSON to stdout as its result (or nothing, for pure side-effect scripts).
+    Non-zero exit or timeout raises, with stderr surfaced in the error message."""
+    script_path = config.get("script_path", "")
+    if not script_path or not Path(script_path).is_file(): raise RuntimeError(f"python_exec: script not found: {script_path}")
+    arg = ctx.resolve(config.get("input_template", "{input}"))
+    timeout_s = int(config.get("timeout_s", 120) or 120)
+    proc = await asyncio.create_subprocess_exec(sys.executable, str(script_path), arg,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try: stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        proc.kill(); await proc.communicate()
+        raise RuntimeError(f"python_exec: timed out after {timeout_s}s")
+    if proc.returncode != 0: raise RuntimeError(f"python_exec: exit {proc.returncode}\n{stderr.decode(errors='replace')[-1000:]}")
+    out = stdout.decode(errors="replace").strip()
+    try: parsed = json.loads(out.splitlines()[-1]) if out else {}
+    except Exception: parsed = {"raw_stdout": out[-2000:]}
+    result_key = config.get("result_key", "python_exec")
+    ctx.scratch[result_key] = parsed
+    return {result_key: parsed}
