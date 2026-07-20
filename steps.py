@@ -4,6 +4,7 @@ The engine never special-cases behavior; it only sequences and reports.
 Config values may reference upstream results with {node_id.key} templating, resolved by ctx.resolve() before the step runs - keeps step implementations free of graph-walking logic."""
 
 import httpx, re, json
+from pathlib import Path
 from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, _base
 
 _STEP_TYPES: dict = {}
@@ -61,9 +62,10 @@ def register_builtins():
     register_step_type("knowledge_query", step_knowledge_query, "Knowledge Query", {"conn_id": "select", "mode": "select", "query_template": "textarea", "result_key": "text"})
     register_step_type("knowledge_insert_text", step_knowledge_insert_text, "Knowledge Insert Text", {"conn_id": "select", "text_template": "textarea", "source_label": "text"})
     register_step_type("echo", step_echo, "Echo / Passthrough", {"template": "textarea", "result_key": "text"})
-    register_step_type("file_write", step_file_write, "File Write (shadow-staged)", {"fm_root": "text", "shadow_dir": "text", "path": "text", "content_key": "text", "auto_accept": "checkbox"})
+    register_step_type("file_write", step_file_write, "File Write (shadow-staged)", {"fm_root": "text", "shadow_dir": "text", "path": "text", "content_key": "text"})
     register_step_type("python_exec", step_python_exec, "Python Script (deterministic)", {"script_path": "text", "input_template": "textarea", "timeout_s": "number", "result_key": "text"})
-
+    register_step_type("file_write_binary", step_file_write_binary, "File Write Binary (shadow-staged)", {"fm_root":"text","shadow_dir":"text","path":"text","content_key":"text","source_root":"text","result_key":"text"})
+    
 async def step_echo(config: dict, ctx) -> dict:
     """No-op passthrough: resolves its template against current scratch and returns it under result_key.
     Zero external dependencies - used for engine self-tests and as a manual inspection/breakpoint node when building real pipelines."""
@@ -74,12 +76,12 @@ async def step_echo(config: dict, ctx) -> dict:
     return {result_key: value}
 
 async def step_file_write(config: dict, ctx) -> dict:
-    """Writes pipeline output through a ShadowStore rather than straight to disk - every pipeline-driven file mutation is reversible and reviewable by default.
-    config: fm_root, shadow_dir (defaults to fm_root/_shadow), path (template), content_key (scratch key holding the text to write), auto_accept (bool, per-step override)."""
     bi = ENV["tools"]["built_ins"]
-    fm = bi.FileManager(config["fm_root"])
-    shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(config["fm_root"]) / "_shadow"), auto_accept=config.get("auto_accept", False))
-    rel_path = ctx.resolve(config["path"])
+    fm_root = config.get("fm_root") or "./data/_common"
+    fm = bi.FileManager(fm_root)
+    shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(fm_root) / "_shadow"))
+    rel_path = ctx.resolve(config.get("path") or "")
+    if not rel_path.strip(): raise RuntimeError("file_write: resolved path is empty - check this node's Location/filename fields")
     content = ctx.scratch.get(config.get("content_key", "answer"), "")
     entry = shadow.stage(rel_path, content, author=f"pipeline:{ctx.job_id}")
     result_key = config.get("result_key", "file_write")
@@ -111,3 +113,18 @@ async def step_python_exec(config: dict, ctx) -> dict:
     result_key = config.get("result_key", "python_exec")
     ctx.scratch[result_key] = parsed
     return {result_key: parsed}
+
+async def step_file_write_binary(config: dict, ctx) -> dict:
+    bi = ENV["tools"]["built_ins"]
+    fm_root = config.get("fm_root") or "./data/_common"
+    fm = bi.FileManager(fm_root)
+    shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(fm_root) / "_shadow"))
+    src = ctx.scratch.get(config.get("content_key", "image_file"), {})
+    source_path = Path(config.get("source_root") or ".") / (src.get("file_name") or "")
+    if not source_path.is_file(): raise RuntimeError(f"file_write_binary: source not found: {source_path}")
+    rel_path = ctx.resolve(config.get("path") or "")
+    if not rel_path.strip(): raise RuntimeError("file_write_binary: resolved path is empty - check this node's Location/filename fields")
+    entry = shadow.stage_binary(rel_path, source_path.read_bytes(), author=f"pipeline:{ctx.job_id}")
+    result_key = config.get("result_key", "file_write_binary")
+    ctx.scratch[result_key] = {"path": rel_path, "status": entry["status"]}
+    return ctx.scratch[result_key]

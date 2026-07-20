@@ -1,6 +1,6 @@
 #tools/ai_manager
 """
-ai_manager — sole centralized tool for AI operations. Owns connections, the step registry, and pipeline execution. 
+ai_manager — sole centralized tool for AI operations. Owns connections, the step registry, and pipeline execution.
 modules/ai_tools/* (Athena, Kimi, Tessa, Image) are UI surfaces that call into this tool directly (ENV["tools"]["ai_manager"]);
 they never hold their own connections or execution loops - avoids the race conditions of tools calling other tools.
 """
@@ -10,7 +10,6 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from tools.ai_manager import engine
 from tools.ai_manager import steps
-# from tools.ai_manager.connections import list_conns, get_conn, list_models_async, conn_opts_html, _base,
 from tools.ai_manager import connections
 
 TOOL_META = {"label": "AI Manager", "icon": "&#x1F9E0;", "description": "Centralized AI connections, steps, and pipeline execution"}
@@ -24,6 +23,11 @@ UI = globals().get("UI", None)
 BI = globals().get("BI", None)
 FM = globals().get("FM", None)
 _PB = globals().get("_PB", None)
+_NAMED_ROOTS = {"common": "./data/_common"}
+
+def register_root(name: str, path: str): _NAMED_ROOTS[name] = path
+def resolve_root(name: str) -> str: return _NAMED_ROOTS.get(name, name)
+def list_roots() -> list: return list(_NAMED_ROOTS.items())
 
 def init_module(env: dict):
     global ENV, UI, BI, FM, _PB
@@ -38,10 +42,7 @@ def init_module(env: dict):
     print(f"[ai_manager] ready | step types: {[s['type'] for s in steps.list_step_types()]}")
 
 def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
-
 def prompt_block_picker_fragment(textarea_id: str) -> str: return BI.prompt_block_picker_html(_PB, textarea_id, f"{_P}/prompt_blocks/save")
-
-# -- Pipeline CRUD (consumed by Tessa's builder; kept here since ai_manager owns the data) --
 
 @router.get("/pipelines", response_class=JSONResponse)
 async def api_list_pipelines(tag: str = None): return JSONResponse(engine.list_pipelines(tag))
@@ -88,9 +89,9 @@ async def chat_page(request: Request):
     Deliberately bypasses IM/im-in and ChatManager so failures are visible at the protocol level (raw POST payload, raw job_id, raw WS event stream) instead of hidden behind abstraction.
     Real chat surfaces (Athena, Tessa) use ChatManager.
     """
-    conns = list_conns()
+    conns = connections.list_conns()
     conn_opts = "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in conns)
-    kg_opts = '<option value="">(no knowledge base)</option>' + "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in list_conns(conn_type="lightrag"))
+    kg_opts = '<option value="">(no knowledge base)</option>' + "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in connections.list_conns(conn_type="lightrag"))
     return HTMLResponse(f"""<div style="max-width:60rem; margin:0 auto; padding:1.5rem; display:flex; flex-direction:column; gap:.6rem; height:100%; box-sizing:border-box">
                                 <div style="display:flex;gap:.5rem">
                                     <select id="chat-conn" name="conn_id" class="module-select" style="flex:1; margin:0" hx-get="{_P}/chat/models" hx-trigger="load, change" hx-target="#chat-model" hx-swap="innerHTML" hx-include="this">{conn_opts}</select>
@@ -137,8 +138,8 @@ async def chat_page(request: Request):
 
 @router.get("/chat/models", response_class=HTMLResponse)
 async def chat_models(conn_id: str = ""):
-    conn = get_conn(conn_id)
-    models = await list_models_async(conn) if conn else []
+    conn = connections.get_conn(conn_id)
+    models = await connections.list_models_async(conn) if conn else []
     opts = "".join(f'<option value="{m}">{m}</option>' for m in models) or '<option value="">(no models found)</option>'
     return HTMLResponse(opts)
 
@@ -166,7 +167,8 @@ async def selftest(request: Request):
     if err: return JSONResponse({"error": err}, status_code=400)
     return JSONResponse({"job_id": job_id, "poll": f"{_P}/job/{job_id}"})
 
-# ai_manager.py — add a plain query-param job-status route (the existing one is path-param only)
+def job_status_url(job_id: str = "") -> str: return f"{_P}/job_status?job_id={job_id}"
+
 @router.get("/job_status", response_class=JSONResponse)
 async def job_status_qs(job_id: str): return JSONResponse(engine.load_job(job_id) or {"error": "not found"})
 
@@ -176,7 +178,6 @@ async def job_status_qs(job_id: str): return JSONResponse(engine.load_job(job_id
 async def shadow_selftest(request: Request):
     """Proves ShadowStore stage/diff/accept/reject/rollback independent of git or any AI call.
     Writes into a scratch folder under data/ai_manager/_selftest so it never touches real project files."""
-    global BI, FM
     shadow = BI.ShadowStore(fm, root / "_shadow")
     FM.write("note.txt", "original line one\noriginal line two\n")
     entry = shadow.stage("note.txt", "original line one\nCHANGED line two\nnew line three\n", author="selftest")
