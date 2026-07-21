@@ -172,6 +172,18 @@ def job_status_url(job_id: str = "") -> str: return f"{_P}/job_status?job_id={jo
 @router.get("/job_status", response_class=JSONResponse)
 async def job_status_qs(job_id: str): return JSONResponse(engine.load_job(job_id) or {"error": "not found"})
 
+@router.get("/pipelines/{pid}/export", response_class=JSONResponse)
+async def export_pipeline(pid: str):
+    pdef = engine.load_pipeline(pid)
+    return JSONResponse(pdef) if pdef else JSONResponse({"error": "not found"}, status_code=404)
+
+@router.post("/pipelines/import", response_class=JSONResponse)
+async def import_pipeline(request: Request):
+    doc = await request.json()
+    doc["id"] = f"pl_{uuid.uuid4().hex[:10]}"  # always a new id - import never silently overwrites an existing pipeline
+    engine.save_pipeline(doc)
+    return JSONResponse({"id": doc["id"]})
+
 # --- Shadow Memory ---
 
 @router.post("/_shadow_selftest", response_class=JSONResponse)

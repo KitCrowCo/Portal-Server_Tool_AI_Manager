@@ -54,7 +54,10 @@ def _reconcile_stale_jobs():
         except Exception: continue
 
 class StepContext:
-    def __init__(self, job_id, username, scratch): self.job_id, self.username, self.scratch = job_id, username, scratch
+    def __init__(self, job_id, username, scratch):
+        self.job_id, self.username, self.scratch = job_id, username, scratch
+    async def progress(self, message: str):
+        if self.node_id: await self.set_node_status(self.node_id, "running", {"message": message})
     def resolve(self, template) -> str:
         """Must never return or propagate None - a template that is missing, None, or not a string always resolves to an empty string rather than crashing something two calls away."""
         if not isinstance(template, str): template = "" if template is None else str(template)
@@ -76,6 +79,7 @@ class StepContext:
         _save_job(job)
         await ENV["push_to_client"](self.username, {"t": "pipeline_event", "job_id": self.job_id, "event": status, "payload": {"node": node_id, **(extra or {})}})
     async def stream(self, key, delta): await ENV["push_to_client"](self.username, {"t": "pipeline_stream", "job_id": self.job_id, "key": key, "delta": delta})
+    async def push(self, event: str, payload: dict): await ENV["push_to_client"](self.username, {"t": "pipeline_event", "job_id": self.job_id, "event": event, "payload": payload})
 
 def _done_set(flow: dict) -> set: return {n["id"] for n in flow["nodes"] if n.get("status") == "done"}
 
@@ -147,6 +151,7 @@ async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> set:
                 else:
                     spec = get_step_type(nd.get("type", ""))
                     if not spec: raise RuntimeError(f"unknown step type: {nd.get('type')}")
+                    ctx.node_id = nd["id"]
                     result = await spec["fn"](nd.get("config", {}), ctx)
                 ctx.scratch[nd["id"]] = result
                 preview = {k: str(v)[:100] for k, v in (result or {}).items()}
@@ -156,7 +161,6 @@ async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> set:
                 await ctx.set_node_status(nd["id"], "error", {"message": str(e)})
                 raise
             return nd["id"]
-
         try:
             results = await asyncio.gather(*[run_one(n) for n in wave])
             done.update(results)
@@ -202,7 +206,7 @@ def _task_exception_logger(task: asyncio.Task):
     if task.cancelled(): return
     exc = task.exception()
     if exc: logger.error("Unhandled exception in pipeline job task", exc_info=exc)
-    
+
 async def set_node_status(self, node_id: str, status: str, extra: dict = None):
     job = load_job(self.job_id)
     if not job: return
@@ -217,3 +221,24 @@ async def set_node_status(self, node_id: str, status: str, extra: dict = None):
     job["heartbeat"] = time.time()
     _save_job(job)
     await ENV["push_to_client"](self.username, {"t": "pipeline_event", "job_id": self.job_id, "event": status, "payload": {"node": node_id, **(extra or {})}})
+
+async def run_inline(username: str, pipeline_id: str, inputs: dict = None, extra_config: dict = None, depth: int = 0) -> dict:
+    """Runs a saved pipeline to completion and returns its final scratch - used by call_pipeline/foreach/branch_on to compose pipelines together.
+    Depth guards against runaway self-referential recursion (a pipeline that calls itself via branch_on)."""
+    if depth > 20: raise RuntimeError("run_inline: max pipeline call depth (20) exceeded - likely an unbounded recursive branch_on")
+    pdef = load_pipeline(pipeline_id)
+    if not pdef: raise RuntimeError(f"run_inline: pipeline not found: {pipeline_id}")
+    flow_data = json.loads(json.dumps(pdef["flow"]))
+    for n in flow_data.get("nodes", []): n["status"] = "idle"; n.pop("ts", None); n.pop("preview", None); n.pop("message", None)
+    merged = {**(extra_config or {}), "_call_depth": depth + 1}
+    for n in flow_data.get("nodes", []): n.setdefault("config", {}).update(merged)
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    job = {"id": job_id, "username": username, "flow": flow_data, "status": "running", "scratch": {"input": (inputs or {}).get("input", "")}, "log": [], "heartbeat": time.time(), "created": datetime.utcnow().isoformat()}
+    _save_job(job)
+    ctx = StepContext(job_id, username, job["scratch"])
+    await _run_flow(flow_data, ctx, job_id)
+    job = load_job(job_id)
+    job["scratch"] = ctx.scratch
+    job["status"] = "error" if any(n.get("status") == "error" for n in flow_data["nodes"]) else "done"
+    _save_job(job)
+    return ctx.scratch

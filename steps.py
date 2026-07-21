@@ -3,9 +3,10 @@
 The engine never special-cases behavior; it only sequences and reports.
 Config values may reference upstream results with {node_id.key} templating, resolved by ctx.resolve() before the step runs - keeps step implementations free of graph-walking logic."""
 
-import httpx, re, json
+import httpx, re, json, sys, asyncio, uuid
 from pathlib import Path
 from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, _base
+from tools.ai_manager import engine
 
 _STEP_TYPES: dict = {}
 ENV: dict = {}
@@ -65,7 +66,13 @@ def register_builtins():
     register_step_type("file_write", step_file_write, "File Write (shadow-staged)", {"fm_root": "text", "shadow_dir": "text", "path": "text", "content_key": "text"})
     register_step_type("python_exec", step_python_exec, "Python Script (deterministic)", {"script_path": "text", "input_template": "textarea", "timeout_s": "number", "result_key": "text"})
     register_step_type("file_write_binary", step_file_write_binary, "File Write Binary (shadow-staged)", {"fm_root":"text","shadow_dir":"text","path":"text","content_key":"text","source_root":"text","result_key":"text"})
-    
+    register_step_type("call_pipeline", step_call_pipeline, "Call Another Pipeline", {"pipeline_id": "pipeline_select", "input_template": "textarea", "result_key": "text"})
+    register_step_type("foreach_call_pipeline", step_foreach_call_pipeline, "For Each Item, Call Pipeline", {"items_source": "text", "pipeline_id": "pipeline_select", "result_key": "text"})
+    register_step_type("chat", step_chat, "Chat Completion", {"conn_id":"select","model":"select","model_ctx":"number","temperature":"number","system_prompt":"textarea","user_template":"textarea","result_key":"text"})
+    register_step_type("decision", step_decision, "Decision / Gate", {"conn_id":"select","model":"select","model_ctx":"number","options":"text","system_prompt":"textarea","user_template":"textarea","result_key":"text"})
+    register_step_type("branch_on", step_branch_on, "Branch On Decision", {"decision_key":"text","routes_json":"textarea","default_pipeline_id":"pipeline_select","input_template":"textarea","result_key":"text"})
+    register_step_type("edit_in_place", step_edit_in_place, "Edit In Place (gap-aware)",{"conn_id": "select", "model": "select", "model_ctx": "number", "temperature": "number", "gap_marker": "text", "system_prompt": "textarea", "chunk_tokens": "number", "fm_root": "text", "shadow_dir": "text", "shadow_doc_path": "text", "result_key": "text"})
+
 async def step_echo(config: dict, ctx) -> dict:
     """No-op passthrough: resolves its template against current scratch and returns it under result_key.
     Zero external dependencies - used for engine self-tests and as a manual inspection/breakpoint node when building real pipelines."""
@@ -87,9 +94,6 @@ async def step_file_write(config: dict, ctx) -> dict:
     result_key = config.get("result_key", "file_write")
     ctx.scratch[result_key] = {"path": rel_path, "status": entry["status"]}
     return ctx.scratch[result_key]
-
-# steps.py — add to imports
-import sys, asyncio, uuid   # uuid was already used in step_image_generate but never imported - real bug, fixed here too
 
 async def step_python_exec(config: dict, ctx) -> dict:
     """Runs a local script for deterministic processing an LLM shouldn't be doing (bulk file ops, exact formatting, upload workflows).
@@ -127,4 +131,141 @@ async def step_file_write_binary(config: dict, ctx) -> dict:
     entry = shadow.stage_binary(rel_path, source_path.read_bytes(), author=f"pipeline:{ctx.job_id}")
     result_key = config.get("result_key", "file_write_binary")
     ctx.scratch[result_key] = {"path": rel_path, "status": entry["status"]}
+    return ctx.scratch[result_key]
+
+async def step_call_pipeline(config: dict, ctx) -> dict:
+    pid = config.get("pipeline_id", "")
+    if not pid: raise RuntimeError("call_pipeline: no pipeline selected")
+    depth = int(config.get("_call_depth", 0))
+    scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}")}, depth=depth)
+    result_key = config.get("result_key", "call_pipeline")
+    ctx.scratch[result_key] = scratch
+    return {result_key: scratch}
+
+async def step_foreach_call_pipeline(config: dict, ctx) -> dict:
+    """Iterates a list (from scratch, or newline-separated text) and calls the SAME saved pipeline once per item, collecting each sub-run's final scratch.
+    This is the loop primitive: e.g. one line per wiki topic -> one pipeline invocation per topic."""
+    raw = ctx.scratch.get(config.get("items_source", ""), config.get("items_source", ""))
+    if isinstance(raw, str):
+        try: items = json.loads(raw)
+        except Exception: items = [x.strip() for x in raw.split("\n") if x.strip()]
+    else: items = raw if isinstance(raw, list) else []
+    if not items: raise RuntimeError("foreach_call_pipeline: items_source resolved to an empty list")
+    pid = config.get("pipeline_id", "")
+    if not pid: raise RuntimeError("foreach_call_pipeline: no pipeline selected")
+    depth = int(config.get("_call_depth", 0))
+    results = []
+    for i, item in enumerate(items):
+        await ctx.progress(f"item {i+1}/{len(items)}: {str(item)[:60]}")
+        results.append(await engine.run_inline(ctx.username, pid, inputs={"input": str(item)}, depth=depth))
+    result_key = config.get("result_key", "foreach_results")
+    ctx.scratch[result_key] = results
+    return {result_key: results}
+
+async def _ollama_stream(conn, messages, model, num_ctx, temperature=0.3):
+    pl = {"model": model, "messages": messages, "stream": True, "options": {"num_ctx": num_ctx, "temperature": temperature}}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0)) as c:
+        async with c.stream("POST", f"{_base(conn)}/api/chat", json=pl) as resp:
+            if resp.status_code != 200: raise RuntimeError(f"HTTP {resp.status_code}")
+            async for line in resp.aiter_lines():
+                if not line: continue
+                try: chunk = json.loads(line)
+                except Exception: continue
+                text = chunk.get("message", {}).get("content", "")
+                if text: yield text
+                if chunk.get("done"): break
+
+async def step_chat(config: dict, ctx) -> dict:
+    conn = get_conn(config.get("conn_id", ""))
+    if not conn: raise RuntimeError("chat step: no connection configured")
+    model = config.get("model", "")
+    if not model: raise RuntimeError("chat step: no model configured")
+    messages = ([{"role": "system", "content": ctx.resolve(config["system_prompt"])}] if config.get("system_prompt") else [])
+    messages.append({"role": "user", "content": ctx.resolve(config.get("user_template") or "{input}")})
+    full = ""; result_key = config.get("result_key", "chat_response")
+    async for piece in _ollama_stream(conn, messages, model, config.get("model_ctx", 8192), config.get("temperature", 0.3)):
+        full += piece; await ctx.stream(result_key, piece)
+    ctx.scratch[result_key] = full
+    return {result_key: full}
+
+async def step_decision(config: dict, ctx) -> dict:
+    """Judge/gate: constrains the model to answer with exactly one of a declared set of words (e.g. 'go,redo' or 'accept,merge,retry').
+    Pair with branch_on to actually dispatch to a different pipeline based on the answer - this step only produces the decision."""
+    conn = get_conn(config.get("conn_id", "")); model = config.get("model", "")
+    if not conn or not model: raise RuntimeError("decision: connection/model required")
+    options = [o.strip() for o in (config.get("options", "go,redo") or "").split(",") if o.strip()] or ["go", "redo"]
+    sys_p = (ctx.resolve(config.get("system_prompt") or "") + f"\n\nRespond with exactly one of these words and nothing else: {', '.join(options)}").strip()
+    messages = [{"role": "system", "content": sys_p}, {"role": "user", "content": ctx.resolve(config.get("user_template") or "{input}")}]
+    full = ""
+    async for piece in _ollama_stream(conn, messages, model, config.get("model_ctx", 8192), 0.0):
+        full += piece
+    choice = next((o for o in options if o.lower() in full.lower()), options[0])
+    result_key = config.get("result_key", "decision")
+    ctx.scratch[result_key] = choice
+    return {result_key: choice}
+
+async def step_branch_on(config: dict, ctx) -> dict:
+    """Reads a scratch value (typically from a decision node) and calls the pipeline mapped to that value.
+    routes_json: {"go": "pl_xxx", "redo": "pl_yyy"}.
+    This is how a redo loop is expressed in an acyclic graph: 'redo' routes back to a pipeline that (re)does the work, rather than an actual cycle in this DAG - depth-guarded via run_inline."""
+    key = config.get("decision_key", "decision")
+    value = str(ctx.scratch.get(key, ""))
+    try: routes = json.loads(config.get("routes_json", "{}") or "{}")
+    except Exception: routes = {}
+    pid = routes.get(value) or config.get("default_pipeline_id", "")
+    if not pid: raise RuntimeError(f"branch_on: no route configured for decision value '{value}'")
+    depth = int(config.get("_call_depth", 0))
+    scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}")}, depth=depth)
+    result_key = config.get("result_key", "branch_result")
+    ctx.scratch[result_key] = scratch
+    return {result_key: scratch}
+
+# steps.py
+async def step_edit_in_place(config: dict, ctx) -> dict:
+    """True in-place chunk editing: locates a chunk by its exact current text (not by position), replaces just that span via the shadow diff/accept flow, and can detect a gap marker to switch from 'edit existing text' mode to 'write new content to fill the gap' mode, then continues editing past the gap once reached.
+    If no marker exists at all, behaves as pure open-ended continuation once the end of existing content is reached - it keeps generating additional chunks until the judge/decision step (chained after this one) reports the goal is met, rather than stopping at end-of-file."""
+    pid = config["project_id"]
+    doc = _load(pid)  # this project accessor is Tessa's own - registered via extra_config same as other tessa_* steps
+    content = doc.get("content", "")
+    marker = config.get("gap_marker", "[[GAP]]")
+    conn = get_conn(config.get("conn_id", "")); model = config.get("model", "")
+    if not conn or not model: raise RuntimeError("edit_in_place: connection/model required")
+    chunk_tokens = int(config.get("chunk_tokens", 4000))
+    before, _, after = content.partition(marker) if marker in content else (content, "", "")
+    chunks = _chunk_text(before, chunk_tokens) if before else []
+    edited = []
+    for i, chunk in enumerate(chunks):
+        await ctx.progress(f"editing chunk {i+1}/{len(chunks)}")
+        sys_p = ctx.resolve(config.get("system_prompt") or "")
+        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": f"Rewrite this passage in place - same length and content, fix grammar/flow/continuity only:\n\n{chunk}"}]
+        full = ""
+        async for piece in _ollama_stream(conn, msgs, model, config.get("model_ctx",8192), config.get("temperature",0.3)):
+            full += piece
+        edited.append(full.strip() or chunk)
+    if marker in content and after.strip():
+        # gap exists with real continuation text after it - generate filler chunks until a decision step (chained next in the pipeline) judges the gap closed. This step produces ONE filler pass per run; loop via branch_on->redo for multiple passes.
+        sys_p = ctx.resolve(config.get("system_prompt") or "")
+        fill_prompt = f"Continue the story to bridge this gap. End of text before the gap:\n\n{edited[-1][-1500:] if edited else before[-1500:]}\n\nText that must follow after your bridge:\n\n{after[:1500]}"
+        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content":fill_prompt}]
+        full = ""
+        async for piece in _ollama_stream(conn, msgs, model, config.get("model_ctx",8192), config.get("temperature",0.5)):
+            full += piece
+        new_content = "\n\n".join(edited) + "\n\n" + full.strip() + "\n\n" + after
+    elif marker in content:
+        # marker present but nothing after it - open-ended: generate one additional chunk past the existing content. Chain with decision/branch_on to keep generating.
+        sys_p = ctx.resolve(config.get("system_prompt") or "")
+        fill_prompt = f"Continue this story toward its stated goal. Existing text ends:\n\n{(edited[-1] if edited else before)[-1500:]}"
+        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content":fill_prompt}]
+        full = ""
+        async for piece in _ollama_stream(conn, msgs, model, config.get("model_ctx",8192), config.get("temperature",0.5)):
+            full += piece
+        new_content = "\n\n".join(edited) + "\n\n" + full.strip()
+    else:
+        new_content = "\n\n".join(edited) or content
+    bi = ENV["tools"]["built_ins"]
+    fm = bi.FileManager(config.get("fm_root") or "./data/_common")
+    shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(config.get("fm_root") or "./data/_common") / "_shadow"))
+    entry = shadow.stage(config.get("shadow_doc_path", f"tessa_edits/{pid}.md"), new_content, author=f"pipeline:{ctx.job_id}")
+    result_key = config.get("result_key", "edit_in_place")
+    ctx.scratch[result_key] = {"status": entry["status"], "gap_remaining": bool(marker in content and not after.strip())}
     return ctx.scratch[result_key]
