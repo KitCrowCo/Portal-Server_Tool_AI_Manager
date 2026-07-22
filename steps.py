@@ -71,7 +71,7 @@ def register_builtins():
     register_step_type("chat", step_chat, "Chat Completion", {"conn_id":"select","model":"select","model_ctx":"number","temperature":"number","system_prompt":"textarea","user_template":"textarea","result_key":"text"})
     register_step_type("decision", step_decision, "Decision / Gate", {"conn_id":"select","model":"select","model_ctx":"number","options":"text","system_prompt":"textarea","user_template":"textarea","result_key":"text"})
     register_step_type("branch_on", step_branch_on, "Branch On Decision", {"decision_key":"text","routes_json":"textarea","default_pipeline_id":"pipeline_select","input_template":"textarea","result_key":"text"})
-    register_step_type("edit_in_place", step_edit_in_place, "Edit In Place (gap-aware)",{"conn_id": "select", "model": "select", "model_ctx": "number", "temperature": "number", "gap_marker": "text", "system_prompt": "textarea", "chunk_tokens": "number", "fm_root": "text", "shadow_dir": "text", "shadow_doc_path": "text", "result_key": "text"})
+ #   register_step_type("edit_in_place", step_edit_in_place, "Edit In Place (gap-aware)",{"conn_id": "select", "model": "select", "model_ctx": "number", "temperature": "number", "gap_marker": "text", "system_prompt": "textarea", "chunk_tokens": "number", "fm_root": "text", "shadow_dir": "text", "shadow_doc_path": "text", "result_key": "text"})
 
 async def step_echo(config: dict, ctx) -> dict:
     """No-op passthrough: resolves its template against current scratch and returns it under result_key.
@@ -220,8 +220,7 @@ async def step_branch_on(config: dict, ctx) -> dict:
     ctx.scratch[result_key] = scratch
     return {result_key: scratch}
 
-# steps.py
-async def step_edit_in_place(config: dict, ctx) -> dict:
+async def notstep_edit_in_place(config: dict, ctx) -> dict:
     """True in-place chunk editing: locates a chunk by its exact current text (not by position), replaces just that span via the shadow diff/accept flow, and can detect a gap marker to switch from 'edit existing text' mode to 'write new content to fill the gap' mode, then continues editing past the gap once reached.
     If no marker exists at all, behaves as pure open-ended continuation once the end of existing content is reached - it keeps generating additional chunks until the judge/decision step (chained after this one) reports the goal is met, rather than stopping at end-of-file."""
     pid = config["project_id"]
@@ -257,7 +256,7 @@ async def step_edit_in_place(config: dict, ctx) -> dict:
         fill_prompt = f"Continue this story toward its stated goal. Existing text ends:\n\n{(edited[-1] if edited else before)[-1500:]}"
         msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content":fill_prompt}]
         full = ""
-        async for piece in _ollama_stream(conn, msgs, model, config.get("model_ctx",8192), config.get("temperature",0.5)):
+        async for piece in _ollama_stream(conn, msgs, model, config.get("model_ctx", 8192), config.get("temperature",0.5)):
             full += piece
         new_content = "\n\n".join(edited) + "\n\n" + full.strip()
     else:
