@@ -59,7 +59,7 @@ async def step_knowledge_insert_text(config: dict, ctx) -> dict:
     return await lightrag_insert_text(conn, text, config.get("source_label", ""))
 
 def register_builtins():
-    register_step_type("chat", step_chat, "Chat Completion", {"conn_id": "select", "model": "select", "system_prompt": "textarea", "user_template": "textarea", "result_key": "text"})
+    register_step_type("chat", step_chat, "Chat Completion", {"conn_id": "select", "model": "select", "model_ctx": "number", "temperature": "number", "system_prompt": "textarea", "user_template": "textarea", "result_key": "text"})
     register_step_type("knowledge_query", step_knowledge_query, "Knowledge Query", {"conn_id": "select", "mode": "select", "query_template": "textarea", "result_key": "text"})
     register_step_type("knowledge_insert_text", step_knowledge_insert_text, "Knowledge Insert Text", {"conn_id": "select", "text_template": "textarea", "source_label": "text"})
     register_step_type("echo", step_echo, "Echo / Passthrough", {"template": "textarea", "result_key": "text"})
@@ -68,10 +68,9 @@ def register_builtins():
     register_step_type("file_write_binary", step_file_write_binary, "File Write Binary (shadow-staged)", {"fm_root":"text","shadow_dir":"text","path":"text","content_key":"text","source_root":"text","result_key":"text"})
     register_step_type("call_pipeline", step_call_pipeline, "Call Another Pipeline", {"pipeline_id": "pipeline_select", "input_template": "textarea", "result_key": "text"})
     register_step_type("foreach_call_pipeline", step_foreach_call_pipeline, "For Each Item, Call Pipeline", {"items_source": "text", "pipeline_id": "pipeline_select", "result_key": "text"})
-    register_step_type("chat", step_chat, "Chat Completion", {"conn_id":"select","model":"select","model_ctx":"number","temperature":"number","system_prompt":"textarea","user_template":"textarea","result_key":"text"})
     register_step_type("decision", step_decision, "Decision / Gate", {"conn_id":"select","model":"select","model_ctx":"number","options":"text","system_prompt":"textarea","user_template":"textarea","result_key":"text"})
     register_step_type("branch_on", step_branch_on, "Branch On Decision", {"decision_key":"text","routes_json":"textarea","default_pipeline_id":"pipeline_select","input_template":"textarea","result_key":"text"})
- #   register_step_type("edit_in_place", step_edit_in_place, "Edit In Place (gap-aware)",{"conn_id": "select", "model": "select", "model_ctx": "number", "temperature": "number", "gap_marker": "text", "system_prompt": "textarea", "chunk_tokens": "number", "fm_root": "text", "shadow_dir": "text", "shadow_doc_path": "text", "result_key": "text"})
+    register_step_type("route", step_route, "Route (branch within this flow)", {"conn_id": "select", "model": "select", "model_ctx": "number", "routes_json": "textarea", "static_choice": "text", "system_prompt": "textarea", "user_template": "textarea", "result_key": "text"})
 
 async def step_echo(config: dict, ctx) -> dict:
     """No-op passthrough: resolves its template against current scratch and returns it under result_key.
@@ -220,51 +219,23 @@ async def step_branch_on(config: dict, ctx) -> dict:
     ctx.scratch[result_key] = scratch
     return {result_key: scratch}
 
-async def notstep_edit_in_place(config: dict, ctx) -> dict:
-    """True in-place chunk editing: locates a chunk by its exact current text (not by position), replaces just that span via the shadow diff/accept flow, and can detect a gap marker to switch from 'edit existing text' mode to 'write new content to fill the gap' mode, then continues editing past the gap once reached.
-    If no marker exists at all, behaves as pure open-ended continuation once the end of existing content is reached - it keeps generating additional chunks until the judge/decision step (chained after this one) reports the goal is met, rather than stopping at end-of-file."""
-    pid = config["project_id"]
-    doc = _load(pid)  # this project accessor is Tessa's own - registered via extra_config same as other tessa_* steps
-    content = doc.get("content", "")
-    marker = config.get("gap_marker", "[[GAP]]")
+async def step_route(config: dict, ctx) -> dict:
+    """Picks exactly ONE of this node's own graph 'next' ids and tells the engine to skip the rest.
+    routes_json: {"label": "next_node_id", ...}. If conn/model are set, the label is chosen by an LLM
+    judge (same one-word-answer mechanism as `decision`); otherwise static_choice picks a fixed label -
+    useful for a python_exec-driven decision feeding this node's input instead of an LLM call."""
+    try: routes = json.loads(config.get("routes_json", "{}") or "{}")
+    except Exception: routes = {}
+    if not routes: raise RuntimeError("route: routes_json must map {label: next_node_id}")
     conn = get_conn(config.get("conn_id", "")); model = config.get("model", "")
-    if not conn or not model: raise RuntimeError("edit_in_place: connection/model required")
-    chunk_tokens = int(config.get("chunk_tokens", 4000))
-    before, _, after = content.partition(marker) if marker in content else (content, "", "")
-    chunks = _chunk_text(before, chunk_tokens) if before else []
-    edited = []
-    for i, chunk in enumerate(chunks):
-        await ctx.progress(f"editing chunk {i+1}/{len(chunks)}")
-        sys_p = ctx.resolve(config.get("system_prompt") or "")
-        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": f"Rewrite this passage in place - same length and content, fix grammar/flow/continuity only:\n\n{chunk}"}]
+    if conn and model:
+        sys_p = (ctx.resolve(config.get("system_prompt") or "") + f"\n\nRespond with exactly one of these words and nothing else: {', '.join(routes)}").strip()
+        msgs = [{"role":"system","content":sys_p}, {"role":"user","content":ctx.resolve(config.get("user_template") or "{input}")}]
         full = ""
-        async for piece in _ollama_stream(conn, msgs, model, config.get("model_ctx",8192), config.get("temperature",0.3)):
-            full += piece
-        edited.append(full.strip() or chunk)
-    if marker in content and after.strip():
-        # gap exists with real continuation text after it - generate filler chunks until a decision step (chained next in the pipeline) judges the gap closed. This step produces ONE filler pass per run; loop via branch_on->redo for multiple passes.
-        sys_p = ctx.resolve(config.get("system_prompt") or "")
-        fill_prompt = f"Continue the story to bridge this gap. End of text before the gap:\n\n{edited[-1][-1500:] if edited else before[-1500:]}\n\nText that must follow after your bridge:\n\n{after[:1500]}"
-        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content":fill_prompt}]
-        full = ""
-        async for piece in _ollama_stream(conn, msgs, model, config.get("model_ctx",8192), config.get("temperature",0.5)):
-            full += piece
-        new_content = "\n\n".join(edited) + "\n\n" + full.strip() + "\n\n" + after
-    elif marker in content:
-        # marker present but nothing after it - open-ended: generate one additional chunk past the existing content. Chain with decision/branch_on to keep generating.
-        sys_p = ctx.resolve(config.get("system_prompt") or "")
-        fill_prompt = f"Continue this story toward its stated goal. Existing text ends:\n\n{(edited[-1] if edited else before)[-1500:]}"
-        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content":fill_prompt}]
-        full = ""
-        async for piece in _ollama_stream(conn, msgs, model, config.get("model_ctx", 8192), config.get("temperature",0.5)):
-            full += piece
-        new_content = "\n\n".join(edited) + "\n\n" + full.strip()
+        async for piece in _ollama_stream(conn, msgs, model, config.get("model_ctx", 8192), 0.0): full += piece
+        choice = next((k for k in routes if k.lower() in full.lower()), next(iter(routes)))
     else:
-        new_content = "\n\n".join(edited) or content
-    bi = ENV["tools"]["built_ins"]
-    fm = bi.FileManager(config.get("fm_root") or "./data/_common")
-    shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(config.get("fm_root") or "./data/_common") / "_shadow"))
-    entry = shadow.stage(config.get("shadow_doc_path", f"tessa_edits/{pid}.md"), new_content, author=f"pipeline:{ctx.job_id}")
-    result_key = config.get("result_key", "edit_in_place")
-    ctx.scratch[result_key] = {"status": entry["status"], "gap_remaining": bool(marker in content and not after.strip())}
-    return ctx.scratch[result_key]
+        choice = config.get("static_choice") or next(iter(routes))
+    result_key = config.get("result_key", "route")
+    ctx.scratch[result_key] = choice
+    return {result_key: choice, "_chosen_next": routes[choice]}

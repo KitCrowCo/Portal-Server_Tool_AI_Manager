@@ -3,7 +3,8 @@ Ownership: this module holds every live connection for the duration of a job.
 Callers never await network I/O directly - submit() returns a job_id immediately; all progress arrives over WS via push_to_client, addressed by job_id, so any module's UI can subscribe by matching that id in its own OOB targets.
 Capability gating: pipelines carry tags (list[str]).
 A caller supplies allowed_tags or allowed_ids when submitting on behalf of a restricted surface (e.g. Athena) - the engine refuses anything outside that allowlist.
-Ad-hoc inline flows (kind="inline", no saved pipeline_id) are for Tessa's test-run surface and anywhere building a one-off flow at request time - callers choosing kind="inline" are responsible for not exposing that path to untrusted input.
+Ad-hoc inline flows (kind="inline", no saved pipeline_id) are for Tessa's test-run surface and anywhere building a one-off flow at request time 
+- callers choosing kind="inline" are responsible for not exposing that path to untrusted input.
 """
 import json, uuid, asyncio, re, traceback, time
 from pathlib import Path
@@ -33,8 +34,8 @@ def delete_pipeline(pid: str): _pdp(pid).unlink(missing_ok=True)
 
 def _jdp(jid: str) -> Path: return JOB_DIR / f"{Path(jid).name}.json"
 def load_job(jid: str) -> Optional[dict]: p = _jdp(jid); return json.loads(p.read_text()) if p.exists() else None
-def _save_job(job: dict): job["modified"] = datetime.utcnow().isoformat(); _jdp(job["id"]).write_text(json.dumps(job, indent=2))    
-    
+def _save_job(job: dict): job["modified"] = datetime.utcnow().isoformat(); _jdp(job["id"]).write_text(json.dumps(job, indent=2))
+
 STALE_SECONDS = 45  # no heartbeat in this window while status=="running" -> treat as interrupted, not silently stuck
 
 def init(env: dict):
@@ -83,6 +84,27 @@ class StepContext:
 
 def _done_set(flow: dict) -> set: return {n["id"] for n in flow["nodes"] if n.get("status") == "done"}
 
+def _skipped_set(flow: dict) -> set: return {n["id"] for n in flow["nodes"] if n.get("status") == "skipped"}
+
+def _cascade_skip(f: Flow, seed_ids: set, done: set, skipped: set):
+    """Marks seed_ids as skipped, then walks forward: a child becomes skipped too once none of its remaining live paths can ever resolve it
+    - 'all' join needs every prev done-or-skipped with at least one actually done; 'any' join only dies if every prev is skipped (none done)."""
+    frontier = list(seed_ids)
+    while frontier:
+        nid = frontier.pop()
+        if nid in done or nid in skipped: continue
+        skipped.add(nid)
+        node = f.nodes.get(nid)
+        if not node: continue
+        for cid in node.next:
+            child = f.nodes.get(cid)
+            if not child or cid in done or cid in skipped: continue
+            join = child.get("join", "all")
+            prevs = [(p in done, p in skipped) for p in child.prev]
+            if join == "any":
+                if prevs and all(sk for _, sk in prevs): frontier.append(cid)
+            elif any(sk for _, sk in prevs) and all(d or sk for d, sk in prevs): frontier.append(cid)
+
 def submit(username, kind="id", pipeline_id="", inline_flow=None, inputs=None, allowed_tags=None, allowed_ids=None, extra_config=None) -> tuple:
     if kind == "id":
         pdef = load_pipeline(pipeline_id)
@@ -96,7 +118,6 @@ def submit(username, kind="id", pipeline_id="", inline_flow=None, inputs=None, a
     for n in flow_data.get("nodes", []): n["status"] = "idle"; n.pop("ts", None); n.pop("preview", None); n.pop("message", None)
     if extra_config:
         for n in flow_data.get("nodes", []): n.setdefault("config", {}).update(extra_config)
-
     job_id = f"job_{uuid.uuid4().hex[:10]}"
     job = {"id": job_id, "username": username, "flow": flow_data, "status": "queued", "scratch": {"input": (inputs or {}).get("input", "")}, "log": [], "heartbeat": time.time(), "created": datetime.utcnow().isoformat()}
     _save_job(job)
@@ -119,23 +140,34 @@ def resume(job_id: str) -> tuple:
 
 def stop(job_id: str):
     job = load_job(job_id)
-    if job: job["status"] = "stopping"; _save_job(job)
+    if job:
+        job["status"] = "stopping"
+        _save_job(job)
 
 def _log(job: dict, msg: str): job.setdefault("log", []).append(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}")
 
-async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> set:
+async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
     f = Flow(flow)
     done = _done_set(flow)
+    skipped = _skipped_set(flow)
     wave_num = 0
-    while not f.is_complete(done):
+    while not f.is_complete(done, skipped):
         job = load_job(job_id)
         if job["status"] == "stopping":
             _log(job, "stop requested - halting before next wave"); _save_job(job)
-            return done
-        wave = [n for n in f.ready(done) if n.to_dict().get("status") != "done"]
-        if not wave:
-            _log(job, f"no ready nodes and flow incomplete - dangling reference or cycle, stopping"); _save_job(job)
+            return done, skipped
+        candidates = [n for n in f.ready(done, skipped) if n.to_dict().get("status") not in ("done", "skipped")]
+        if not candidates:
+            _log(job, "no ready nodes and flow incomplete - dangling reference or cycle, stopping"); _save_job(job)
             break
+        # AND-join nodes downstream of a skipped branch never actually run - they cascade to skipped instead
+        auto_skip = {n.id for n in candidates if n.get("join","all") != "any" and any(p in skipped for p in n.prev)}
+        if auto_skip:
+            _cascade_skip(f, auto_skip, done, skipped)
+            for nid in auto_skip | (skipped - _skipped_set(load_job(job_id)["flow"])):
+                await ctx.set_node_status(nid, "skipped")
+            continue  # re-evaluate readiness now that more nodes are resolved
+        wave = candidates
         wave_num += 1
         job = load_job(job_id)
         _log(job, f"wave {wave_num}: starting {len(wave)} node(s): {[n.to_dict()['id'] for n in wave]}")
@@ -156,23 +188,29 @@ async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> set:
                 ctx.scratch[nd["id"]] = result
                 preview = {k: str(v)[:100] for k, v in (result or {}).items()}
                 await ctx.set_node_status(nd["id"], "done", {"preview": preview})
+                chosen = (result or {}).get("_chosen_next")
+                return nd["id"], ([nid for nid in nd.get("next",[]) if nid != chosen] if chosen else [])
             except Exception as e:
                 traceback.print_exc()
                 await ctx.set_node_status(nd["id"], "error", {"message": str(e)})
                 raise
-            return nd["id"]
+
         try:
             results = await asyncio.gather(*[run_one(n) for n in wave])
-            done.update(results)
         except Exception as e:
             job = load_job(job_id)
             job["status"] = "error"; _log(job, f"wave {wave_num} failed: {e}"); _save_job(job)
-            return done
+            return done, skipped
+        done.update(nid for nid, _ in results)
+        skip_seeds = set().union(*(siblings for _, siblings in results)) if results else set()
+        if skip_seeds:
+            _cascade_skip(f, skip_seeds, done, skipped)
+            for nid in skip_seeds | (skipped - _skipped_set(load_job(job_id)["flow"])): await ctx.set_node_status(nid, "skipped")
         job = load_job(job_id)
         job["scratch"] = ctx.scratch
         _log(job, f"wave {wave_num}: complete")
         _save_job(job)
-    return done
+    return done, skipped
 
 async def _run(job_id: str):
     job = load_job(job_id)
@@ -180,7 +218,7 @@ async def _run(job_id: str):
     job["status"] = "running"; _log(job, "job started"); _save_job(job)
     ctx = StepContext(job_id, job["username"], job["scratch"])
     try:
-        done = await _run_flow(job["flow"], ctx, job_id)
+        done, skipped = await _run_flow(job["flow"], ctx, job_id)
     except Exception as e:
         # last-resort catch: if anything above this point throws, the job record itself says so, instead of silently dying as an unretrieved task exception.
         traceback.print_exc()
@@ -194,7 +232,7 @@ async def _run(job_id: str):
     flow_nodes = job["flow"]["nodes"]
     if job["status"] == "stopping": job["status"] = "stopped"
     elif any(n.get("status") == "error" for n in flow_nodes): job["status"] = "error"
-    elif all(n.get("status") == "done" for n in flow_nodes): job["status"] = "done"
+    elif all(n.get("status") in ("done", "skipped") for n in flow_nodes): job["status"] = "done"
     else: job["status"] = "stopped"
     job["scratch"] = ctx.scratch
     _log(job, f"job finished with status: {job['status']}")

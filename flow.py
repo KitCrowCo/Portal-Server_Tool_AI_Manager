@@ -1,9 +1,11 @@
 """ Generalized DAG Architecture (FlowCanvas Core)
 
 ## 1. Project Overview
-This project is a generalized node-based graph architecture (Directed Acyclic Graph) designed to construct, modify, view, and interact with complex structural workflows, such as AI generation pipelines. It operates as an independent, highly extensible data framework built to interface seamlessly with modern, unitless (SVG-style) canvas UIs while retaining the ability to tie into strict units when required.
+This project is a generalized node-based graph architecture (Directed Acyclic Graph) designed to construct, modify, view, and interact with complex structural workflows, such as AI generation pipelines.
+It operates as an independent, highly extensible data framework built to interface seamlessly with modern, unitless (SVG-style) canvas UIs while retaining the ability to tie into strict units when required.
 
-It heavily emphasizes **Memory-First Graph Operations**. The in-memory data classes operate entirely independently of the presentation layer. This ensures that structural linking and data payload mapping remain perfectly intact, strictly isolating topological integrity from visual "save states" or coordinate systems.
+It heavily emphasizes **Memory-First Graph Operations**. The in-memory data classes operate entirely independently of the presentation layer.
+This ensures that structural linking and data payload mapping remain perfectly intact, strictly isolating topological integrity from visual "save states" or coordinate systems.
 
 ## 2. Core Architecture
 The system is divided into two primary halves: the **Data Layer** (the source of truth) and the **Presentation Layer** (the UI canvas implementation).
@@ -20,7 +22,9 @@ The system is divided into two primary halves: the **Data Layer** (the source of
 *   **Path Items:** The connective directional splines drawn dynamically between source and destination Node Items.
 
 ## 3. Data Integrity & Operation Paradigm
-1.  **Strict State Management:** No structural edits (connecting nodes, deleting nodes) happen solely in the UI. UI interactions pass requests to the `Flow` object (e.g., `flow.break_path`, `flow.insert_between`). Once the data layer confirms the operation is topologically sound, the canvas rebuilds or updates the visual items.
+1.  **Strict State Management:** No structural edits (connecting nodes, deleting nodes) happen solely in the UI.
+        UI interactions pass requests to the `Flow` object (e.g., `flow.break_path`, `flow.insert_between`).
+        Once the data layer confirms the operation is topologically sound, the canvas rebuilds or updates the visual items.
 2.  **Generalized Node Subsets:** Subsets of nodes can be temporarily tracked outside the main flow to allow visually isolated configurations or parameter tuning before permanently merging them into the active execution dataset.
 3.  **Cascading Appearance Overrides:** Node visual styles cascade from bottom to top priorities: Canvas visual defaults -> `Flow`-level `appearance` dictates -> individual `FlowNode` `appearance` overrides.
 
@@ -29,7 +33,7 @@ The system is divided into two primary halves: the **Data Layer** (the source of
 flow.py — Segmented DAG core for ai_manager pipelines.
 
 FlowNode/Flow are the source of truth for pipeline structure.
-A pipeline IS a Flow: each FlowNode's payload is {"type": step_type, "config": {...}}; edges (prev/next) are execution order, branches are concurrent, merges wait on all incoming prev.
+A pipeline IS a Flow: each FlowNode's payload is {"type": step_type, "config": {...}}; edges (prev/next) are execution order, branches are concurrent, merges wait on incoming prev (all or select).
 Subflows: a node's payload may be {"type": "subflow", "flow": <nested Flow dict>} - engine.py treats this as one step that recursively runs the nested Flow and folds its terminal node outputs back as this node's result.
 Arbitrarily deep nesting works because Flow.to_dict()/FlowNode are the same shape at every level.
 """
@@ -39,18 +43,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Callable, Optional, Tuple, Union
 from dataclasses import dataclass
 import numpy as np
-
-# def check_paths(paths: List[Dict[str, str]], root: str = "", create: bool = False, verbose: bool = False) -> bool:
-#     """Validates and optionally creates a list of paths."""
-#     for p in paths:
-#         path = Path(p["location"].replace("root", root))
-#         if not path.exists():
-#             if not create:
-#                 if verbose: print(f"Missing path: {path}")
-#                 return False
-#             path.parent.mkdir(parents=True, exist_ok=True)
-#             if verbose: print(f"Created path: {path}")
-#     return True
 
 class DictTools:
     """Generalized deep-dictionary manipulation and parsing tools."""
@@ -91,8 +83,7 @@ class DictTools:
             for k, v in data.items():
                 if isinstance(v, (dict, list)) and (not continue_func or continue_func(k, v)): parsed[k] = DictTools.compact_parse(v, continue_func, format_func)
             return parsed
-        if isinstance(data, list): 
-            return [DictTools.compact_parse(v, continue_func, format_func) for v in data]
+        if isinstance(data, list): return [DictTools.compact_parse(v, continue_func, format_func) for v in data]
         return data
 
 class JsonManager:
@@ -254,5 +245,20 @@ class Flow:
 
     def to_dict(self) -> dict: return {"nodes": [node.to_dict() for node in self.nodes.values()], "appearance": self.appearance, "subflows": self.subflows} # Serializes entire flow object for JSON saving.
     def heads(self) -> List[FlowNode]: return [n for n in self.nodes.values() if not n.prev]
-    def ready(self, done: set) -> List[FlowNode]: return [n for n in self.nodes.values() if n.id not in done and all(p in done for p in n.prev)] #Nodes whose every prev is already done, and which aren't done themselves - one execution wave.
-    def is_complete(self, done: set) -> bool: return all(n.id in done for n in self.nodes.values())
+    def is_complete(self, done: set, skipped: set = None) -> bool: return all(n.id in (done | (skipped or set())) for n in self.nodes.values())
+
+    def ready(self, done: set, skipped: set = None) -> List[FlowNode]:
+    """Nodes not yet resolved whose join condition against prev is satisfied.
+    join='all' (default): every prev must be done or skipped for this node to be considered - the caller is responsible for deciding whether an all-join node with a skipped prev should itself run or cascade to skipped, since that's an execution-semantics call, not a structural one.
+    join='any': at least one prev must be done (skipped prevs don't block and don't count)."""
+    skipped = skipped or set()
+    resolved = done | skipped
+    out = []
+    for n in self.nodes.values():
+        if n.id in resolved: continue
+        if not n.prev: out.append(n); continue
+        join = n.get("join", "all")
+        if join == "any":
+            if any(p in done for p in n.prev): out.append(n)
+        elif all(p in resolved for p in n.prev): out.append(n)
+    return out
