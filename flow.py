@@ -248,17 +248,17 @@ class Flow:
     def is_complete(self, done: set, skipped: set = None) -> bool: return all(n.id in (done | (skipped or set())) for n in self.nodes.values())
 
     def ready(self, done: set, skipped: set = None) -> List[FlowNode]:
-    """Nodes not yet resolved whose join condition against prev is satisfied.
-    join='all' (default): every prev must be done or skipped for this node to be considered - the caller is responsible for deciding whether an all-join node with a skipped prev should itself run or cascade to skipped, since that's an execution-semantics call, not a structural one.
-    join='any': at least one prev must be done (skipped prevs don't block and don't count)."""
-    skipped = skipped or set()
-    resolved = done | skipped
-    out = []
-    for n in self.nodes.values():
-        if n.id in resolved: continue
-        if not n.prev: out.append(n); continue
-        join = n.get("join", "all")
-        if join == "any":
-            if any(p in done for p in n.prev): out.append(n)
-        elif all(p in resolved for p in n.prev): out.append(n)
-    return out
+        """Nodes not yet resolved whose join condition against prev is satisfied.
+        join='all' (default): every prev must be done or skipped for this node to be considered - the caller is responsible for deciding whether an all-join node with a skipped prev should itself run or cascade to skipped, since that's an execution-semantics call, not a structural one.
+        join='any': at least one prev must be done (skipped prevs don't block and don't count)."""
+        skipped = skipped or set()
+        resolved = done | skipped
+        out = []
+        for n in self.nodes.values():
+            if n.id in resolved: continue
+            if not n.prev: out.append(n); continue
+            join = n.get("join", "all")
+            if join == "any":
+                if any(p in done for p in n.prev): out.append(n)
+            elif all(p in resolved for p in n.prev): out.append(n)
+        return out

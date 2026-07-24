@@ -1,0 +1,23 @@
+{
+  "_meta": {"display_name": "vLLM / OpenAI-Compatible", "icon": "&#x25C6;", "connection_type": "vllm", "description": "Any OpenAI chat-completions-compatible endpoint - vLLM, LM Studio, text-generation-webui, llama.cpp server."},
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1", "required": true},
+    "port": {"type": "integer", "label": "Port", "default": 8000, "required": true},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": ""},
+    "api_key": {"type": "secret", "label": "API Key", "default": "", "hint": "Sent as Authorization: Bearer"},
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 600}
+  },
+  "endpoints": {
+    "health": {"method": "GET", "path": "/v1/models"},
+    "chat": {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "{model}", "messages": "{messages}", "stream": true, "temperature": "{temperature}", "top_p": "{top_p}", "max_tokens": "{num_predict}"}}
+  },
+  "options_schema": {
+    "temperature": {"type": "float", "default": 0.8, "min": 0.0, "max": 2.0},
+    "top_p": {"type": "float", "default": 0.9, "min": 0.0, "max": 1.0},
+    "num_predict": {"type": "integer", "default": -1, "min": -1, "max": 32768, "hint": "sent as max_tokens"}
+  },
+  "response_parser": {"stream_format": "sse", "content_path": "choices.0.delta.content"},
+  "status_map": {"success_codes": [200], "error_key": "error"}
+}d": "GET"}}
+}

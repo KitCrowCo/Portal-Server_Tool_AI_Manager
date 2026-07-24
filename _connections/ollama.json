@@ -1,0 +1,101 @@
+{
+  "_meta": {
+    "schema_version": "1.0",
+    "connection_type": "ollama",
+    "display_name": "Ollama",
+    "description": "Local Ollama inference server. Runs models via llama.cpp backend. REST API on configurable host:port.",
+    "icon": "&#x25CB;",
+    "docs_url": "https://github.com/ollama/ollama/blob/main/docs/api.md"
+  },
+
+  "connection": {
+    "host": {
+      "label": "Host",
+      "type": "string",
+      "default": "127.0.0.1",
+      "hint": "IP or hostname of the Ollama server",
+      "required": true
+    },
+    "port": {
+      "label": "Port",
+      "type": "integer",
+      "default": 11434,
+      "hint": "Default Ollama port",
+      "required": true
+    },
+    "tls": {
+      "label": "Use HTTPS",
+      "type": "boolean",
+      "default": false,
+      "hint": "Enable if Ollama is behind a TLS-terminating reverse proxy"
+    },
+    "base_path": {
+      "label": "Base Path",
+      "type": "string",
+      "default": "",
+      "hint": "Optional path prefix if behind a sub-path reverse proxy (e.g. /ollama)"
+    },
+    "api_key": {
+      "label": "API Key",
+      "type": "secret",
+      "default": "",
+      "hint": "Optional — only needed if Ollama is behind an auth proxy"
+    },
+    "timeout_s": {
+      "label": "Request Timeout (s)",
+      "type": "integer",
+      "default": 600,
+      "hint": "Max seconds to wait for a response before aborting"
+    }
+  },
+
+  "capabilities": {
+    "list_models":   true,
+    "pull_model":    true,
+    "delete_model":  true,
+    "generate":      true,
+    "chat":          true,
+    "embeddings":    true,
+    "streaming":     true,
+    "model_info":    true,
+    "health_check":  true
+  },
+
+  "endpoints": {
+    "health":      { "method": "GET",    "path": "/api/tags",       "note": "Returns model list; used as liveness probe" },
+    "list_models": { "method": "GET",    "path": "/api/tags" },
+    "model_info":  { "method": "POST",   "path": "/api/show",       "body": { "name":  "{model}" } },
+    "pull":        { "method": "POST",   "path": "/api/pull",       "body": { "name":  "{model}", "stream": true } },
+    "delete":      { "method": "DELETE", "path": "/api/delete",     "body": { "name":  "{model}" } },
+    "generate":    { "method": "POST",   "path": "/api/generate",   "body": { "model": "{model}", "prompt":   "{prompt}", "stream": true, "options": "{options}" } },
+    "chat":        { "method": "POST",   "path": "/api/chat",       "body": { "model": "{model}", "messages": "{messages}", "stream": true, "options": "{options}" } },
+    "embeddings":  { "method": "POST",   "path": "/api/embeddings", "body": { "model": "{model}", "prompt":   "{text}" } }
+  },
+
+  "model_list_parser": {
+    "root_key": "models",
+    "name_field": "name",
+    "size_field": "size",
+    "modified_field": "modified_at",
+    "details_field": "details"
+  },
+
+  "options_schema": {
+    "temperature":    { "type": "float",   "default": 0.8,   "min":  0.0, "max": 2.0,      "hint": "Sampling temperature" },
+    "top_p":          { "type": "float",   "default": 0.9,   "min":  0.0, "max": 1.0 },
+    "top_k":          { "type": "integer", "default": 40,    "min":  1,   "max": 200 },
+    "num_ctx":        { "type": "integer", "default": 16384, "min":  1,   "max": 13107200,   "hint": "Context window in tokens" },
+    "num_predict":    { "type": "integer", "default": -1,    "min":  -1,  "max": 32768,    "hint": "-1 = unlimited" },
+    "repeat_penalty": { "type": "float",   "default": 1.1,   "min":  0.5, "max": 2.0 },
+    "seed":           { "type": "integer", "default": 0,     "hint": "0 = random" },
+    "stop":           { "type": "list",    "default": [],    "hint": "List of stop sequences" }
+  },
+
+  "status_map": {
+    "success_codes": [200],
+    "error_key": "error",
+    "stream_done_sentinel": { "key": "done", "value": true }
+  },
+
+  "response_parser": {"stream_format": "jsonl", "content_path": "message.content"}
+}

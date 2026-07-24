@@ -186,6 +186,7 @@ async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
                     ctx.node_id = nd["id"]
                     result = await spec["fn"](nd.get("config", {}), ctx)
                 ctx.scratch[nd["id"]] = result
+                _apply_result_map(ctx, nd.get("config", {}).get("result_map"), result)
                 preview = {k: str(v)[:100] for k, v in (result or {}).items()}
                 await ctx.set_node_status(nd["id"], "done", {"preview": preview})
                 chosen = (result or {}).get("_chosen_next")
@@ -280,3 +281,18 @@ async def run_inline(username: str, pipeline_id: str, inputs: dict = None, extra
     job["status"] = "error" if any(n.get("status") == "error" for n in flow_data["nodes"]) else "done"
     _save_job(job)
     return ctx.scratch
+
+def _apply_result_map(ctx, result_map, result: dict):
+    """Optional per-node config. Lets one step's result dict fan out to multiple named scratch keys, or several logical fields combine/rename freely - this is the general mechanism, not a per-step one.
+    result_map entries: {"logical_field": "scratch_key"} to copy/overwrite, or {"logical_field": {"key": "scratch_key", "mode": "append"}} to accumulate (e.g. a running notes/scratchpad field across a while-loop, since ctx.scratch already survives every wave of one job run).
+    "*" as a logical_field merges the entire result dict flat into scratch under its own field names."""
+    if not result_map or not isinstance(result, dict): return
+    if isinstance(result_map, str):
+        try: result_map = json.loads(result_map)
+        except Exception: return
+    for logical_key, target in result_map.items():
+        if logical_key == "*": ctx.scratch.update(result); continue
+        if logical_key not in result: continue
+        key, mode = (target.get("key"), target.get("mode", "set")) if isinstance(target, dict) else (target, "set")
+        if not key: continue
+        ctx.scratch[key] = (str(ctx.scratch.get(key, "")) + str(result[logical_key])) if mode == "append" else result[logical_key]

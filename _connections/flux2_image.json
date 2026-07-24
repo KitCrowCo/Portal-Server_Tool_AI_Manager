@@ -1,0 +1,11 @@
+{
+  "_meta": {"display_name": "Flux2 Image Generator", "icon": "&#x1F5BC;", "connection_type": "flux2_image", "description": "Flux.2 Klein image generation node (txt2img/inpaint/sequence) - single GPU, one request at a time."},
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1", "hint": "Docker service name if on the same compose network", "required": true},
+    "port": {"type": "integer", "label": "Port", "default": 8000, "required": true},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": ""}
+  },
+  "endpoints": {"health": {"path": "/system/status", "method": "GET"}}
+}
+

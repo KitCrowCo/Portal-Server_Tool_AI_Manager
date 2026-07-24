@@ -1,0 +1,10 @@
+{
+  "_meta": {"display_name": "Flux2 Text Encoder", "icon": "&#x1F4DD;", "connection_type": "flux2_text", "description": "Qwen3 GGUF text encoder for Flux.2 Klein - prompt in, embeds.npy in shared vault out."},
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1", "hint": "Docker service name if on the same compose network", "required": true},
+    "port": {"type": "integer", "label": "Port", "default": 8001, "required": true},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": ""}
+  },
+  "endpoints": {"health": {"path": "/health", "method": "GET"}}
+}

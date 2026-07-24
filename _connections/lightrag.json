@@ -1,0 +1,11 @@
+{
+  "_meta": {"display_name": "LightRAG", "icon": "&#x1F578;", "connection_type": "lightrag"},
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1"},
+    "port": {"type": "integer", "label": "Port", "default": 9621},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": ""}
+  },
+  "domain_notes": {"type": "string", "label": "Domain Notes", "default": "", "hint": "What kind of knowledge lives here (e.g. 'Household code & scripts', 'Lease/insurance docs', 'Worldbuilding lore') - shown under the selector in Kimi."},
+  "endpoints": {"health": {"path": "/health", "method": "GET"}}
+}
