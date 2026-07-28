@@ -68,7 +68,7 @@
     "pull":        { "method": "POST",   "path": "/api/pull",       "body": { "name":  "{model}", "stream": true } },
     "delete":      { "method": "DELETE", "path": "/api/delete",     "body": { "name":  "{model}" } },
     "generate":    { "method": "POST",   "path": "/api/generate",   "body": { "model": "{model}", "prompt":   "{prompt}", "stream": true, "options": "{options}" } },
-    "chat":        { "method": "POST",   "path": "/api/chat",       "body": { "model": "{model}", "messages": "{messages}", "stream": true, "options": "{options}" } },
+    "chat":        { "method": "POST",   "path": "/api/chat",       "body": { "model": "{model}", "messages": "{messages}", "stream": true, "think": "{think}", "options": "{options}" } },
     "embeddings":  { "method": "POST",   "path": "/api/embeddings", "body": { "model": "{model}", "prompt":   "{text}" } }
   },
 
@@ -96,6 +96,6 @@
     "error_key": "error",
     "stream_done_sentinel": { "key": "done", "value": true }
   },
-
-  "response_parser": {"stream_format": "jsonl", "content_path": "message.content"}
+  "response_parser": {"stream_format": "jsonl", "content_path": "message.content", "thinking_path": "message.thinking"},
+  "supports_thinking": true
 }

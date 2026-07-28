@@ -19,5 +19,4 @@
   },
   "response_parser": {"stream_format": "sse", "content_path": "choices.0.delta.content"},
   "status_map": {"success_codes": [200], "error_key": "error"}
-}d": "GET"}}
 }

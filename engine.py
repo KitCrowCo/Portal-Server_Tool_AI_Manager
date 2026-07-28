@@ -146,6 +146,7 @@ def stop(job_id: str):
 
 def _log(job: dict, msg: str): job.setdefault("log", []).append(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}")
 
+
 async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
     f = Flow(flow)
     done = _done_set(flow)
@@ -164,8 +165,7 @@ async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
         auto_skip = {n.id for n in candidates if n.get("join","all") != "any" and any(p in skipped for p in n.prev)}
         if auto_skip:
             _cascade_skip(f, auto_skip, done, skipped)
-            for nid in auto_skip | (skipped - _skipped_set(load_job(job_id)["flow"])):
-                await ctx.set_node_status(nid, "skipped")
+            for nid in auto_skip | (skipped - _skipped_set(load_job(job_id)["flow"])): await ctx.set_node_status(nid, "skipped")
             continue  # re-evaluate readiness now that more nodes are resolved
         wave = candidates
         wave_num += 1
@@ -186,7 +186,7 @@ async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
                     ctx.node_id = nd["id"]
                     result = await spec["fn"](nd.get("config", {}), ctx)
                 ctx.scratch[nd["id"]] = result
-                _apply_result_map(ctx, nd.get("config", {}).get("result_map"), result)
+                apply_result_map(nd.get("config", {}), ctx, result)
                 preview = {k: str(v)[:100] for k, v in (result or {}).items()}
                 await ctx.set_node_status(nd["id"], "done", {"preview": preview})
                 chosen = (result or {}).get("_chosen_next")
@@ -282,17 +282,24 @@ async def run_inline(username: str, pipeline_id: str, inputs: dict = None, extra
     _save_job(job)
     return ctx.scratch
 
-def _apply_result_map(ctx, result_map, result: dict):
-    """Optional per-node config. Lets one step's result dict fan out to multiple named scratch keys, or several logical fields combine/rename freely - this is the general mechanism, not a per-step one.
-    result_map entries: {"logical_field": "scratch_key"} to copy/overwrite, or {"logical_field": {"key": "scratch_key", "mode": "append"}} to accumulate (e.g. a running notes/scratchpad field across a while-loop, since ctx.scratch already survives every wave of one job run).
-    "*" as a logical_field merges the entire result dict flat into scratch under its own field names."""
-    if not result_map or not isinstance(result, dict): return
-    if isinstance(result_map, str):
-        try: result_map = json.loads(result_map)
-        except Exception: return
-    for logical_key, target in result_map.items():
-        if logical_key == "*": ctx.scratch.update(result); continue
-        if logical_key not in result: continue
-        key, mode = (target.get("key"), target.get("mode", "set")) if isinstance(target, dict) else (target, "set")
-        if not key: continue
-        ctx.scratch[key] = (str(ctx.scratch.get(key, "")) + str(result[logical_key])) if mode == "append" else result[logical_key]
+def apply_result_map(config: dict, ctx, result: dict) -> dict:
+    """Standardized scratchpad mapping helper. Supports dictionary mapping, flat merging ('*'), and accumulators ('append')."""
+    rmap = config.get("result_map")
+    if rmap == "*": ctx.scratch.update(result)
+    elif isinstance(rmap, dict) and rmap:
+        for src_key, target in rmap.items():
+            val = result.get(src_key)
+            if isinstance(target, str): ctx.scratch[target] = val
+            elif isinstance(target, dict):
+                k = target.get("key")
+                mode = target.get("mode", "overwrite")
+                if k:
+                    if mode == "append":
+                        existing = ctx.scratch.get(k, "")
+                        if isinstance(existing, list): existing.append(val)
+                        else: ctx.scratch[k] = (str(existing) + "\n\n" + str(val)) if existing else str(val)
+                    else:
+                        ctx.scratch[k] = val
+    elif not rmap:
+        if isinstance(result, dict): ctx.scratch.update(result)
+    return result

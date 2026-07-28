@@ -5,12 +5,10 @@ Config values may reference upstream results with {node_id.key} templating, reso
 
 import httpx, re, json, sys, asyncio, uuid
 from pathlib import Path
-from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, _base, stream_llm
 from tools.ai_manager import engine
 
 # To be generalized:
-from tools.ai_manager.connections import lightrag_list_entities
-from tools.ai_manager.connections import flux2_encode, flux2_generate
+from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, _base, stream_llm, lightrag_list_entities, flux2_encode, flux2_generate, list_conns, list_models_sync
 
 _STEP_TYPES: dict = {}
 ENV: dict = {}
@@ -21,17 +19,18 @@ def init(env: dict):
 def register_step_type(name: str, fn, label: str = "", config_schema: list = None): _STEP_TYPES[name] = {"fn": fn, "label": label or name, "config_schema": config_schema or []} # label/config_schema are optional UI hints for pipeline builders - the engine itself never reads them.
 def get_step_type(name: str) -> dict: return _STEP_TYPES.get(name)
 def list_step_types() -> list: return [{"type": k, **{kk: vv for kk, vv in v.items() if kk != "fn"}} for k, v in _STEP_TYPES.items()]
+def _llm_conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name",c["_id"])} [{c.get("connection_type")}]') for c in (list_conns("ollama") + list_conns("vllm"))]
+def _knowledge_conn_options(values=None): return [("", "(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns("lightrag")]
+def _flux2_text_options(values=None): return [("", "(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns("flux2_text")]
+def _flux2_image_options(values=None): return [("", "(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns("flux2_image")]
+def _pipeline_options(values=None): return [("", "(none)")] + [(p["id"], f'{p.get("name",p["id"])} [{", ".join(p.get("tags",[]))}]') for p in engine.list_pipelines()]
 
 def register_builtins():
     BI = ENV["tools"]["built_ins"]
-    # Common Patterns
-    # temp = BI.SettingField("temperature", "Temperature", type="number", default=0.7, step="any", hint="Float. No artificial limits."),
-    # nctx = BI.SettingField("num_ctx", "Context Window", type="number", default=16384, step=1, hint="Exact token count for memory tuning."),
-    # tout = BI.SettingField("timeout_s", "Timeout (Seconds)", type="number", default=600, step=1, hint="Set to 600+ for heavy APU node workloads."),
     def _rmap_field(): return BI.SettingField("result_map", "Result Mapping (JSON, optional)", type="json", default={}, hint='Map this step\'s output fields to scratch keys, e.g. {"text":"article_md"}. "*" merges everything flat. {"text":{"key":"notes","mode":"append"}} accumulates rather than overwrites.')
 
     register_step_type("llm_generate", step_llm_generate, "LLM Generate (chat / decision / router)", [
-        BI.SettingField("conn_id", "Connection", type="text"), BI.SettingField("model", "Model", type="text"),
+        BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options), BI.SettingField("model", "Model", type="text"),
         BI.SettingField("system_prompt", "System Prompt", type="textarea", default="You are a helpful AI assistant."),
         BI.SettingField("user_template", "User Prompt Template", type="textarea", default="{input}"),
         BI.SettingField("enforce_options", "Enforced Options (comma-sep)", type="text"),
@@ -40,6 +39,7 @@ def register_builtins():
         BI.SettingField("num_ctx", "Context Window (tokens)", type="number", default=16384, step=1),
         BI.SettingField("num_predict", "Max Output Tokens", type="number", default=-1, step=1, hint="-1 = unlimited (provider default)"),
         BI.SettingField("top_p", "Top P", type="number", default=None), BI.SettingField("top_k", "Top K", type="number", default=None, step=1),
+        BI.SettingField("think", "Enable Thinking Mode", type="checkbox", default=False, hint="Only takes effect on connections whose profile declares supports_thinking (Ollama does). Silently ignored otherwise - a console warning is logged, not an error."),
         _rmap_field()])
 
     register_step_type("find", step_find, "Find (grep, regex search)",[
@@ -59,7 +59,7 @@ def register_builtins():
         _rmap_field()])
 
     register_step_type("knowledge_query", step_knowledge_query, "Knowledge Query", [
-        BI.SettingField("conn_id","Knowledge Connection","text"),
+        BI.SettingField("conn_id", "Knowledge Connection", type="select", options=_knowledge_conn_options),
         BI.SettingField("mode","Search Mode","text",default="hybrid"),
         BI.SettingField("query_template","Query Template","textarea",default="{input}"),
         BI.SettingField("return_context_only","Return raw context only (no synthesis)","checkbox",default=False),
@@ -67,12 +67,12 @@ def register_builtins():
         _rmap_field()])
 
     register_step_type("knowledge_list_entities", step_knowledge_list_entities, "Knowledge Graph - List Entities", [
-        BI.SettingField("conn_id","Knowledge Connection","text"),
+        BI.SettingField("conn_id","Knowledge Connection",type="select", options=_knowledge_conn_options),
         BI.SettingField("limit","Limit","number",default=500,step=1),
         _rmap_field()])
 
     register_step_type("knowledge_insert_text", step_knowledge_insert_text, "Knowledge Insert Text", [
-        BI.SettingField("conn_id","Knowledge Connection","text"),
+        BI.SettingField("conn_id","Knowledge Connection", type="select", options=_knowledge_conn_options),
         BI.SettingField("text_template","Text Template","textarea",default="{input}"),
         BI.SettingField("source_label","Source Label","text")])
 
@@ -109,8 +109,8 @@ def register_builtins():
         _rmap_field()])
 
     register_step_type("image_generate", step_image_generate, "Text-to-Image (Flux2)", [
-        BI.SettingField("text_encoder_conn_id", "Text Encoder Connection", type="text", hint="ID of the flux2_text connection"),
-        BI.SettingField("image_conn_id", "Image Connection", type="text", hint="ID of the flux2_image connection"),
+        BI.SettingField("text_encoder_conn_id", "Text Encoder Connection", type="select", options = _flux2_text_options, hint="ID of the flux2_text connection"),
+        BI.SettingField("image_conn_id", "Image Connection", type="select", options = _flux2_image_options, hint="ID of the flux2_image connection"),
         BI.SettingField("prompt_template", "Prompt Template", type="textarea", default="{input}", hint="Use {variables} for dynamic prompts"),
         BI.SettingField("width", "Width", type="number", default=1024, step=16),
         BI.SettingField("height", "Height", type="number", default=1024, step=16),
@@ -121,14 +121,14 @@ def register_builtins():
         _rmap_field()])
 
     register_step_type("call_pipeline", step_call_pipeline, "Call Another Pipeline", [
-        BI.SettingField("pipeline_id", "Pipeline ID", type="text", hint="ID of the pipeline to trigger"),
+        BI.SettingField("pipeline_id", "Pipeline ID", type="select", options=_pipeline_options),
         BI.SettingField("input_template", "Input Template", type="textarea", default="{input}"),
         BI.SettingField("_call_depth", "Call Depth Override", type="number", default=0, hint="Advanced: manually increment depth tracking"),
         _rmap_field()])
 
     register_step_type("foreach_call_pipeline", step_foreach_call_pipeline, "For Each Item, Call Pipeline", [
         BI.SettingField("items_source", "Items Scratch Key", type="text", hint="Scratch key containing a JSON array or text block"),
-        BI.SettingField("pipeline_id", "Pipeline ID", type="text", hint="ID of the pipeline to run per item"),
+        BI.SettingField("pipeline_id", "Pipeline ID", type="select", options=_pipeline_options, hint="ID of the pipeline to run per item"),
         BI.SettingField("_call_depth", "Call Depth Override", type="number", default=0),
         _rmap_field()])
 
@@ -140,7 +140,7 @@ def register_builtins():
         _rmap_field()])
 
     register_step_type("edit_in_place", step_edit_in_place, "Edit In Place (gap-aware, chunked)", [
-        BI.SettingField("conn_id", "Connection", type="text"),
+        BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
         BI.SettingField("model", "Model", type="text"),
         BI.SettingField("system_prompt", "System Prompt", type="textarea"),
         BI.SettingField("rewrite_prompt", "Rewrite Prompt", type="textarea"),
@@ -155,7 +155,7 @@ def register_builtins():
 
     register_step_type("chunked_file_pass", chunked_file_pass, "Chunked File Pass", [
         BI.SettingField("project_id", "Project ID", type="text"),
-        BI.SettingField("conn_id", "Connection", type="text"),
+        BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
         BI.SettingField("model", "Model", type="text"),
         BI.SettingField("system_prompt", "System Prompt", type="textarea"),
         BI.SettingField("user_template", "User Template", type="textarea", default="{chunk_content}"),
@@ -169,7 +169,7 @@ def register_builtins():
 
     register_step_type("chunked_synthesis", chunked_synthesis, "Chunked Synthesis", [
         BI.SettingField("project_id", "Project ID", type="text"),
-        BI.SettingField("conn_id", "Connection", type="text"),
+        BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
         BI.SettingField("model", "Model", type="text"),
         BI.SettingField("system_prompt", "System Prompt", type="textarea"),
         BI.SettingField("user_template", "User Template", type="textarea", default="{chunk_content}"),
@@ -177,6 +177,7 @@ def register_builtins():
         BI.SettingField("model_ctx", "Context Window", type="number", default=32768, step=1),
         BI.SettingField("chunk_tokens", "Chunk Tokens", type="number", default=6000, step=1),
         BI.SettingField("temperature", "Temperature", type="number", default=0.3, step="any"),
+        BI.SettingField("source_key", "Source Scratch Key", type="text", default="input", hint="Which upstream result to chunk-synthesize - defaults to the pipeline's own input."),
         _rmap_field()])
 
 async def step_llm_generate(config: dict, ctx) -> dict:
@@ -193,9 +194,10 @@ async def step_llm_generate(config: dict, ctx) -> dict:
     if options: sys_p = (sys_p + f"\n\nRespond with exactly one of these words and nothing else: {', '.join(options)}").strip()
     messages = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": ctx.resolve(config.get("user_template") or "{input}")}]
     full = ""
-    async for piece in stream_llm(conn, messages, model, temperature=config.get("temperature", 0.3), num_ctx=config.get("num_ctx", 8192), num_predict=config.get("num_predict", -1), top_p=config.get("top_p"), top_k=config.get("top_k")):
-        full += piece
-        await ctx.stream("text", piece)
+    thinking_full = ""
+    async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.3), num_ctx=config.get("num_ctx", 8192), num_predict=config.get("num_predict", -1), top_p=config.get("top_p"), top_k=config.get("top_k")):
+        full += text; thinking_full += thinking
+        await ctx.stream("text", text)
     result = {"text": full}
     if not options: return result
     choice = next((o for o in options if o.lower() in full.lower()), options[0])
@@ -236,7 +238,8 @@ async def step_list_files(config: dict, ctx) -> dict:
     """Lists files under a root as a JSON array of relative-path strings - typically feeds foreach_call_pipeline's items_source.
     Deterministic, no AI call - this is the kind of plain Python step the architecture is meant to mix freely with generation steps."""
     exts = tuple(e.strip().lower() for e in (config.get("extensions","") or "").split(",") if e.strip())
-    return {"files": sorted(str(f.relative_to(Path(config.get("root", "./data/ai_tools/_knowledge")))) for f in root.rglob("*") if f.is_file() and (not exts or f.suffix.lower() in exts))}
+    root = Path(config.get("root", "./data/ai_tools/_knowledge"))
+    return {"files": sorted(str(f.relative_to(root)) for f in root.rglob("*") if f.is_file() and (not exts or f.suffix.lower() in exts))}
 
 async def step_knowledge_query(config: dict, ctx) -> dict:
     """Returns {"response": synthesized answer text, "raw": full raw API response dict}.
@@ -283,48 +286,12 @@ async def step_expr(config: dict, ctx) -> dict:
     except Exception as e: raise RuntimeError(f"expr: {e}")
     return {"value": value}
 
-
-
-
-
-# --- Result Mapping Core ---
-
-def apply_result_map(config: dict, ctx, result: dict) -> dict:
-    """Standardized scratchpad mapping helper.
-    Supports dictionary mapping, flat merging ('*'), and accumulators ('append')."""
-    rmap = config.get("result_map")
-    if rmap == "*":
-        ctx.scratch.update(result)
-    elif isinstance(rmap, dict) and rmap:
-        for src_key, target in rmap.items():
-            val = result.get(src_key)
-            if isinstance(target, str):
-                ctx.scratch[target] = val
-            elif isinstance(target, dict):
-                k = target.get("key")
-                mode = target.get("mode", "overwrite")
-                if k:
-                    if mode == "append":
-                        existing = ctx.scratch.get(k, "")
-                        if isinstance(existing, list):
-                            existing.append(val)
-                        else:
-                            ctx.scratch[k] = (str(existing) + "\n\n" + str(val)) if existing else str(val)
-                    else:
-                        ctx.scratch[k] = val
-    elif not rmap:
-        if isinstance(result, dict):
-            ctx.scratch.update(result)
-    return result
-
-
 def _chunk_text(text: str, chunk_tokens: int = 4000) -> list[str]:
     """Splits text into chunks roughly matching chunk_tokens (assuming ~4 chars per token)."""
     if not text: return []
     char_limit = chunk_tokens * 4
     paragraphs = text.split("\n\n")
     chunks, current_chunk, current_len = [], [], 0
-
     for p in paragraphs:
         if current_len + len(p) > char_limit and current_chunk:
             chunks.append("\n\n".join(current_chunk))
@@ -333,22 +300,8 @@ def _chunk_text(text: str, chunk_tokens: int = 4000) -> list[str]:
         else:
             current_chunk.append(p)
             current_len += len(p) + 2
-
-    if current_chunk:
-        chunks.append("\n\n".join(current_chunk))
+    if current_chunk: chunks.append("\n\n".join(current_chunk))
     return chunks
-
-
-
-
-
-
-
-
-
-
-
-
 
 async def step_edit_in_place(config: dict, ctx) -> dict:
     """In-place chunk rewrite with gap-fill continuation - operates purely on a scratch text key (source_key), not any specific document store.
@@ -369,43 +322,41 @@ async def step_edit_in_place(config: dict, ctx) -> dict:
         await ctx.progress(f"editing chunk {i+1}/{len(chunks)}")
         msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": rewrite_tpl.replace("{chunk}", chunk)}]
         full = ""
-        async for piece in stream_llm(conn, msgs, model, temperature=config.get("temperature",0.3), num_ctx=config.get("num_ctx",8192), num_predict=config.get("num_ctx",8192)): full += piece
+        async for piece, _think in stream_llm(conn, msgs, model, temperature=config.get("temperature",0.3), num_ctx=config.get("num_ctx",8192), num_predict=config.get("num_ctx",8192)): full += piece
         edited.append(full.strip() or chunk)
     if marker in content and after.strip():
         fill_tpl = config.get("continuation_prompt") or "Continue the story to bridge this gap. End of text before the gap:\n\n{before}\n\nText that must follow after your bridge:\n\n{after}"
         prompt = fill_tpl.replace("{before}", (edited[-1] if edited else before)[-1500:]).replace("{after}", after[:1500])
         msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content":prompt}]
         full = ""
-        async for piece in stream_llm(conn, msgs, model, temperature=config.get("temperature",0.5), num_ctx=config.get("num_ctx",8192), num_predict=config.get("num_ctx",8192)): full += piece
+        async for piece, _think in stream_llm(conn, msgs, model, temperature=config.get("temperature",0.5), num_ctx=config.get("num_ctx",8192), num_predict=config.get("num_ctx",8192)): full += piece
         new_content, gap_remaining = "\n\n".join(edited) + "\n\n" + full.strip() + "\n\n" + after, False
     elif marker in content:
         open_tpl = config.get("open_ended_prompt") or "Continue this toward its stated goal. Existing text ends:\n\n{tail}"
         msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": open_tpl.replace("{tail}", (edited[-1] if edited else before)[-1500:])}]
         full = ""
-        async for piece in stream_llm(conn, msgs, model, temperature=config.get("temperature",0.5), num_ctx=config.get("num_ctx",8192), num_predict=config.get("num_ctx",8192)): full += piece
+        async for piece, _think in stream_llm(conn, msgs, model, temperature=config.get("temperature",0.5), num_ctx=config.get("num_ctx",8192), num_predict=config.get("num_ctx",8192)): full += piece
         new_content, gap_remaining = "\n\n".join(edited) + "\n\n" + full.strip(), True
     else:
         new_content, gap_remaining = "\n\n".join(edited) or content, False
     return {"text": new_content, "gap_remaining": gap_remaining}
 
-
 async def chunked_file_pass(config: dict, ctx) -> dict:
     conn = get_conn(config.get("conn_id", ""))
     model = config.get("model", "")
     if not conn or not model: raise RuntimeError("chunked_file_pass: connection/model not configured")
-    
     num_ctx = int(config.get("model_ctx", 32768))
     chunk_tokens = int(config.get("chunk_tokens", 6000))
     sys_p = ctx.resolve(config.get("system_prompt", ""))
     tpl = config.get("user_template", "") or "{chunk_content}"
     sep = config.get("output_separator") or "\n\n---\n\n"
-    
     bi = ENV["tools"]["built_ins"]
-    fm_root = config.get("input_source") or "./data/ai_tools/_knowledge"
+    fm_root = config.get("fm_root") or "./data/_common"
     fm = bi.FileManager(fm_root)
-    files = [str(p.relative_to(fm.root)).replace("\\", "/") for p in fm.root.rglob("*") if p.is_file() and not p.name.startswith(".")]
+    files_list = ctx.scratch.get(config.get("items_source", "files"), [])
+    if not isinstance(files_list, list): files_list = [files_list]
     accumulated_output = ""
-    for fi, rel in enumerate(files):
+    for fi, rel in enumerate(files_list):
         try: text = fm.read(rel)
         except Exception: continue
         chunks = _chunk_text(text, chunk_tokens)
@@ -413,110 +364,32 @@ async def chunked_file_pass(config: dict, ctx) -> dict:
             user_msg = tpl.replace("{file_name}", Path(rel).name).replace("{file_path}", rel).replace("{chunk_number}", str(ci+1)).replace("{chunks_total}", str(len(chunks))).replace("{chunk_content}", chunk)
             msgs = ([] if not sys_p else [{"role": "system", "content": sys_p}]) + [{"role": "user", "content": user_msg}]
             full = ""
-            async for text_piece in stream_llm(conn, msgs, model, temperature=config.get("temperature", 0.3), num_ctx=num_ctx):
+            async for text_piece, _think in stream_llm(conn, msgs, model, temperature=config.get("temperature", 0.3), num_ctx=num_ctx):
                 if text_piece:
                     full += text_piece
                     await ctx.stream("chunk_pass", text_piece)
-            if full:
-                accumulated_output += f"\n\n<!-- file_pass | {rel} chunk {ci+1}/{len(chunks)} -->\n{full.strip()}{sep}"
-            await ctx.push("file_pass_progress", {"file": rel, "chunk": ci+1, "chunks_total": len(chunks), "file_index": fi+1, "files_total": len(files)})
-    return apply_result_map(config, ctx, {"text": accumulated_output.strip(), "files_processed": len(files)})
-
+            if full: accumulated_output += f"\n\n<!-- file_pass | {rel} chunk {ci+1}/{len(chunks)} -->\n{full.strip()}{sep}"
+            await ctx.push("file_pass_progress", {"file": rel, "chunk": ci+1, "chunks_total": len(chunks), "file_index": fi+1, "files_total": len(files_list)})
+    return {"text": accumulated_output.strip(), "files_processed": len(files_list)}
 
 async def chunked_synthesis(config: dict, ctx) -> dict:
-    conn = get_conn(config.get("conn_id", ""))
-    model = config.get("model", "")
+    conn = get_conn(config.get("conn_id", "")); model = config.get("model", "")
     if not conn or not model: raise RuntimeError("chunked_synthesis: connection/model not configured")
-    
-    num_ctx = int(config.get("model_ctx", 32768))
-    chunk_tokens = int(config.get("chunk_tokens", 6000))
-    sys_p = ctx.resolve(config.get("system_prompt", ""))
-    tpl = config.get("user_template", "") or "{chunk_content}"
-    sep = config.get("output_separator") or "\n\n---\n\n"
-    
-    content = str(ctx.scratch.get("input", "")).strip()
-    if not content:
-        return apply_result_map(config, ctx, {"text": "", "chunks_processed": 0})
-        
+    num_ctx, chunk_tokens = int(config.get("model_ctx", 32768)), int(config.get("chunk_tokens", 6000))
+    sys_p, tpl, sep = ctx.resolve(config.get("system_prompt", "")), config.get("user_template", "") or "{chunk_content}", config.get("output_separator") or "\n\n---\n\n"
+    content = str(ctx.scratch.get(config.get("source_key", "input"), "")).strip()
+    if not content: return {"text": "", "chunks_processed": 0}
     chunks = _chunk_text(content, chunk_tokens)
-    accumulated_output = ""
+    accumulated = ""
     for ci, chunk in enumerate(chunks):
         user_msg = tpl.replace("{chunk_content}", chunk).replace("{chunk_number}", str(ci+1)).replace("{chunks_total}", str(len(chunks)))
-        msgs = ([] if not sys_p else [{"role": "system", "content": sys_p}]) + [{"role": "user", "content": user_msg}]
+        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content":user_msg}]
         full = ""
-        async for text_piece in stream_llm(conn, msgs, model, temperature=config.get("temperature", 0.3), num_ctx=num_ctx):
-            if text_piece:
-                full += text_piece
-                await ctx.stream("synthesis", text_piece)
-        if full:
-            accumulated_output += f"\n\n{full.strip()}{sep}"
+        async for text_piece, _think in stream_llm(conn, msgs, model, temperature=config.get("temperature", 0.3), num_ctx=num_ctx):
+            if text_piece: full += text_piece; await ctx.stream("synthesis", text_piece)
+        if full: accumulated += f"\n\n{full.strip()}{sep}"
         await ctx.push("synthesis_progress", {"chunk": ci+1, "chunks_total": len(chunks)})
-        
-    return apply_result_map(config, ctx, {"text": accumulated_output.strip(), "chunks_processed": len(chunks)})
-
-
-
-# async def chunked_file_pass(config: dict, ctx) -> dict:
-#     """Iterates selected/knowledge files, chunks each, runs a chat call per chunk, and appends results directly into the target project's document with a separator
-#     - persists after every chunk so a stopped job leaves real partial progress, matching prior behavior."""
-#     pid = config["project_id"]
-#     conn = get_conn(config.get("conn_id",""))
-#     model = config.get("model","")
-#     if not conn or not model: raise RuntimeError("chunked_file_pass: connection/model not configured")
-#     num_ctx, chunk_tokens = config.get("model_ctx", 32768), config.get("chunk_tokens", 6000)
-#     sys_p, tpl, sep = config.get("system_prompt",""), config.get("user_template","") or "{chunk_content}", config.get("output_separator") or "\n\n---\n\n"
-#     if config.get("use_selected"):
-#         doc = _load(pid)
-#         files = sorted(f for f in (doc.get("selected_files",[]) if doc else []) if (KG_DIR/f).is_file())
-#     else:
-#         base = KG_DIR/config.get("input_source","").strip("/") if config.get("input_source") else KG_DIR
-#         files = sorted(str(f.relative_to(KG_DIR)) for f in base.rglob("*") if f.is_file() and not f.name.startswith(".")) if base.exists() else []
-#     result_key = config.get("result_key","file_pass")
-#     for fi, rel in enumerate(files):
-#         try: text = (KG_DIR/rel).read_text(encoding="utf-8", errors="ignore")
-#         except Exception: continue
-#         chunks = _chunk_text(text, chunk_tokens)
-#         for ci, chunk in enumerate(chunks):
-#             user_msg = tpl.replace("{file_name}", Path(rel).name).replace("{file_path}", rel).replace("{chunk_number}", str(ci+1)).replace("{chunks_total}", str(len(chunks))).replace("{chunk_content}", chunk)
-#             msgs = ([] if not sys_p else [{"role":"system","content":sys_p}]) + [{"role":"user","content":user_msg}]
-#             full = ""
-#             async for text_piece, _tb, done, err in _stream(conn, msgs, model, num_ctx):
-#                 if err: raise RuntimeError(f"{rel} chunk {ci+1}: {err}")
-#                 if text_piece: full += text_piece; await ctx.stream(result_key, text_piece)
-#                 if done: break
-#             if full:
-#                 doc = _load(pid)
-#                 if doc: doc["content"] += f"\n\n<!-- file_pass | {rel} chunk {ci+1}/{len(chunks)} -->\n{full.strip()}{sep}"; _save(doc)
-#             await ctx.push("file_pass_progress", {"file": rel, "chunk": ci+1, "chunks_total": len(chunks), "file_index": fi+1, "files_total": len(files)})
-#     ctx.scratch[result_key] = {"files_processed": len(files)}
-#     return ctx.scratch[result_key]
-
-# async def chunked_synthesis(config: dict, ctx) -> dict:
-#     """Chunks the project's CURRENT document content and re-synthesizes chunk by chunk, appending (not replacing) - matches prior accumulate-don't-overwrite behavior."""
-#     pid = config["project_id"]
-#     conn = AIM.connections.get_conn(config.get("conn_id",""))
-#     model = config.get("model","")
-#     if not conn or not model: raise RuntimeError("tessa_synthesis: connection/model not configured")
-#     num_ctx, chunk_tokens = config.get("model_ctx", 32768), config.get("chunk_tokens", 6000)
-#     sys_p, tpl, sep = config.get("system_prompt",""), config.get("user_template","") or "{chunk_content}", config.get("output_separator") or "\n\n---\n\n"
-#     result_key = config.get("result_key","synthesis")
-#     doc = _load(pid); content = (doc.get("content","") if doc else "").strip()
-#     if not content: ctx.scratch[result_key] = {"chunks_processed": 0}; return ctx.scratch[result_key]
-#     chunks = _chunk_text(content, chunk_tokens)
-#     for ci, chunk in enumerate(chunks):
-#         user_msg = tpl.replace("{chunk_content}",chunk).replace("{chunk_number}",str(ci+1)).replace("{chunks_total}",str(len(chunks)))
-#         msgs = ([] if not sys_p else [{"role":"system","content":sys_p}]) + [{"role":"user","content":user_msg}]
-#         full = ""
-#         async for text_piece, _tb, done, err in _stream(conn, msgs, model, num_ctx):
-#             if err: raise RuntimeError(f"chunk {ci+1}: {err}")
-#             if text_piece: full += text_piece; await ctx.stream(result_key, text_piece)
-#             if done: break
-#         if full:
-#             doc = _load(pid)
-#             if doc: doc["content"] += f"\n\n{full.strip()}{sep}"; _save(doc)
-#         await ctx.push("synthesis_progress", {"chunk": ci+1, "chunks_total": len(chunks)})
-#     ctx.scratch[result_key] = {"chunks_processed": len(chunks)}
-#     return ctx.scratch[result_key]
+    return {"text": accumulated.strip(), "chunks_processed": len(chunks)}
 
 async def step_knowledge_insert_text(config: dict, ctx) -> dict:
     conn = get_conn(config.get("conn_id", ""), conn_type="lightrag")
@@ -524,12 +397,12 @@ async def step_knowledge_insert_text(config: dict, ctx) -> dict:
     text = ctx.resolve(config.get("text_template", "{input}"))
     res = await lightrag_insert_text(conn, text, config.get("source_label", ""))
     res_dict = res if isinstance(res, dict) else {"status": res}
-    return apply_result_map(config, ctx, res_dict)
+    return res_dict
 
 async def step_echo(config: dict, ctx) -> dict:
     value = ctx.resolve(config.get("template", "{input}"))
     await ctx.push("echo", {"value": value})
-    return apply_result_map(config, ctx, {"value": value, "text": value})
+    return {"value": value, "text": value}
 
 async def step_file_write(config: dict, ctx) -> dict:
     bi = ENV["tools"]["built_ins"]
@@ -540,35 +413,7 @@ async def step_file_write(config: dict, ctx) -> dict:
     if not rel_path.strip(): raise RuntimeError("file_write: resolved path is empty - check this node's Location/filename fields")
     content = ctx.scratch.get(config.get("content_key", "text"), "")
     entry = shadow.stage(rel_path, str(content), author=f"pipeline:{ctx.job_id}")
-    return apply_result_map(config, ctx, {"path": rel_path, "status": entry["status"]})
-
-# async def step_knowledge_insert_text(config: dict, ctx) -> dict:
-#     conn = get_conn(config.get("conn_id", ""), conn_type="lightrag")
-#     if not conn: raise RuntimeError("knowledge_insert_text step: no knowledge connection configured")
-#     text = ctx.resolve(config.get("text_template", "{input}"))
-#     return await lightrag_insert_text(conn, text, config.get("source_label", ""))
-
-# async def step_echo(config: dict, ctx) -> dict:
-#     """No-op passthrough: resolves its template against current scratch and returns it under result_key.
-#     Zero external dependencies - used for engine self-tests and as a manual inspection/breakpoint node when building real pipelines."""
-#     result_key = config.get("result_key", "echo")
-#     value = ctx.resolve(config.get("template", "{input}"))
-#     await ctx.push("echo", {"node_result_key": result_key, "value": value})
-#     ctx.scratch[result_key] = value
-#     return {result_key: value}
-
-# async def step_file_write(config: dict, ctx) -> dict:
-#     bi = ENV["tools"]["built_ins"]
-#     fm_root = config.get("fm_root") or "./data/_common"
-#     fm = bi.FileManager(fm_root)
-#     shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(fm_root) / "_shadow"))
-#     rel_path = ctx.resolve(config.get("path") or "")
-#     if not rel_path.strip(): raise RuntimeError("file_write: resolved path is empty - check this node's Location/filename fields")
-#     content = ctx.scratch.get(config.get("content_key", "answer"), "")
-#     entry = shadow.stage(rel_path, content, author=f"pipeline:{ctx.job_id}")
-#     result_key = config.get("result_key", "file_write")
-#     ctx.scratch[result_key] = {"path": rel_path, "status": entry["status"]}
-#     return ctx.scratch[result_key]
+    return {"path": rel_path, "status": entry["status"]}
 
 async def step_python_exec(config: dict, ctx) -> dict:
     if config.get("script_body"):
@@ -590,50 +435,7 @@ async def step_python_exec(config: dict, ctx) -> dict:
     out = stdout.decode(errors="replace").strip()
     try: parsed = json.loads(out.splitlines()[-1]) if out else {}
     except Exception: parsed = {"raw_stdout": out}
-    return apply_result_map(config, ctx, parsed if isinstance(parsed, dict) else {"result": parsed})
-    
-# async def step_python_exec(config: dict, ctx) -> dict:
-#     """Runs a script for deterministic work an LLM shouldn't do.
-#     script_path for anything reused/version-controlled; script_body carries a short inline script directly in the pipeline's own JSON for one-off glue logic with no file needed first.
-#     Contract: receives one resolved argv string, prints one line of JSON to stdout as its result (or nothing, for pure side-effect scripts).
-#     Non-zero exit or timeout raises with stderr surfaced."""
-#     if config.get("script_body"):
-#         tmp = Path(f"./data/ai_manager/_scratch_scripts/{ctx.job_id}_{ctx.node_id}.py")
-#         tmp.parent.mkdir(parents=True, exist_ok=True)
-#         tmp.write_text(ctx.resolve(config["script_body"]))
-#         script_path = str(tmp)
-#     else:
-#         script_path = config.get("script_path", "")
-#     if not script_path or not Path(script_path).is_file(): raise RuntimeError(f"python_exec: script not found: {script_path}")
-#     arg = ctx.resolve(config.get("input_template", "{input}"))
-#     timeout_s = int(config.get("timeout_s", 600) or 600)
-#     proc = await asyncio.create_subprocess_exec(sys.executable, script_path, arg, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-#     try: stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-#     except asyncio.TimeoutError:
-#         proc.kill(); await proc.communicate()
-#         raise RuntimeError(f"python_exec: timed out after {timeout_s}s")
-#     if proc.returncode != 0: raise RuntimeError(f"python_exec: exit {proc.returncode}\n{stderr.decode(errors='replace')[-1000:]}")
-#     out = stdout.decode(errors="replace").strip()
-#     try: parsed = json.loads(out.splitlines()[-1]) if out else {}
-#     except Exception: parsed = {"raw_stdout": out}
-#     result_key = config.get("result_key", "python_exec")
-#     ctx.scratch[result_key] = parsed
-#     return {result_key: parsed}
-
-# async def step_file_write_binary(config: dict, ctx) -> dict:
-#     bi = ENV["tools"]["built_ins"]
-#     fm_root = config.get("fm_root") or "./data/_common"
-#     fm = bi.FileManager(fm_root)
-#     shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(fm_root) / "_shadow"))
-#     src = ctx.scratch.get(config.get("content_key", "image_file"), {})
-#     source_path = Path(config.get("source_root") or ".") / (src.get("file_name") or "")
-#     if not source_path.is_file(): raise RuntimeError(f"file_write_binary: source not found: {source_path}")
-#     rel_path = ctx.resolve(config.get("path") or "")
-#     if not rel_path.strip(): raise RuntimeError("file_write_binary: resolved path is empty - check this node's Location/filename fields")
-#     entry = shadow.stage_binary(rel_path, source_path.read_bytes(), author=f"pipeline:{ctx.job_id}")
-#     result_key = config.get("result_key", "file_write_binary")
-#     ctx.scratch[result_key] = {"path": rel_path, "status": entry["status"]}
-#     return ctx.scratch[result_key]
+    return parsed if isinstance(parsed, dict) else {"result": parsed}
 
 async def step_file_write_binary(config: dict, ctx) -> dict:
     bi = ENV["tools"]["built_ins"]
@@ -647,43 +449,14 @@ async def step_file_write_binary(config: dict, ctx) -> dict:
     rel_path = ctx.resolve(config.get("path") or "")
     if not rel_path.strip(): raise RuntimeError("file_write_binary: resolved path is empty - check this node's Location/filename fields")
     entry = shadow.stage_binary(rel_path, source_path.read_bytes(), author=f"pipeline:{ctx.job_id}")
-    return apply_result_map(config, ctx, {"path": rel_path, "status": entry["status"]})
+    return {"path": rel_path, "status": entry["status"]}
 
 async def step_call_pipeline(config: dict, ctx) -> dict:
     pid = config.get("pipeline_id", "")
     if not pid: raise RuntimeError("call_pipeline: no pipeline selected")
     depth = int(config.get("_call_depth", 0))
     scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}")}, depth=depth)
-    return apply_result_map(config, ctx, scratch if isinstance(scratch, dict) else {"scratch": scratch})
-
-# async def step_call_pipeline(config: dict, ctx) -> dict:
-#     pid = config.get("pipeline_id", "")
-#     if not pid: raise RuntimeError("call_pipeline: no pipeline selected")
-#     depth = int(config.get("_call_depth", 0))
-#     scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}")}, depth=depth)
-#     result_key = config.get("result_key", "call_pipeline")
-#     ctx.scratch[result_key] = scratch
-#     return {result_key: scratch}
-
-# async def step_foreach_call_pipeline(config: dict, ctx) -> dict:
-#     """Iterates a list (from scratch, or newline-separated text) and calls the SAME saved pipeline once per item, collecting each sub-run's final scratch.
-#     This is the loop primitive: e.g. one line per wiki topic -> one pipeline invocation per topic."""
-#     raw = ctx.scratch.get(config.get("items_source", ""), config.get("items_source", ""))
-#     if isinstance(raw, str):
-#         try: items = json.loads(raw)
-#         except Exception: items = [x.strip() for x in raw.split("\n") if x.strip()]
-#     else: items = raw if isinstance(raw, list) else []
-#     if not items: raise RuntimeError("foreach_call_pipeline: items_source resolved to an empty list")
-#     pid = config.get("pipeline_id", "")
-#     if not pid: raise RuntimeError("foreach_call_pipeline: no pipeline selected")
-#     depth = int(config.get("_call_depth", 0))
-#     results = []
-#     for i, item in enumerate(items):
-#         await ctx.progress(f"item {i+1}/{len(items)}: {str(item)[:60]}")
-#         results.append(await engine.run_inline(ctx.username, pid, inputs={"input": str(item)}, depth=depth))
-#     result_key = config.get("result_key", "foreach_results")
-#     ctx.scratch[result_key] = results
-#     return {result_key: results}
+    return scratch if isinstance(scratch, dict) else {"scratch": scratch}
 
 async def step_foreach_call_pipeline(config: dict, ctx) -> dict:
     raw = ctx.scratch.get(config.get("items_source", ""), config.get("items_source", ""))
@@ -699,23 +472,7 @@ async def step_foreach_call_pipeline(config: dict, ctx) -> dict:
     for i, item in enumerate(items):
         await ctx.progress(f"item {i+1}/{len(items)}: {str(item)[:60]}")
         results.append(await engine.run_inline(ctx.username, pid, inputs={"input": str(item)}, depth=depth))
-    return apply_result_map(config, ctx, {"results": results, "count": len(results)})
-
-# async def step_branch_on(config: dict, ctx) -> dict:
-#     """Reads a scratch value (typically from a decision node) and calls the pipeline mapped to that value.
-#     routes_json: {"go": "pl_xxx", "redo": "pl_yyy"}.
-#     This is how a redo loop is expressed in an acyclic graph: 'redo' routes back to a pipeline that (re)does the work, rather than an actual cycle in this DAG - depth-guarded via run_inline."""
-#     key = config.get("decision_key", "decision")
-#     value = str(ctx.scratch.get(key, ""))
-#     try: routes = json.loads(config.get("routes_json", "{}") or "{}")
-#     except Exception: routes = {}
-#     pid = routes.get(value) or config.get("default_pipeline_id", "")
-#     if not pid: raise RuntimeError(f"branch_on: no route configured for decision value '{value}'")
-#     depth = int(config.get("_call_depth", 0))
-#     scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}")}, depth=depth)
-#     result_key = config.get("result_key", "branch_result")
-#     ctx.scratch[result_key] = scratch
-#     return {result_key: scratch}
+    return {"results": results, "count": len(results)}
 
 async def step_branch_on(config: dict, ctx) -> dict:
     key = config.get("decision_key", "decision")
@@ -726,20 +483,4 @@ async def step_branch_on(config: dict, ctx) -> dict:
     if not pid: raise RuntimeError(f"branch_on: no route configured for decision value '{value}'")
     depth = int(config.get("_call_depth", 0))
     scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}")}, depth=depth)
-    return apply_result_map(config, ctx, scratch if isinstance(scratch, dict) else {"scratch": scratch})
-
-
-
-# async def step_image_generate(config: dict, ctx) -> dict:
-#     txt_conn = get_conn(config.get("text_encoder_conn_id", ""))
-#     img_conn = get_conn(config.get("image_conn_id", ""))
-#     prompt = ctx.resolve(config.get("prompt_template", "{input}"))
-#     w = int(config.get("width", 1024))
-#     h = int(config.get("height", 1024))
-#     steps = int(config.get("steps", 4))
-#     cfg = float(config.get("cfg", 1.0))
-#     shift = float(config.get("shift", 1.0))
-#     seed = int(config.get("seed", -1))
-#     enc = await flux2_encode(txt_conn, prompt) if txt_conn else prompt
-#     res = await flux2_generate(img_conn, enc, width=w, height=h, steps=steps, cfg=cfg, shift=shift, seed=seed)
-#     return apply_result_map(config, ctx, res if isinstance(res, dict) else {"image_file": res})
+    return scratch if isinstance(scratch, dict) else {"scratch": scratch}

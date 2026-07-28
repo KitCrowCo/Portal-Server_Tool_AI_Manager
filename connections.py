@@ -128,17 +128,17 @@ def _get_nested_value(data, path: str):
         if data is None: return ""
     return data
 
-async def stream_llm(conn: dict, messages: list, model: str, **kwargs):
-    """Agnostic chat stream.
-    Endpoint path/method/body shape come from the connection profile's own endpoints.chat.
-    kwargs are canonical generation params (temperature, num_ctx, num_predict, top_p, top_k, seed, stop);
-    only ones the connection's options_schema recognizes get sent, so a step never needs provider-specific parameter names.
-    response_parser (stream_format/content_path) and status_map.stream_done_sentinel drive how the reply is read back."""
+async def stream_llm(conn: dict, messages: list, model: str, think: bool = False, **kwargs):
+    """Agnostic chat stream. Yields (text, thinking) tuples per chunk - thinking is "" for providers/calls that don't produce it.
+    think=True is honored only if the connection's profile declares supports_thinking;
+    otherwise it's silently dropped with a console warning, never an error - a provider lacking a capability is a gap in that provider, not a reason to remove the capability for providers that have it."""
     profile = _conn_profile(conn)
     chat_ep = profile.get("endpoints", {}).get("chat", {})
     if not chat_ep: raise RuntimeError(f"stream_llm: connection_type '{conn.get('connection_type')}' has no endpoints.chat")
+    supports_thinking = profile.get("supports_thinking", False)
+    if think and not supports_thinking: print(f"[stream_llm] '{conn.get('connection_type')}' has no supports_thinking - think=True ignored for this call")
     options = _resolved_options(profile, kwargs)
-    payload = _render_template(chat_ep.get("body", {}), {"model": model, "messages": messages, "options": options, **options})
+    payload = _render_template(chat_ep.get("body", {}), {"model": model, "messages": messages, "think": think and supports_thinking, "options": options, **options})
     url = _base(conn) + chat_ep.get("path", "/api/chat")
     headers = {}
     api_key = conn.get("values", {}).get("api_key", "")
@@ -150,7 +150,7 @@ async def stream_llm(conn: dict, messages: list, model: str, **kwargs):
         async with c.stream(chat_ep.get("method","POST"), url, json=payload, headers=headers) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
-                yield f"\n[Connection Error {resp.status_code}: {body.decode(errors='replace')[:300]}]"; return
+                yield f"\n[Connection Error {resp.status_code}: {body.decode(errors='replace')[:300]}]", ""; return
             async for line in resp.aiter_lines():
                 if not line: continue
                 if parser.get("stream_format") == "sse":
@@ -160,7 +160,8 @@ async def stream_llm(conn: dict, messages: list, model: str, **kwargs):
                 try: chunk = json.loads(line)
                 except json.JSONDecodeError: continue
                 text = _get_nested_value(chunk, parser.get("content_path",""))
-                if text: yield text
+                thinking = _get_nested_value(chunk, parser.get("thinking_path","")) if supports_thinking else ""
+                if text or thinking: yield text, thinking
                 if done_sentinel and chunk.get(done_sentinel.get("key","done")) == done_sentinel.get("value", True): break
 
 # --- LightRAG ---
