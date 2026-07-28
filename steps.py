@@ -16,7 +16,7 @@ def init(env: dict):
     global ENV
     ENV = env
 
-def register_step_type(name: str, fn, label: str = "", config_schema: list = None): _STEP_TYPES[name] = {"fn": fn, "label": label or name, "config_schema": config_schema or []} # label/config_schema are optional UI hints for pipeline builders - the engine itself never reads them.
+def register_step_type(name, fn, label="", config_schema=None, output_keys=None): _STEP_TYPES[name] = {"fn": fn, "label": label or name, "config_schema": config_schema or [], "output_keys": output_keys or []} # label/config_schema are optional UI hints for pipeline builders - the engine itself never reads them.
 def get_step_type(name: str) -> dict: return _STEP_TYPES.get(name)
 def list_step_types() -> list: return [{"type": k, **{kk: vv for kk, vv in v.items() if kk != "fn"}} for k, v in _STEP_TYPES.items()]
 def _llm_conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name",c["_id"])} [{c.get("connection_type")}]') for c in (list_conns("ollama") + list_conns("vllm"))]
@@ -25,12 +25,23 @@ def _flux2_text_options(values=None): return [("", "(none)")] + [(c["_id"], c.ge
 def _flux2_image_options(values=None): return [("", "(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns("flux2_image")]
 def _pipeline_options(values=None): return [("", "(none)")] + [(p["id"], f'{p.get("name",p["id"])} [{", ".join(p.get("tags",[]))}]') for p in engine.list_pipelines()]
 
+def _model_options_for_config(values=None):
+    """Reads the config's OWN conn_id at render time to list that connection's real models."""
+    conn_id = (values or {}).get("conn_id", "")
+    if not conn_id: return []
+    conn = get_conn(conn_id)
+    models = list_models_sync(conn) if conn else []
+    cur = (values or {}).get("model", "")
+    if cur and cur not in models: models = [cur] + models
+    return [(m, m) for m in models]
+
 def register_builtins():
     BI = ENV["tools"]["built_ins"]
     def _rmap_field(): return BI.SettingField("result_map", "Result Mapping (JSON, optional)", type="json", default={}, hint='Map this step\'s output fields to scratch keys, e.g. {"text":"article_md"}. "*" merges everything flat. {"text":{"key":"notes","mode":"append"}} accumulates rather than overwrites.')
 
     register_step_type("llm_generate", step_llm_generate, "LLM Generate (chat / decision / router)", [
-        BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options), BI.SettingField("model", "Model", type="text"),
+        BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
+        BI.SettingField("model", "Model", type="select", options=_model_options_for_config),
         BI.SettingField("system_prompt", "System Prompt", type="textarea", default="You are a helpful AI assistant."),
         BI.SettingField("user_template", "User Prompt Template", type="textarea", default="{input}"),
         BI.SettingField("enforce_options", "Enforced Options (comma-sep)", type="text"),
@@ -38,16 +49,17 @@ def register_builtins():
         BI.SettingField("temperature", "Temperature", type="number", default=0.7, hint="No artificial step limit - test whatever value your task needs."),
         BI.SettingField("num_ctx", "Context Window (tokens)", type="number", default=16384, step=1),
         BI.SettingField("num_predict", "Max Output Tokens", type="number", default=-1, step=1, hint="-1 = unlimited (provider default)"),
-        BI.SettingField("top_p", "Top P", type="number", default=None), BI.SettingField("top_k", "Top K", type="number", default=None, step=1),
+        BI.SettingField("top_p", "Top P", type="number", default=None),
+        BI.SettingField("top_k", "Top K", type="number", default=None, step=1),
         BI.SettingField("think", "Enable Thinking Mode", type="checkbox", default=False, hint="Only takes effect on connections whose profile declares supports_thinking (Ollama does). Silently ignored otherwise - a console warning is logged, not an error."),
-        _rmap_field()])
+        _rmap_field()], output_keys=["text", "thinking", "choice"])
 
     register_step_type("find", step_find, "Find (grep, regex search)",[
         BI.SettingField("source_key","Source Scratch Key","text",default="input"),
         BI.SettingField("path","File Path Override","text"),
         BI.SettingField("pattern","Regex Pattern","text"),
         BI.SettingField("dotall","Regex DOTALL","checkbox",default=False),
-        _rmap_field()])
+        _rmap_field()], output_keys=["matches", "count", "source"])
 
     register_step_type("text_replace", step_text_replace, "Text Replace (sed / template fill)",[
         BI.SettingField("source_key","Source Scratch Key","text",default="input"),
@@ -64,12 +76,12 @@ def register_builtins():
         BI.SettingField("query_template","Query Template","textarea",default="{input}"),
         BI.SettingField("return_context_only","Return raw context only (no synthesis)","checkbox",default=False),
         BI.SettingField("extra_params","Extra Params (JSON, passthrough)","json",default={}),
-        _rmap_field()])
+        _rmap_field()], output_keys=["response", "raw"])
 
     register_step_type("knowledge_list_entities", step_knowledge_list_entities, "Knowledge Graph - List Entities", [
         BI.SettingField("conn_id","Knowledge Connection",type="select", options=_knowledge_conn_options),
         BI.SettingField("limit","Limit","number",default=500,step=1),
-        _rmap_field()])
+        _rmap_field()], output_keys=["entities"])
 
     register_step_type("knowledge_insert_text", step_knowledge_insert_text, "Knowledge Insert Text", [
         BI.SettingField("conn_id","Knowledge Connection", type="select", options=_knowledge_conn_options),
@@ -78,7 +90,8 @@ def register_builtins():
 
     register_step_type("file_write", step_file_write, "File Write (shadow-staged)", [
         BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common"),
-        BI.SettingField("path","Destination Path","text",hint="Supports {templates}"), BI.SettingField("content_key","Content Scratch Key","text",default="text"),
+        BI.SettingField("path","Destination Path","text",hint="Supports {templates}"),
+        BI.SettingField("content_key","Content Scratch Key","text",default="text"),
         _rmap_field()])
 
     register_step_type("file_write_binary", step_file_write_binary, "File Write Binary (shadow-staged)", [
@@ -95,7 +108,7 @@ def register_builtins():
         BI.SettingField("timeout_s","Timeout (s)","number",default=600,step=1),
         _rmap_field()])
 
-    register_step_type("list_files", step_list_files, "List Files", [BI.SettingField("root","Target Directory","text",default="./data/ai_tools/_knowledge"),BI.SettingField("extensions","Extensions","text"),_rmap_field()])
+    register_step_type("list_files", step_list_files, "List Files", [BI.SettingField("root","Target Directory","text",default="./data/ai_tools/_knowledge"),BI.SettingField("extensions","Extensions","text"),_rmap_field()], output_keys=["files"])
     register_step_type("echo", step_echo, "Echo / Passthrough", [BI.SettingField("template","Template","textarea",default="{input}"), _rmap_field()])
     register_step_type("expr", step_expr, "Expression (mini derived value)", [BI.SettingField("vars_json","Variables (JSON: name -> template)","json",default={}), BI.SettingField("expr","Python Expression","text",default="input"), _rmap_field()])
     register_step_type("call_pipeline", step_call_pipeline, "Call Another Pipeline", [BI.SettingField("pipeline_id","Pipeline ID","text"), BI.SettingField("input_template","Input Template","textarea",default="{input}"), _rmap_field()])
@@ -123,11 +136,13 @@ def register_builtins():
     register_step_type("call_pipeline", step_call_pipeline, "Call Another Pipeline", [
         BI.SettingField("pipeline_id", "Pipeline ID", type="select", options=_pipeline_options),
         BI.SettingField("input_template", "Input Template", type="textarea", default="{input}"),
+        BI.SettingField("extra_inputs_json", "Extra Inputs (JSON: key -> template)", type="json", default={}, hint='Passed alongside "input" into the sub-pipeline scratch, e.g. {"source_dir":"{n1.files}"} - lets the sub-pipeline reference more than just the current item.'),
         BI.SettingField("_call_depth", "Call Depth Override", type="number", default=0, hint="Advanced: manually increment depth tracking"),
         _rmap_field()])
 
     register_step_type("foreach_call_pipeline", step_foreach_call_pipeline, "For Each Item, Call Pipeline", [
         BI.SettingField("items_source", "Items Scratch Key", type="text", hint="Scratch key containing a JSON array or text block"),
+        BI.SettingField("extra_inputs_json", "Extra Inputs (JSON: key -> template)", type="json", default={}, hint='Passed alongside "input" into the sub-pipeline scratch, e.g. {"source_dir":"{n1.files}"} - lets the sub-pipeline reference more than just the current item.'),
         BI.SettingField("pipeline_id", "Pipeline ID", type="select", options=_pipeline_options, hint="ID of the pipeline to run per item"),
         BI.SettingField("_call_depth", "Call Depth Override", type="number", default=0),
         _rmap_field()])
@@ -137,11 +152,12 @@ def register_builtins():
         BI.SettingField("routes_json", "Routes Map (JSON)", type="textarea", default="{}", hint="Map decision strings to pipeline IDs"),
         BI.SettingField("default_pipeline_id", "Default Pipeline ID", type="text", hint="Fallback pipeline if decision string doesn't match"),
         BI.SettingField("input_template", "Input Template", type="textarea", default="{input}"),
+        BI.SettingField("extra_inputs_json", "Extra Inputs (JSON: key -> template)", type="json", default={}, hint='Passed alongside "input" into the sub-pipeline scratch, e.g. {"source_dir":"{n1.files}"} - lets the sub-pipeline reference more than just the current item.'),
         _rmap_field()])
 
     register_step_type("edit_in_place", step_edit_in_place, "Edit In Place (gap-aware, chunked)", [
         BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
-        BI.SettingField("model", "Model", type="text"),
+        BI.SettingField("model", "Model", type="select", options=_model_options_for_config),
         BI.SettingField("system_prompt", "System Prompt", type="textarea"),
         BI.SettingField("rewrite_prompt", "Rewrite Prompt", type="textarea"),
         BI.SettingField("continuation_prompt", "Continuation Prompt", type="textarea"),
@@ -156,7 +172,7 @@ def register_builtins():
     register_step_type("chunked_file_pass", chunked_file_pass, "Chunked File Pass", [
         BI.SettingField("project_id", "Project ID", type="text"),
         BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
-        BI.SettingField("model", "Model", type="text"),
+        BI.SettingField("model", "Model", type="select", options=_model_options_for_config),
         BI.SettingField("system_prompt", "System Prompt", type="textarea"),
         BI.SettingField("user_template", "User Template", type="textarea", default="{chunk_content}"),
         BI.SettingField("output_separator", "Output Separator", type="text", default="\n\n---\n\n"),
@@ -170,7 +186,7 @@ def register_builtins():
     register_step_type("chunked_synthesis", chunked_synthesis, "Chunked Synthesis", [
         BI.SettingField("project_id", "Project ID", type="text"),
         BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
-        BI.SettingField("model", "Model", type="text"),
+        BI.SettingField("model", "Model", type="select", options=_model_options_for_config),
         BI.SettingField("system_prompt", "System Prompt", type="textarea"),
         BI.SettingField("user_template", "User Template", type="textarea", default="{chunk_content}"),
         BI.SettingField("output_separator", "Output Separator", type="text", default="\n\n---\n\n"),
@@ -179,6 +195,12 @@ def register_builtins():
         BI.SettingField("temperature", "Temperature", type="number", default=0.3, step="any"),
         BI.SettingField("source_key", "Source Scratch Key", type="text", default="input", hint="Which upstream result to chunk-synthesize - defaults to the pipeline's own input."),
         _rmap_field()])
+
+    register_step_type("format_each", step_format_each, "Format Each (list → repeated text)", [
+        BI.SettingField("items_key","Items Scratch Key","text"),
+        BI.SettingField("item_template","Item Template","textarea",default="{input}"),
+        BI.SettingField("separator","Separator","text",default="\n\n---\n\n"),
+        _rmap_field()], output_keys=["text","count"])
 
 async def step_llm_generate(config: dict, ctx) -> dict:
     """Universal text-generation node. Returns {"text": full reply, "choice": <if enforce_options set>}.
@@ -411,7 +433,8 @@ async def step_file_write(config: dict, ctx) -> dict:
     shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(fm_root) / "_shadow"))
     rel_path = ctx.resolve(config.get("path") or "")
     if not rel_path.strip(): raise RuntimeError("file_write: resolved path is empty - check this node's Location/filename fields")
-    content = ctx.scratch.get(config.get("content_key", "text"), "")
+    raw_key = str(config.get("content_key", "text")).strip()
+    content = ctx.resolve(raw_key if raw_key.startswith("{") else "{" + raw_key + "}")
     entry = shadow.stage(rel_path, str(content), author=f"pipeline:{ctx.job_id}")
     return {"path": rel_path, "status": entry["status"]}
 
@@ -455,7 +478,7 @@ async def step_call_pipeline(config: dict, ctx) -> dict:
     pid = config.get("pipeline_id", "")
     if not pid: raise RuntimeError("call_pipeline: no pipeline selected")
     depth = int(config.get("_call_depth", 0))
-    scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}")}, depth=depth)
+    scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}"), **_resolve_extra_inputs(config, ctx)}, depth=depth)
     return scratch if isinstance(scratch, dict) else {"scratch": scratch}
 
 async def step_foreach_call_pipeline(config: dict, ctx) -> dict:
@@ -471,7 +494,7 @@ async def step_foreach_call_pipeline(config: dict, ctx) -> dict:
     results = []
     for i, item in enumerate(items):
         await ctx.progress(f"item {i+1}/{len(items)}: {str(item)[:60]}")
-        results.append(await engine.run_inline(ctx.username, pid, inputs={"input": str(item)}, depth=depth))
+        results.append(await engine.run_inline(ctx.username, pid, inputs={"input": str(item), **_resolve_extra_inputs(config, ctx)}, depth=depth))
     return {"results": results, "count": len(results)}
 
 async def step_branch_on(config: dict, ctx) -> dict:
@@ -482,5 +505,19 @@ async def step_branch_on(config: dict, ctx) -> dict:
     pid = routes.get(value) or config.get("default_pipeline_id", "")
     if not pid: raise RuntimeError(f"branch_on: no route configured for decision value '{value}'")
     depth = int(config.get("_call_depth", 0))
-    scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}")}, depth=depth)
+    scratch = await engine.run_inline(ctx.username, pid, inputs={"input": ctx.resolve(config.get("input_template") or "{input}"), **_resolve_extra_inputs(config, ctx)}, depth=depth)
     return scratch if isinstance(scratch, dict) else {"scratch": scratch}
+
+async def step_format_each(config: dict, ctx) -> dict:
+    """Turns a list of dicts (typically foreach_call_pipeline's 'results') into repeated text blocks.
+    item_template uses {field} for keys INSIDE one item directly
+    - not {node.field}, since a list item has no node id of its own, just whatever keys that sub-run's scratch ended up with (its "input", plus any top-level keys its own steps wrote via result_map)."""
+    items = ctx.scratch.get(config.get("items_key",""), [])
+    if not isinstance(items, list): raise RuntimeError("format_each: items_key must resolve to a list")
+    tpl, sep = config.get("item_template", "{input}"), config.get("separator", "\n\n---\n\n")
+    def _fmt(item):
+        out = tpl
+        if isinstance(item, dict):
+            for k, v in item.items(): out = out.replace("{" + k + "}", str(v))
+        return out
+    return {"text": sep.join(_fmt(i) for i in items), "count": len(items)}

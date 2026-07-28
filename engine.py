@@ -54,6 +54,11 @@ def _reconcile_stale_jobs():
                 f.write_text(json.dumps(job, indent=2))
         except Exception: continue
 
+def _resolve_extra_inputs(config: dict, ctx) -> dict:
+    try: templates = json.loads(config.get("extra_inputs_json","{}") or "{}")
+    except Exception: templates = {}
+    return {k: ctx.resolve(v) for k, v in templates.items()}
+
 class StepContext:
     def __init__(self, job_id, username, scratch):
         self.job_id, self.username, self.scratch = job_id, username, scratch
@@ -119,7 +124,7 @@ def submit(username, kind="id", pipeline_id="", inline_flow=None, inputs=None, a
     if extra_config:
         for n in flow_data.get("nodes", []): n.setdefault("config", {}).update(extra_config)
     job_id = f"job_{uuid.uuid4().hex[:10]}"
-    job = {"id": job_id, "username": username, "flow": flow_data, "status": "queued", "scratch": {"input": (inputs or {}).get("input", "")}, "log": [], "heartbeat": time.time(), "created": datetime.utcnow().isoformat()}
+    job = {"id": job_id, "username": username, "flow": flow_data, "status": "queued", "scratch": {"input": "", **(inputs or {})}, "log": [], "heartbeat": time.time(), "created": datetime.utcnow().isoformat()}
     _save_job(job)
     task = asyncio.create_task(_run(job_id))
     task.add_done_callback(_task_exception_logger)
@@ -145,7 +150,6 @@ def stop(job_id: str):
         _save_job(job)
 
 def _log(job: dict, msg: str): job.setdefault("log", []).append(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}")
-
 
 async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
     f = Flow(flow)
@@ -186,6 +190,8 @@ async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
                     ctx.node_id = nd["id"]
                     result = await spec["fn"](nd.get("config", {}), ctx)
                 ctx.scratch[nd["id"]] = result
+                alias = re.sub(r'\W+', '_', nd.get("name","").strip()).strip('_')
+                if alias and alias not in ctx.scratch: ctx.scratch[alias] = result
                 apply_result_map(nd.get("config", {}), ctx, result)
                 preview = {k: str(v)[:100] for k, v in (result or {}).items()}
                 await ctx.set_node_status(nd["id"], "done", {"preview": preview})
@@ -272,7 +278,7 @@ async def run_inline(username: str, pipeline_id: str, inputs: dict = None, extra
     merged = {**(extra_config or {}), "_call_depth": depth + 1}
     for n in flow_data.get("nodes", []): n.setdefault("config", {}).update(merged)
     job_id = f"job_{uuid.uuid4().hex[:10]}"
-    job = {"id": job_id, "username": username, "flow": flow_data, "status": "running", "scratch": {"input": (inputs or {}).get("input", "")}, "log": [], "heartbeat": time.time(), "created": datetime.utcnow().isoformat()}
+    job = {"id": job_id, "username": username, "flow": flow_data, "status": "queued", "scratch": {"input": "", **(inputs or {})}, "log": [], "heartbeat": time.time(), "created": datetime.utcnow().isoformat()}
     _save_job(job)
     ctx = StepContext(job_id, username, job["scratch"])
     await _run_flow(flow_data, ctx, job_id)
