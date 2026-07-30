@@ -190,8 +190,14 @@ async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
                     ctx.node_id = nd["id"]
                     result = await spec["fn"](nd.get("config", {}), ctx)
                 ctx.scratch[nd["id"]] = result
-                alias = re.sub(r'\W+', '_', nd.get("name","").strip()).strip('_')
-                if alias and alias not in ctx.scratch: ctx.scratch[alias] = result
+                alias = re.sub(r'\W+', '_', nd.get("name","").strip().lower()).strip('_')
+                if alias:
+                    if alias in ctx.scratch and alias != nd["id"]:
+                        job = load_job(job_id)
+                        _log(job, f"alias collision: '{alias}' already in use - node {nd['id']} ({nd.get('name','')}) only resolvable by id")
+                        _save_job(job)
+                    else:
+                        ctx.scratch[alias] = result
                 apply_result_map(nd.get("config", {}), ctx, result)
                 preview = {k: str(v)[:100] for k, v in (result or {}).items()}
                 await ctx.set_node_status(nd["id"], "done", {"preview": preview})

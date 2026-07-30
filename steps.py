@@ -16,7 +16,7 @@ def init(env: dict):
     global ENV
     ENV = env
 
-def register_step_type(name, fn, label="", config_schema=None, output_keys=None): _STEP_TYPES[name] = {"fn": fn, "label": label or name, "config_schema": config_schema or [], "output_keys": output_keys or []} # label/config_schema are optional UI hints for pipeline builders - the engine itself never reads them.
+def register_step_type(name, fn, label="", config_schema=None, output_keys=None, guide=""): _STEP_TYPES[name] = {"fn": fn, "label": label or name, "config_schema": config_schema or [], "output_keys": output_keys or [], "guide": guide} # label/config_schema are optional UI hints for pipeline builders - the engine itself never reads them.
 def get_step_type(name: str) -> dict: return _STEP_TYPES.get(name)
 def list_step_types() -> list: return [{"type": k, **{kk: vv for kk, vv in v.items() if kk != "fn"}} for k, v in _STEP_TYPES.items()]
 def _llm_conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name",c["_id"])} [{c.get("connection_type")}]') for c in (list_conns("ollama") + list_conns("vllm"))]
@@ -37,22 +37,24 @@ def _model_options_for_config(values=None):
 
 def register_builtins():
     BI = ENV["tools"]["built_ins"]
-    def _rmap_field(): return BI.SettingField("result_map", "Result Mapping (JSON, optional)", type="json", default={}, hint='Map this step\'s output fields to scratch keys, e.g. {"text":"article_md"}. "*" merges everything flat. {"text":{"key":"notes","mode":"append"}} accumulates rather than overwrites.')
+    def _rmap_field(): return BI.SettingField("result_map", "Result Mapping (JSON, optional)", type="json", default={}, advanced=True, hint='Map this step\'s output fields to scratch keys, e.g. {"text":"article_md"}. "*" merges everything flat. {"text":{"key":"notes","mode":"append"}} accumulates rather than overwrites.')
 
     register_step_type("llm_generate", step_llm_generate, "LLM Generate (chat / decision / router)", [
         BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
         BI.SettingField("model", "Model", type="select", options=_model_options_for_config),
         BI.SettingField("system_prompt", "System Prompt", type="textarea", default="You are a helpful AI assistant."),
-        BI.SettingField("user_template", "User Prompt Template", type="textarea", default="{input}"),
-        BI.SettingField("enforce_options", "Enforced Options (comma-sep)", type="text"),
-        BI.SettingField("routes_json", "Routing JSON", type="json", default={}),
+        BI.SettingField("user_template", "User Prompt Template", type="textarea", default="{input}", hint="Reference an upstream node's output with {node_id.field}, e.g. {n1.text}. Bare {input} is this pipeline's own input."),
         BI.SettingField("temperature", "Temperature", type="number", default=0.7, hint="No artificial step limit - test whatever value your task needs."),
         BI.SettingField("num_ctx", "Context Window (tokens)", type="number", default=16384, step=1),
         BI.SettingField("num_predict", "Max Output Tokens", type="number", default=-1, step=1, hint="-1 = unlimited (provider default)"),
-        BI.SettingField("top_p", "Top P", type="number", default=None),
-        BI.SettingField("top_k", "Top K", type="number", default=None, step=1),
-        BI.SettingField("think", "Enable Thinking Mode", type="checkbox", default=False, hint="Only takes effect on connections whose profile declares supports_thinking (Ollama does). Silently ignored otherwise - a console warning is logged, not an error."),
-        _rmap_field()], output_keys=["text", "thinking", "choice"])
+        BI.SettingField("json_fields", "JSON Output Fields (comma-sep, optional)", type="text", advanced=True, hint='e.g. "char_name, char_desc" - model is instructed to reply with exactly these JSON keys, giving you {this_node.char_name}, {this_node.char_desc} directly. Falls back to plain {this_node.text} if parsing fails.'),
+        BI.SettingField("think", "Enable Thinking Mode", type="checkbox", default=False, hint="Only takes effect on connections whose profile declares supports_thinking (Ollama does). Silently ignored otherwise."),
+        BI.SettingField("enforce_options", "Enforced Options (comma-sep)", type="text", advanced=True, hint="Constrains the reply to one of these words - enables Routing JSON below."),
+        BI.SettingField("routes_json", "Routing JSON", type="json", default={}, advanced=True, hint='Maps an enforced-option word to a downstream node id, e.g. {"yes":"n5","no":"n8"}. Requires Enforced Options.'),
+        BI.SettingField("top_p", "Top P", type="number", default=None, advanced=True),
+        BI.SettingField("top_k", "Top K", type="number", default=None, step=1, advanced=True),
+        _rmap_field()], output_keys=["text", "thinking", "choice"], guide="""Calls a chat model. Returns {this_node.text} (full reply) and {this_node.thinking} (if the model/profile supports thinking).
+Reference this node's output elsewhere as {alias.text} - alias is this node's Name field, lowercased, with spaces/punctuation turned to underscores (e.g. "Char Gen" -> char_gen). If Name is blank, you can only use {node_id.text} - harder to remember but always works. JSON Output Fields (Advanced): instead of one text blob, ask for several named values in one pass - e.g. "char_name, char_desc" gives {alias.char_name} and {alias.char_desc} directly, no separate parse node needed. Falls back to plain {alias.text} if the model doesn't reply in valid JSON. Enforced Options + Routing JSON (Advanced): constrains the reply to one word from a fixed list and routes to a different downstream node per word - use for yes/no branches or category routers.""")
 
     register_step_type("find", step_find, "Find (grep, regex search)",[
         BI.SettingField("source_key","Source Scratch Key","text",default="input"),
@@ -89,10 +91,10 @@ def register_builtins():
         BI.SettingField("source_label","Source Label","text")])
 
     register_step_type("file_write", step_file_write, "File Write (shadow-staged)", [
-        BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common"),
-        BI.SettingField("path","Destination Path","text",hint="Supports {templates}"),
-        BI.SettingField("content_key","Content Scratch Key","text",default="text"),
-        _rmap_field()])
+        BI.SettingField("fm_root","FS Root","file_picker", default="./data/_common"),
+        BI.SettingField("path","Destination Path","text", hint="Supports {templates}, e.g. articles/{input}.md"),
+        BI.SettingField("content_key","Content Scratch Key","text",default="text", hint="Either a key promoted via Result Mapping on an upstream node, or a direct reference like {n2.text}. Bare 'text' only resolves if exactly one upstream node's output was mapped to that name."),
+        _rmap_field()], guide="""Writes text to a file - never directly, always through the Shadow Stage (Tessa's Pending Reviews panel), where you accept or reject the change before it touches the real file. Location supports {templates}, e.g. articles/{input}.md. Content Scratch Key is either a name promoted via Result Mapping on an upstream node, or a direct reference like {n2.text} / {char_gen.char_desc}. The bare default "text" only works if exactly one upstream node's output was mapped to that name - if nothing gets written, this is almost always why.""")
 
     register_step_type("file_write_binary", step_file_write_binary, "File Write Binary (shadow-staged)", [
         BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common"),
@@ -111,15 +113,6 @@ def register_builtins():
     register_step_type("list_files", step_list_files, "List Files", [BI.SettingField("root","Target Directory","text",default="./data/ai_tools/_knowledge"),BI.SettingField("extensions","Extensions","text"),_rmap_field()], output_keys=["files"])
     register_step_type("echo", step_echo, "Echo / Passthrough", [BI.SettingField("template","Template","textarea",default="{input}"), _rmap_field()])
     register_step_type("expr", step_expr, "Expression (mini derived value)", [BI.SettingField("vars_json","Variables (JSON: name -> template)","json",default={}), BI.SettingField("expr","Python Expression","text",default="input"), _rmap_field()])
-    register_step_type("call_pipeline", step_call_pipeline, "Call Another Pipeline", [BI.SettingField("pipeline_id","Pipeline ID","text"), BI.SettingField("input_template","Input Template","textarea",default="{input}"), _rmap_field()])
-    register_step_type("foreach_call_pipeline", step_foreach_call_pipeline, "For Each Item, Call Pipeline", [BI.SettingField("items_source","Items Scratch Key","text"), BI.SettingField("pipeline_id","Pipeline ID","text"), _rmap_field()])
-
-    register_step_type("branch_on", step_branch_on, "Branch On Decision", [
-        BI.SettingField("decision_key","Decision Scratch Key","text",default="decision"),
-        BI.SettingField("routes_json","Routes Map (JSON)","json",default={}),
-        BI.SettingField("default_pipeline_id","Default Pipeline ID","text"),
-        BI.SettingField("input_template","Input Template","textarea",default="{input}"),
-        _rmap_field()])
 
     register_step_type("image_generate", step_image_generate, "Text-to-Image (Flux2)", [
         BI.SettingField("text_encoder_conn_id", "Text Encoder Connection", type="select", options = _flux2_text_options, hint="ID of the flux2_text connection"),
@@ -212,15 +205,21 @@ async def step_llm_generate(config: dict, ctx) -> dict:
     if not model: raise RuntimeError("llm_generate: no model configured")
     raw_opts = config.get("enforce_options", "")
     options = raw_opts if isinstance(raw_opts, list) else [o.strip() for o in raw_opts.split(",") if o.strip()]
+    json_fields = [f.strip() for f in str(config.get("json_fields","")).split(",") if f.strip()]
     sys_p = ctx.resolve(config.get("system_prompt") or "")
     if options: sys_p = (sys_p + f"\n\nRespond with exactly one of these words and nothing else: {', '.join(options)}").strip()
+    if json_fields: sys_p = (sys_p + f"\n\nRespond ONLY with a single JSON object with exactly these keys: {json.dumps(json_fields)}. No markdown fences, no text before or after the JSON.").strip()
     messages = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": ctx.resolve(config.get("user_template") or "{input}")}]
     full = ""
     thinking_full = ""
     async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.3), num_ctx=config.get("num_ctx", 8192), num_predict=config.get("num_predict", -1), top_p=config.get("top_p"), top_k=config.get("top_k")):
         full += text; thinking_full += thinking
         await ctx.stream("text", text)
-    result = {"text": full}
+    result = {"text": full, "thinking": thinking_full}
+    if json_fields:
+        parsed = _extract_json_fields(full, json_fields)
+        if parsed: result.update(parsed)
+        else: await ctx.progress("json_fields requested but parsing failed - raw text kept under 'text'")
     if not options: return result
     choice = next((o for o in options if o.lower() in full.lower()), options[0])
     result["choice"] = choice
@@ -228,6 +227,16 @@ async def step_llm_generate(config: dict, ctx) -> dict:
     except Exception: routes = {}
     if routes: result["_chosen_next"] = routes.get(choice)
     return result
+
+def _extract_json_fields(text: str, fields: list) -> dict | None:
+    """Best-effort JSON extraction from an LLM reply - strips a wrapping markdown fence if present, finds the first {...} block, returns only the requested keys that were actually present. Returns None (not {}) on total failure so the caller can fall back to plain text."""
+    cleaned = re.sub(r'\A```(?:json)?\s*|\s*```\Z', '', text.strip())
+    m = re.search(r'\{.*\}', cleaned, re.S)
+    if not m: return None
+    try: obj = json.loads(m.group(0))
+    except Exception: return None
+    found = {k: obj[k] for k in fields if k in obj}
+    return found or None
 
 async def step_find(config: dict, ctx) -> dict:
     """Returns {"matches": [...], "count": n, "source": full searched text}."""
@@ -434,7 +443,10 @@ async def step_file_write(config: dict, ctx) -> dict:
     rel_path = ctx.resolve(config.get("path") or "")
     if not rel_path.strip(): raise RuntimeError("file_write: resolved path is empty - check this node's Location/filename fields")
     raw_key = str(config.get("content_key", "text")).strip()
-    content = ctx.resolve(raw_key if raw_key.startswith("{") else "{" + raw_key + "}")
+    if not raw_key: raise RuntimeError("file_write: content_key is empty - set a scratch key or {node_id.field} reference")
+    template = raw_key if raw_key.startswith("{") else "{" + raw_key + "}"
+    content = ctx.resolve(template)
+    if not content: raise RuntimeError(f"file_write: '{raw_key}' resolved to empty content - check Result Mapping on the upstream node, or reference it directly as {template}")
     entry = shadow.stage(rel_path, str(content), author=f"pipeline:{ctx.job_id}")
     return {"path": rel_path, "status": entry["status"]}
 
