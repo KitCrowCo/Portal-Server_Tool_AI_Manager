@@ -43,157 +43,206 @@ def register_builtins():
         BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
         BI.SettingField("model", "Model", type="select", options=_model_options_for_config),
         BI.SettingField("system_prompt", "System Prompt", type="textarea", default="You are a helpful AI assistant."),
-        BI.SettingField("user_template", "User Prompt Template", type="textarea", default="{input}", hint="Reference an upstream node's output with {node_id.field}, e.g. {n1.text}. Bare {input} is this pipeline's own input."),
+        BI.SettingField("user_template", "User Prompt Template", type="textarea", default="{input}", hint="Reference an upstream node with {alias.field}, e.g. {n1.text}. Bare {input} is this pipeline's own input."),
         BI.SettingField("temperature", "Temperature", type="number", default=0.7, hint="No artificial step limit - test whatever value your task needs."),
         BI.SettingField("num_ctx", "Context Window (tokens)", type="number", default=16384, step=1),
         BI.SettingField("num_predict", "Max Output Tokens", type="number", default=-1, step=1, hint="-1 = unlimited (provider default)"),
-        BI.SettingField("json_fields", "JSON Output Fields (comma-sep, optional)", type="text", advanced=True, hint='e.g. "char_name, char_desc" - model is instructed to reply with exactly these JSON keys, giving you {this_node.char_name}, {this_node.char_desc} directly. Falls back to plain {this_node.text} if parsing fails.'),
         BI.SettingField("think", "Enable Thinking Mode", type="checkbox", default=False, hint="Only takes effect on connections whose profile declares supports_thinking (Ollama does). Silently ignored otherwise."),
+        BI.SettingField("json_fields", "JSON Output Fields (comma-sep)", type="text", advanced=True, hint='e.g. "char_name, char_desc" - asks the model for exactly these named fields in one pass instead of one text blob. Falls back to plain {alias.text} if parsing fails.'),
         BI.SettingField("enforce_options", "Enforced Options (comma-sep)", type="text", advanced=True, hint="Constrains the reply to one of these words - enables Routing JSON below."),
         BI.SettingField("routes_json", "Routing JSON", type="json", default={}, advanced=True, hint='Maps an enforced-option word to a downstream node id, e.g. {"yes":"n5","no":"n8"}. Requires Enforced Options.'),
         BI.SettingField("top_p", "Top P", type="number", default=None, advanced=True),
         BI.SettingField("top_k", "Top K", type="number", default=None, step=1, advanced=True),
-        _rmap_field()], output_keys=["text", "thinking", "choice"], guide="""Calls a chat model. Returns {this_node.text} (full reply) and {this_node.thinking} (if the model/profile supports thinking).
-Reference this node's output elsewhere as {alias.text} - alias is this node's Name field, lowercased, with spaces/punctuation turned to underscores (e.g. "Char Gen" -> char_gen). If Name is blank, you can only use {node_id.text} - harder to remember but always works. JSON Output Fields (Advanced): instead of one text blob, ask for several named values in one pass - e.g. "char_name, char_desc" gives {alias.char_name} and {alias.char_desc} directly, no separate parse node needed. Falls back to plain {alias.text} if the model doesn't reply in valid JSON. Enforced Options + Routing JSON (Advanced): constrains the reply to one word from a fixed list and routes to a different downstream node per word - use for yes/no branches or category routers.""")
+        _rmap_field()], output_keys=["text", "thinking", "choice"],
+        guide="""Calls a chat model. With no config beyond Connection/Model, replies to {input} with the system prompt shown - this is the safe, always-works default.
 
-    register_step_type("find", step_find, "Find (grep, regex search)",[
-        BI.SettingField("source_key","Source Scratch Key","text",default="input"),
-        BI.SettingField("path","File Path Override","text"),
-        BI.SettingField("pattern","Regex Pattern","text"),
-        BI.SettingField("dotall","Regex DOTALL","checkbox",default=False),
-        _rmap_field()], output_keys=["matches", "count", "source"])
+Returns {alias.text} (full reply) and {alias.thinking} (if the model supports it). alias = this node's Reference Name field.
 
-    register_step_type("text_replace", step_text_replace, "Text Replace (sed / template fill)",[
+JSON Output Fields (Advanced): ask for several named values in one pass instead of one blob - e.g. "char_name, char_desc" gives {alias.char_name} and {alias.char_desc} directly.
+
+Enforced Options + Routing JSON (Advanced): constrains the reply to one word from a list and routes to a different downstream node per word - for yes/no branches or category routers. Nothing else on this node needs Enforced Options to work; it's purely additive.""")
+
+    register_step_type("find", step_find, "Find (grep, regex search)", [
+        BI.SettingField("pattern","Regex Pattern","text", hint="Required - no default match makes sense for a search step."),
         BI.SettingField("source_key","Source Scratch Key","text",default="input"),
-        BI.SettingField("mode","Mode","text",default="replace_all"),
+        BI.SettingField("path","File Path Override","text",advanced=True, hint="If set, reads from this file instead of Source Scratch Key."),
+        BI.SettingField("dotall","Regex DOTALL","checkbox",default=False,advanced=True),
+        _rmap_field()], output_keys=["matches", "count", "source"],
+        guide="""Regex search, no LLM call. Returns {alias.matches} (list of {text, groups, start, end}), {alias.count}, and {alias.source} (the full searched text - useful as input to a downstream text_replace).
+
+Default source is {input}; point Source Scratch Key at another node's output (e.g. "n2") to search that instead.""")
+
+    register_step_type("text_replace", step_text_replace, "Text Replace (sed / template fill)", [
+        BI.SettingField("mode","Mode","select",default="replace_all", options=[("replace_all","Replace all matches"),("replace_first","Replace first match only")]),
         BI.SettingField("pattern","Regex Pattern","text"),
-        BI.SettingField("replacement_template","Replacement Template","text"),
-        BI.SettingField("matches_key","Matches Key","text"),
-        BI.SettingField("replacements_key","Replacements Key","text"),
-        _rmap_field()])
+        BI.SettingField("replacement_template","Replacement Template","text", hint="{match} = whole match, {0}/{1}... = capture groups."),
+        BI.SettingField("source_key","Source Scratch Key","text",default="input"),
+        BI.SettingField("matches_key","Matches Key (sequence mode)","text",advanced=True, hint="Set this + Replacements Key to substitute a prior Find step's matches in order instead of using Pattern."),
+        BI.SettingField("replacements_key","Replacements Key (sequence mode)","text",advanced=True),
+        _rmap_field()],
+        guide="""Two modes. Pattern mode (default): regex + replacement template against Source Scratch Key. Sequence mode (Advanced): point Matches Key at a prior Find step's {alias.matches} and Replacements Key at a list of replacement strings - substitutes each match in document order, e.g. one generated image path per flagged placeholder.
+
+Returns {alias.text}.""")
 
     register_step_type("knowledge_query", step_knowledge_query, "Knowledge Query", [
         BI.SettingField("conn_id", "Knowledge Connection", type="select", options=_knowledge_conn_options),
-        BI.SettingField("mode","Search Mode","text",default="hybrid"),
         BI.SettingField("query_template","Query Template","textarea",default="{input}"),
-        BI.SettingField("return_context_only","Return raw context only (no synthesis)","checkbox",default=False),
-        BI.SettingField("extra_params","Extra Params (JSON, passthrough)","json",default={}),
-        _rmap_field()], output_keys=["response", "raw"])
+        BI.SettingField("mode","Search Mode","select",default="hybrid", options=[("hybrid","Hybrid (default, recommended)"),("local","Local"),("global","Global"),("naive","Naive"),("mix","Mix")]),
+        BI.SettingField("return_context_only","Return raw retrieved context only (no re-synthesis)","checkbox",default=False,advanced=True),
+        BI.SettingField("extra_params","Extra Params (JSON passthrough)","json",default={},advanced=True, hint="Anything this dashboard doesn't expose yet (top_k, chunk_top_k, etc.) - passed straight to the LightRAG query."),
+        _rmap_field()], output_keys=["response", "raw"],
+        guide="""Queries a LightRAG knowledge base with hybrid mode by default. Returns {alias.response} (synthesized answer) and {alias.raw} (full API response, for anything not surfaced directly).""")
 
     register_step_type("knowledge_list_entities", step_knowledge_list_entities, "Knowledge Graph - List Entities", [
         BI.SettingField("conn_id","Knowledge Connection",type="select", options=_knowledge_conn_options),
-        BI.SettingField("limit","Limit","number",default=500,step=1),
-        _rmap_field()], output_keys=["entities"])
+        BI.SettingField("limit","Limit","number",default=500,step=1,advanced=True),
+        _rmap_field()], output_keys=["entities"],
+        guide="""Reads the knowledge graph's own entity list directly - no LLM call, no re-deriving what LightRAG already indexed. Returns {alias.entities}, typically fed straight into a foreach_call_pipeline.""")
 
     register_step_type("knowledge_insert_text", step_knowledge_insert_text, "Knowledge Insert Text", [
         BI.SettingField("conn_id","Knowledge Connection", type="select", options=_knowledge_conn_options),
         BI.SettingField("text_template","Text Template","textarea",default="{input}"),
-        BI.SettingField("source_label","Source Label","text")])
+        BI.SettingField("source_label","Source Label","text",advanced=True)],
+        guide="""Writes text directly into the knowledge base (not shadow-staged - LightRAG has no diff/review concept of its own; treat this node as a real, immediate write).""")
 
     register_step_type("file_write", step_file_write, "File Write (shadow-staged)", [
-        BI.SettingField("fm_root","FS Root","file_picker", default="./data/_common"),
-        BI.SettingField("path","Destination Path","text", hint="Supports {templates}, e.g. articles/{input}.md"),
-        BI.SettingField("content_key","Content Scratch Key","text",default="text", hint="Either a key promoted via Result Mapping on an upstream node, or a direct reference like {n2.text}. Bare 'text' only resolves if exactly one upstream node's output was mapped to that name."),
-        _rmap_field()], guide="""Writes text to a file - never directly, always through the Shadow Stage (Tessa's Pending Reviews panel), where you accept or reject the change before it touches the real file. Location supports {templates}, e.g. articles/{input}.md. Content Scratch Key is either a name promoted via Result Mapping on an upstream node, or a direct reference like {n2.text} / {char_gen.char_desc}. The bare default "text" only works if exactly one upstream node's output was mapped to that name - if nothing gets written, this is almost always why.""")
+        BI.SettingField("path","Destination Path","text", hint="Supports {templates}, e.g. articles/{input}.md."),
+        BI.SettingField("content_key","Content Scratch Key","text",default="text", hint='Either a Result-Mapped name, or a direct {n2.text} reference. Bare "text" only works if exactly one upstream node was mapped to that name.'),
+        BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common",advanced=True),
+        _rmap_field()],
+        guide="""Never writes directly - always through the Shadow Stage (Tessa's Pending Reviews / bottom-bar Shadow Diff), where you accept or reject before it touches the real file. Errors loudly (rather than writing an empty file) if Location or Content Scratch Key can't resolve.""")
 
     register_step_type("file_write_binary", step_file_write_binary, "File Write Binary (shadow-staged)", [
-        BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common"),
         BI.SettingField("path","Destination Path","text"),
-        BI.SettingField("source_root","Source Root","file_picker",default="."),
-        BI.SettingField("content_key","Content Scratch Key","text",default="file_name"),
-        _rmap_field()])
+        BI.SettingField("content_key","Content Scratch Key","text",default="image_file"),
+        BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common",advanced=True),
+        BI.SettingField("source_root","Source Root","file_picker",default=".",advanced=True),
+        _rmap_field()],
+        guide="""Same shadow-staged write as File Write, for binary output (typically an image_generate node's result). Content Scratch Key should point at a node whose output includes a file_name field.""")
 
     register_step_type("python_exec", step_python_exec, "Python Script", [
-        BI.SettingField("script_path","Script Location","file_picker"),
-        BI.SettingField("script_body","Inline Script Body","textarea"),
+        BI.SettingField("script_body","Inline Script Body","textarea", hint="Quick glue logic. Receives one argument (Input Template, resolved), must print a JSON object as its last stdout line."),
         BI.SettingField("input_template","Input Template","textarea",default="{input}"),
-        BI.SettingField("timeout_s","Timeout (s)","number",default=600,step=1),
-        _rmap_field()])
+        BI.SettingField("script_path","Script File (instead of inline)","file_picker",advanced=True),
+        BI.SettingField("timeout_s","Timeout (s)","number",default=600,step=1,advanced=True, hint="Generous by default for CPU-bound/no-GPU hardware - raise further if needed, no artificial ceiling."),
+        _rmap_field()],
+        guide="""Runs either Inline Script Body or Script File as a subprocess with Input Template as argv[1]. Whatever the script prints as its final JSON line becomes this node's result dict. No default script - this node always needs at least Inline Script Body or Script File filled in.""")
 
-    register_step_type("list_files", step_list_files, "List Files", [BI.SettingField("root","Target Directory","text",default="./data/ai_tools/_knowledge"),BI.SettingField("extensions","Extensions","text"),_rmap_field()], output_keys=["files"])
-    register_step_type("echo", step_echo, "Echo / Passthrough", [BI.SettingField("template","Template","textarea",default="{input}"), _rmap_field()])
-    register_step_type("expr", step_expr, "Expression (mini derived value)", [BI.SettingField("vars_json","Variables (JSON: name -> template)","json",default={}), BI.SettingField("expr","Python Expression","text",default="input"), _rmap_field()])
+    register_step_type("list_files", step_list_files, "List Files", [
+        BI.SettingField("root","Target Directory","text",default="./data/ai_tools/_knowledge"),
+        BI.SettingField("extensions","Extensions (comma-sep)","text",advanced=True, hint="Empty = all files."),
+        _rmap_field()], output_keys=["files"],
+        guide="""Lists relative file paths under a directory. No LLM call. Default root is the shared knowledge folder. Returns {alias.files}, typically feeding foreach_call_pipeline or chunked_file_pass.""")
 
-    register_step_type("image_generate", step_image_generate, "Text-to-Image (Flux2)", [
-        BI.SettingField("text_encoder_conn_id", "Text Encoder Connection", type="select", options = _flux2_text_options, hint="ID of the flux2_text connection"),
-        BI.SettingField("image_conn_id", "Image Connection", type="select", options = _flux2_image_options, hint="ID of the flux2_image connection"),
-        BI.SettingField("prompt_template", "Prompt Template", type="textarea", default="{input}", hint="Use {variables} for dynamic prompts"),
-        BI.SettingField("width", "Width", type="number", default=1024, step=16),
-        BI.SettingField("height", "Height", type="number", default=1024, step=16),
-        BI.SettingField("steps", "Steps", type="number", default=4, step=1, hint="Inference steps (e.g., 4 for distilled, 20+ for base)"),
-        BI.SettingField("cfg", "Guidance Scale (CFG)", type="number", default=1.0, step="any"),
-        BI.SettingField("shift", "Shift", type="number", default=1.0, step="any"),
-        BI.SettingField("seed", "Seed", type="number", default=-1, hint="-1 for random"),
-        _rmap_field()])
+    register_step_type("echo", step_echo, "Echo / Passthrough", [
+        BI.SettingField("template","Template","textarea",default="{input}"),
+        _rmap_field()],
+        guide="""Resolves a template and passes it through unchanged - default is a no-op pass of {input}. Useful for renaming/reshaping a value between two nodes without an LLM call, or as a merge-point placeholder.""")
+
+    register_step_type("expr", step_expr, "Expression (small derived value)", [
+        BI.SettingField("expr","Python Expression","text",default="input", hint="Restricted builtins only (len/str/int/float/min/max/sorted/round) - no import, no file/network access."),
+        BI.SettingField("vars_json","Variables (JSON: name -> template)","json",default={},advanced=True, hint='e.g. {"a":"{n1.text}"} makes "a" available in the expression.'),
+        _rmap_field()],
+        guide="""One Python expression, safely sandboxed - for glue too small to justify python_exec (deriving a slug, basic arithmetic on a numeric result). Default expr="input" just passes {input} through as a sanity-check default.""")
 
     register_step_type("call_pipeline", step_call_pipeline, "Call Another Pipeline", [
         BI.SettingField("pipeline_id", "Pipeline ID", type="select", options=_pipeline_options),
         BI.SettingField("input_template", "Input Template", type="textarea", default="{input}"),
-        BI.SettingField("extra_inputs_json", "Extra Inputs (JSON: key -> template)", type="json", default={}, hint='Passed alongside "input" into the sub-pipeline scratch, e.g. {"source_dir":"{n1.files}"} - lets the sub-pipeline reference more than just the current item.'),
-        BI.SettingField("_call_depth", "Call Depth Override", type="number", default=0, hint="Advanced: manually increment depth tracking"),
-        _rmap_field()])
+        BI.SettingField("extra_inputs_json", "Extra Inputs (JSON: key -> template)", type="json", default={}, advanced=True, hint='Passed alongside "input" into the sub-pipeline, e.g. {"source_dir":"{n1.files}"}.'),
+        BI.SettingField("_call_depth", "Call Depth Override", type="number", default=0, advanced=True, hint="Advanced/internal - leave at 0 unless debugging recursion depth."),
+        _rmap_field()],
+        guide="""Runs a saved pipeline to completion inline and folds its final scratch back as this node's result. No default pipeline - Pipeline ID must be set.""")
 
     register_step_type("foreach_call_pipeline", step_foreach_call_pipeline, "For Each Item, Call Pipeline", [
-        BI.SettingField("items_source", "Items Scratch Key", type="text", hint="Scratch key containing a JSON array or text block"),
-        BI.SettingField("extra_inputs_json", "Extra Inputs (JSON: key -> template)", type="json", default={}, hint='Passed alongside "input" into the sub-pipeline scratch, e.g. {"source_dir":"{n1.files}"} - lets the sub-pipeline reference more than just the current item.'),
-        BI.SettingField("pipeline_id", "Pipeline ID", type="select", options=_pipeline_options, hint="ID of the pipeline to run per item"),
-        BI.SettingField("_call_depth", "Call Depth Override", type="number", default=0),
-        _rmap_field()])
+        BI.SettingField("items_source", "Items Scratch Key", type="text", hint="Scratch key containing a JSON array or newline-separated text block."),
+        BI.SettingField("pipeline_id", "Pipeline ID", type="select", options=_pipeline_options),
+        BI.SettingField("extra_inputs_json", "Extra Inputs (JSON: key -> template)", type="json", default={}, advanced=True),
+        BI.SettingField("_call_depth", "Call Depth Override", type="number", default=0, advanced=True),
+        _rmap_field()], output_keys=["results","count"],
+        guide="""Items Scratch Key is a LITERAL field name, not a {template} - no braces, no dots, no alias/node id.
+
+By default every step's output fields flatten onto top-level scratch under their own name. A list_files node's output {"files": [...]} becomes available at the plain key "files" with zero config needed.
+
+WRONG (common mistake): typing the upstream node's alias or id (e.g. "docs" or "n_1a2b3c4d") - that key holds the WHOLE result dict, not the list inside it, and this step will silently run zero iterations.
+RIGHT: type the flattened field name itself - "files", "entities", "results", whatever the upstream step's output_keys list shows.
+
+Worked example:
+  Node A (list_files, root=./data/ai_tools/_knowledge) -> flattens to scratch key "files" (a list of path strings)
+  Node B (this step): Items Scratch Key = files | Pipeline ID = <a saved sub-pipeline>
+  -> runs the sub-pipeline once per path string in that list, returns {alias.results} (list of one output per item) and {alias.count}
+
+If two upstream nodes both produce a "files" key you'll get a silent collision (last one written wins) - set that node's Result Mapping to {"files":"unique_name"} to rename it before using it here.""")
 
     register_step_type("branch_on", step_branch_on, "Branch On Decision", [
-        BI.SettingField("decision_key", "Decision Scratch Key", type="text", default="decision", hint="Scratch key containing the chosen route word"),
-        BI.SettingField("routes_json", "Routes Map (JSON)", type="textarea", default="{}", hint="Map decision strings to pipeline IDs"),
-        BI.SettingField("default_pipeline_id", "Default Pipeline ID", type="text", hint="Fallback pipeline if decision string doesn't match"),
-        BI.SettingField("input_template", "Input Template", type="textarea", default="{input}"),
-        BI.SettingField("extra_inputs_json", "Extra Inputs (JSON: key -> template)", type="json", default={}, hint='Passed alongside "input" into the sub-pipeline scratch, e.g. {"source_dir":"{n1.files}"} - lets the sub-pipeline reference more than just the current item.'),
-        _rmap_field()])
+        BI.SettingField("decision_key", "Decision Scratch Key", type="text", default="decision"),
+        BI.SettingField("routes_json", "Routes Map (JSON)", type="json", default={}, hint='e.g. {"yes":"pl_abc","no":"pl_def"} - maps a decision string to a pipeline id.'),
+        BI.SettingField("default_pipeline_id", "Default Pipeline ID", type="text", advanced=True, hint="Fallback if the decision value doesn't match any route."),
+        BI.SettingField("input_template", "Input Template", type="textarea", default="{input}", advanced=True),
+        BI.SettingField("extra_inputs_json", "Extra Inputs (JSON)", type="json", default={}, advanced=True),
+        _rmap_field()],
+        guide="""Reads Decision Scratch Key (typically an upstream llm_generate's {alias.choice}) and runs whichever sub-pipeline Routes Map assigns to that value. Errors loudly if the value matches nothing and no Default Pipeline ID is set.""")
+
+    register_step_type("image_generate", step_image_generate, "Text-to-Image (Flux2)", [
+        BI.SettingField("text_encoder_conn_id", "Text Encoder Connection", type="select", options = _flux2_text_options),
+        BI.SettingField("image_conn_id", "Image Connection", type="select", options = _flux2_image_options),
+        BI.SettingField("prompt_template", "Prompt Template", type="textarea", default="{input}"),
+        BI.SettingField("width", "Width", type="number", default=1024, step=16),
+        BI.SettingField("height", "Height", type="number", default=1024, step=16),
+        BI.SettingField("steps", "Steps", type="number", default=4, step=1, hint="4 for distilled/fast models, 20+ for base models."),
+        BI.SettingField("cfg", "Guidance Scale (CFG)", type="number", default=1.0, step="any", advanced=True),
+        BI.SettingField("shift", "Shift", type="number", default=1.0, step="any", advanced=True),
+        BI.SettingField("seed", "Seed", type="number", default=-1, advanced=True, hint="-1 for random."),
+        _rmap_field()], output_keys=["file_name"],
+        guide="""Two-stage: encodes the prompt on the text-encoder connection, then generates on the image connection. Returns {alias.file_name}, typically fed to file_write_binary.""")
 
     register_step_type("edit_in_place", step_edit_in_place, "Edit In Place (gap-aware, chunked)", [
         BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
         BI.SettingField("model", "Model", type="select", options=_model_options_for_config),
-        BI.SettingField("system_prompt", "System Prompt", type="textarea"),
-        BI.SettingField("rewrite_prompt", "Rewrite Prompt", type="textarea"),
-        BI.SettingField("continuation_prompt", "Continuation Prompt", type="textarea"),
-        BI.SettingField("open_ended_prompt", "Open Ended Prompt", type="textarea"),
-        BI.SettingField("gap_marker", "Gap Marker", type="text", default="[[GAP]]"),
-        BI.SettingField("chunk_tokens", "Chunk Tokens", type="number", default=4000, step=1),
-        BI.SettingField("num_ctx", "Context Window", type="number", default=16384, step=1),
-        BI.SettingField("temperature", "Temperature", type="number", default=0.3, step="any"),
         BI.SettingField("source_key", "Source Scratch Key", type="text", default="input"),
-        _rmap_field()])
+        BI.SettingField("gap_marker", "Gap Marker", type="text", default="[[GAP]]", hint="Text before this marker gets chunk-rewritten; text after is used as continuation context."),
+        BI.SettingField("system_prompt", "System Prompt", type="textarea", advanced=True),
+        BI.SettingField("rewrite_prompt", "Rewrite Prompt", type="textarea", advanced=True, hint="Default: light grammar/flow/continuity pass, same length and content."),
+        BI.SettingField("continuation_prompt", "Continuation Prompt", type="textarea", advanced=True),
+        BI.SettingField("open_ended_prompt", "Open Ended Prompt", type="textarea", advanced=True),
+        BI.SettingField("chunk_tokens", "Chunk Tokens", type="number", default=4000, step=1, advanced=True),
+        BI.SettingField("num_ctx", "Context Window", type="number", default=8192, step=1, advanced=True),
+        BI.SettingField("temperature", "Temperature", type="number", default=0.3, step="any", advanced=True),
+        _rmap_field()], output_keys=["text","gap_remaining"],
+        guide="""Chunk-rewrites Source Scratch Key in place. With no Gap Marker present, does a straight chunked rewrite pass. With a marker, rewrites everything before it and bridges to whatever's after it (or continues open-ended if nothing follows). Sensible defaults on all prompts - only Connection/Model are required.""")
 
     register_step_type("chunked_file_pass", chunked_file_pass, "Chunked File Pass", [
-        BI.SettingField("project_id", "Project ID", type="text"),
         BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
         BI.SettingField("model", "Model", type="select", options=_model_options_for_config),
-        BI.SettingField("system_prompt", "System Prompt", type="textarea"),
-        BI.SettingField("user_template", "User Template", type="textarea", default="{chunk_content}"),
-        BI.SettingField("output_separator", "Output Separator", type="text", default="\n\n---\n\n"),
-        BI.SettingField("use_selected", "Use Selected Files", type="checkbox", default=False),
-        BI.SettingField("input_source", "Input Directory Relative", type="file_picker"),
-        BI.SettingField("model_ctx", "Context Window", type="number", default=32768, step=1),
-        BI.SettingField("chunk_tokens", "Chunk Tokens", type="number", default=6000, step=1),
-        BI.SettingField("temperature", "Temperature", type="number", default=0.3, step="any"),
-        _rmap_field()])
+        BI.SettingField("items_source", "Files Scratch Key", type="text", default="files", hint="Typically a list_files node's {alias.files}."),
+        BI.SettingField("user_template", "User Template", type="textarea", default="{chunk_content}", hint="Also available: {file_name}, {file_path}, {chunk_number}, {chunks_total}."),
+        BI.SettingField("system_prompt", "System Prompt", type="textarea", advanced=True),
+        BI.SettingField("chunk_tokens", "Chunk Tokens", type="number", default=6000, step=1, advanced=True),
+        BI.SettingField("model_ctx", "Context Window", type="number", default=32768, step=1, advanced=True),
+        BI.SettingField("temperature", "Temperature", type="number", default=0.3, step="any", advanced=True),
+        BI.SettingField("output_separator", "Output Separator", type="text", default="\n\n---\n\n", advanced=True),
+        BI.SettingField("fm_root", "FS Root", type="file_picker", default="./data/_common", advanced=True),
+        _rmap_field()], output_keys=["text","files_processed"],
+        guide="""Runs one LLM pass per chunk, per file, over a list of files (e.g. from list_files). Concatenates all outputs into {alias.text}. No default prompt beyond passing the chunk through - set User Template for real use.""")
 
     register_step_type("chunked_synthesis", chunked_synthesis, "Chunked Synthesis", [
-        BI.SettingField("project_id", "Project ID", type="text"),
         BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
         BI.SettingField("model", "Model", type="select", options=_model_options_for_config),
-        BI.SettingField("system_prompt", "System Prompt", type="textarea"),
+        BI.SettingField("source_key", "Source Scratch Key", type="text", default="input"),
         BI.SettingField("user_template", "User Template", type="textarea", default="{chunk_content}"),
-        BI.SettingField("output_separator", "Output Separator", type="text", default="\n\n---\n\n"),
-        BI.SettingField("model_ctx", "Context Window", type="number", default=32768, step=1),
-        BI.SettingField("chunk_tokens", "Chunk Tokens", type="number", default=6000, step=1),
-        BI.SettingField("temperature", "Temperature", type="number", default=0.3, step="any"),
-        BI.SettingField("source_key", "Source Scratch Key", type="text", default="input", hint="Which upstream result to chunk-synthesize - defaults to the pipeline's own input."),
-        _rmap_field()])
+        BI.SettingField("system_prompt", "System Prompt", type="textarea", advanced=True),
+        BI.SettingField("chunk_tokens", "Chunk Tokens", type="number", default=6000, step=1, advanced=True),
+        BI.SettingField("model_ctx", "Context Window", type="number", default=32768, step=1, advanced=True),
+        BI.SettingField("temperature", "Temperature", type="number", default=0.3, step="any", advanced=True),
+        BI.SettingField("output_separator", "Output Separator", type="text", default="\n\n---\n\n", advanced=True),
+        _rmap_field()], output_keys=["text","chunks_processed"],
+        guide="""Same chunked LLM-pass pattern as Chunked File Pass, but over one long value (Source Scratch Key) instead of a list of files - for summarizing/transforming one large document.""")
 
-    register_step_type("format_each", step_format_each, "Format Each (list → repeated text)", [
-        BI.SettingField("items_key","Items Scratch Key","text"),
-        BI.SettingField("item_template","Item Template","textarea",default="{input}"),
-        BI.SettingField("separator","Separator","text",default="\n\n---\n\n"),
-        _rmap_field()], output_keys=["text","count"])
+    register_step_type("format_each", step_format_each, "Format Each (list -> repeated text)", [
+        BI.SettingField("items_key","Items Scratch Key","text", hint="Typically foreach_call_pipeline's {alias.results}."),
+        BI.SettingField("item_template","Item Template","textarea",default="{input}", hint="Uses {field} for keys INSIDE one list item directly - not {node.field}, since a list item isn't a node."),
+        BI.SettingField("separator","Separator","text",default="\n\n---\n\n",advanced=True),
+        _rmap_field()], output_keys=["text","count"],
+        guide="""Turns a list of dicts into one repeated-template text block. No LLM call. Feeds nicely into a file_write after a foreach_call_pipeline fan-out.""")
 
 async def step_llm_generate(config: dict, ctx) -> dict:
     """Universal text-generation node. Returns {"text": full reply, "choice": <if enforce_options set>}.

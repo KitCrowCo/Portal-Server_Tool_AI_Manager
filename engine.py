@@ -29,6 +29,7 @@ def save_pipeline(doc: dict): doc["modified"] = datetime.utcnow().isoformat(); _
 def list_pipelines(tag: str = None) -> list: return [p for p in (json.loads(f.read_text()) for f in sorted(PIPE_DIR.glob("*.json"))) if not tag or tag in p.get("tags", [])]
 def new_pipeline(owner: str, name: str = "New Pipeline") -> dict: return {"id": f"pl_{uuid.uuid4().hex[:10]}", "name": name, "owner": owner, "tags": [], "flow": Flow().to_dict(), "created": datetime.utcnow().isoformat()}
 def delete_pipeline(pid: str): _pdp(pid).unlink(missing_ok=True)
+def delete_job(jid: str): _jdp(jid).unlink(missing_ok=True)
 
 # -- Jobs --
 
@@ -151,6 +152,11 @@ def stop(job_id: str):
 
 def _log(job: dict, msg: str): job.setdefault("log", []).append(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}")
 
+def _resolve_alias(nd: dict) -> str:
+    explicit = str(nd.get("slug","")).strip().lower()
+    if explicit: return re.sub(r'\W+', '_', explicit).strip('_') or nd["id"]
+    return re.sub(r'\W+', '_', (nd.get("name","") or "").strip().lower()).strip('_') or nd["id"]
+
 async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
     f = Flow(flow)
     done = _done_set(flow)
@@ -190,14 +196,14 @@ async def _run_flow(flow: dict, ctx: "StepContext", job_id: str) -> tuple:
                     ctx.node_id = nd["id"]
                     result = await spec["fn"](nd.get("config", {}), ctx)
                 ctx.scratch[nd["id"]] = result
-                alias = re.sub(r'\W+', '_', nd.get("name","").strip().lower()).strip('_')
+                alias = _resolve_alias(nd)
                 if alias:
                     if alias in ctx.scratch and alias != nd["id"]:
                         job = load_job(job_id)
                         _log(job, f"alias collision: '{alias}' already in use - node {nd['id']} ({nd.get('name','')}) only resolvable by id")
                         _save_job(job)
-                    else:
-                        ctx.scratch[alias] = result
+                else:
+                    ctx.scratch[alias] = result
                 apply_result_map(nd.get("config", {}), ctx, result)
                 preview = {k: str(v)[:100] for k, v in (result or {}).items()}
                 await ctx.set_node_status(nd["id"], "done", {"preview": preview})
