@@ -37,7 +37,7 @@ def _model_options_for_config(values=None):
 
 def register_builtins():
     BI = ENV["tools"]["built_ins"]
-    def _rmap_field(): return BI.SettingField("result_map", "Result Mapping (JSON, optional)", type="json", default={}, advanced=True, hint='Map this step\'s output fields to scratch keys, e.g. {"text":"article_md"}. "*" merges everything flat. {"text":{"key":"notes","mode":"append"}} accumulates rather than overwrites.')
+    def _rmap_field(): return BI.SettingField("result_map", "Result Mapping (JSON, optional)", type="json", default={}, advanced=True, hint="""Map this step's output fields to scratch keys, e.g. {"text":"article_md"}. "*" merges everything flat. {"text":{"key":"notes","mode":"append"}} accumulates rather than overwrites.""")
 
     register_step_type("llm_generate", step_llm_generate, "LLM Generate (chat / decision / router)", [
         BI.SettingField("conn_id", "Connection", type="select", options=_llm_conn_options),
@@ -51,16 +51,20 @@ def register_builtins():
         BI.SettingField("json_fields", "JSON Output Fields (comma-sep)", type="text", advanced=True, hint='e.g. "char_name, char_desc" - asks the model for exactly these named fields in one pass instead of one text blob. Falls back to plain {alias.text} if parsing fails.'),
         BI.SettingField("enforce_options", "Enforced Options (comma-sep)", type="text", advanced=True, hint="Constrains the reply to one of these words - enables Routing JSON below."),
         BI.SettingField("routes_json", "Routing JSON", type="json", default={}, advanced=True, hint='Maps an enforced-option word to a downstream node id, e.g. {"yes":"n5","no":"n8"}. Requires Enforced Options.'),
-        BI.SettingField("top_p", "Top P", type="number", default=None, advanced=True),
+        BI.SettingField("top_p", "Top P", type="number", default=None, step="any", advanced=True),
         BI.SettingField("top_k", "Top K", type="number", default=None, step=1, advanced=True),
+        BI.SettingField("seed", "Seed (blank/-1 = random)", type="number", default=None, advanced=True, step=1, hint="Same concept as a diffusion model's seed. Set a specific integer to make this node's output reproducible for identical prompt+settings. Leave blank for genuine randomness every run."),
+        BI.SettingField("items_source", "Files Scratch Key (chunk over a file list)", type="text", advanced=True, hint="Leave blank for a normal single-shot call. Set to a scratch key holding a file list (e.g. list_files' output) to run one chunked pass per file, concatenated - this is what a separate 'Chunked File Pass' node used to be."),
+        BI.SettingField("chunk_source_key", "Chunk Single Source (scratch key)", type="text", advanced=True, hint="Alternative to Files Scratch Key - chunks ONE long value instead of a file list. Leave blank to skip chunking entirely."),
+        BI.SettingField("chunk_tokens", "Chunk Size (tokens)", type="number", default=6000, step=1, advanced=True, hint="Only used if Files Scratch Key or Chunk Single Source is set."),
+        BI.SettingField("output_separator", "Chunk Output Separator", type="text", default="\n\n---\n\n", advanced=True),
+		BI.SettingField("fm_root", "FS Root (for file chunking)", type="file_picker", default="./data/_common", advanced=True),
         _rmap_field()], output_keys=["text", "thinking", "choice"],
         guide="""Calls a chat model. With no config beyond Connection/Model, replies to {input} with the system prompt shown - this is the safe, always-works default.
-
-Returns {alias.text} (full reply) and {alias.thinking} (if the model supports it). alias = this node's Reference Name field.
-
-JSON Output Fields (Advanced): ask for several named values in one pass instead of one blob - e.g. "char_name, char_desc" gives {alias.char_name} and {alias.char_desc} directly.
-
-Enforced Options + Routing JSON (Advanced): constrains the reply to one word from a list and routes to a different downstream node per word - for yes/no branches or category routers. Nothing else on this node needs Enforced Options to work; it's purely additive.""")
+                 Returns {alias.text} (full reply) and {alias.thinking} (if the model supports it). alias = this node's Reference Name field.
+                 JSON Output Fields (Advanced): ask for several named values in one pass instead of one blob - e.g. "char_name, char_desc" gives {alias.char_name} and {alias.char_desc} directly.
+                 Enforced Options + Routing JSON (Advanced): constrains the reply to one word from a list and routes to a different downstream node per word - for yes/no branches or category routers.
+                 Nothing else on this node needs Enforced Options to work; it's purely additive.""")
 
     register_step_type("find", step_find, "Find (grep, regex search)", [
         BI.SettingField("pattern","Regex Pattern","text", hint="Required - no default match makes sense for a search step."),
@@ -252,6 +256,9 @@ async def step_llm_generate(config: dict, ctx) -> dict:
     if not conn: raise RuntimeError("llm_generate: no connection configured")
     model = config.get("model", "")
     if not model: raise RuntimeError("llm_generate: no model configured")
+    
+    seed_kwargs = {}
+    if config.get("seed") not in (None, "", -1): seed_kwargs["seed"] = int(config["seed"])
     raw_opts = config.get("enforce_options", "")
     options = raw_opts if isinstance(raw_opts, list) else [o.strip() for o in raw_opts.split(",") if o.strip()]
     json_fields = [f.strip() for f in str(config.get("json_fields","")).split(",") if f.strip()]
@@ -261,7 +268,7 @@ async def step_llm_generate(config: dict, ctx) -> dict:
     messages = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": ctx.resolve(config.get("user_template") or "{input}")}]
     full = ""
     thinking_full = ""
-    async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.3), num_ctx=config.get("num_ctx", 8192), num_predict=config.get("num_predict", -1), top_p=config.get("top_p"), top_k=config.get("top_k")):
+    async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.3), num_ctx=config.get("num_ctx", 8192), num_predict=config.get("num_predict", -1), top_p=config.get("top_p"), top_k=config.get("top_k"), **seed_kwargs):
         full += text; thinking_full += thinking
         await ctx.stream("text", text)
     result = {"text": full, "thinking": thinking_full}
@@ -276,7 +283,39 @@ async def step_llm_generate(config: dict, ctx) -> dict:
     except Exception: routes = {}
     if routes: result["_chosen_next"] = routes.get(choice)
     return result
+    
+    #items_key, chunk_key = config.get("items_source",""), config.get("chunk_source_key","")
+    #if items_key or chunk_key: return await _run_chunked(config, ctx, conn, model, items_key, chunk_key)
+    #return await _run_single(config, ctx, conn, model)  # existing single-shot body, unchanged, extracted as-is
 
+async def _run_chunked(config, ctx, conn, model, items_key, chunk_key):
+    """Merged behavior of the old chunked_file_pass / chunked_synthesis nodes. Splitting-by-tokens uses _tok() (already used elsewhere for input-length checks) as the estimator - swap in your real chunker's exact counting method here if it differs."""
+    chunk_tokens = config.get("chunk_tokens", 6000)
+    sep = config.get("output_separator", "\n\n---\n\n")
+    pieces, processed = [], 0
+    if items_key:
+        fm = ENV["tools"]["built_ins"].FileManager(config.get("fm_root") or "./data/_common")
+        files = ctx.scratch.get(items_key, [])
+        for fpath in files:
+            text = fm.read_text(fpath)
+            for i, chunk in enumerate(_split_by_tokens(text, chunk_tokens)):
+                user_p = ctx.resolve(config.get("user_template","{chunk_content}"), extra={"chunk_content": chunk, "file_name": Path(fpath).name, "file_path": fpath, "chunk_number": i+1})
+                pieces.append((await _one_shot(config, conn, model, user_p))["text"]); processed += 1
+    else:
+        text = str(ctx.scratch.get(chunk_key,""))
+        for i, chunk in enumerate(_split_by_tokens(text, chunk_tokens)):
+            user_p = ctx.resolve(config.get("user_template","{chunk_content}"), extra={"chunk_content": chunk, "chunk_number": i+1})
+            pieces.append((await _one_shot(config, conn, model, user_p))["text"]); processed += 1
+    return {"text": sep.join(pieces), "chunks_processed": processed}
+
+def _split_by_tokens(text: str, chunk_tokens: int) -> list:
+    words, out, buf = text.split(), [], []
+    for w in words:
+        buf.append(w)
+        if _tok(" ".join(buf)) >= chunk_tokens: out.append(" ".join(buf)); buf = []
+    if buf: out.append(" ".join(buf))
+    return out or [text]    
+    
 def _extract_json_fields(text: str, fields: list) -> dict | None:
     """Best-effort JSON extraction from an LLM reply - strips a wrapping markdown fence if present, finds the first {...} block, returns only the requested keys that were actually present. Returns None (not {}) on total failure so the caller can fall back to plain text."""
     cleaned = re.sub(r'\A```(?:json)?\s*|\s*```\Z', '', text.strip())

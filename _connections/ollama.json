@@ -87,7 +87,7 @@
     "num_ctx":        { "type": "integer", "default": 16384, "min":  1,   "max": 13107200,   "hint": "Context window in tokens" },
     "num_predict":    { "type": "integer", "default": -1,    "min":  -1,  "max": 32768,    "hint": "-1 = unlimited" },
     "repeat_penalty": { "type": "float",   "default": 1.1,   "min":  0.5, "max": 2.0 },
-    "seed":           { "type": "integer", "default": 0,     "hint": "0 = random" },
+    "seed":           { "type": "integer", "default": -1,     "hint": "-1 = random" },
     "stop":           { "type": "list",    "default": [],    "hint": "List of stop sequences" }
   },
 

@@ -99,11 +99,11 @@ def _conn_profile(conn: dict) -> dict:
     return profile
 
 def _resolved_options(profile: dict, kwargs: dict) -> dict:
-    """Only options the connection's own options_schema declares are ever sent - an unrecognized canonical kwarg from a step is silently dropped rather than forwarded to a provider that doesn't define it.
-    Unset values fall back to the schema's default, clamped to its min/max."""
+    """None (missing OR explicitly blank) always means 'use this schema's own default' - never silently becomes 0."""
     out = {}
     for key, spec in profile.get("options_schema", {}).items():
-        val = kwargs.get(key, spec.get("default"))
+        val = kwargs.get(key)
+        if val is None: val = spec.get("default")
         if isinstance(val, (int, float)) and spec.get("type") in ("integer", "float"):
             if "min" in spec: val = max(spec["min"], val)
             if "max" in spec: val = min(spec["max"], val)
