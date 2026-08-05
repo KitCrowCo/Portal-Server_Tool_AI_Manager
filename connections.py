@@ -395,3 +395,25 @@ async def flux2_system_stop(conn) -> dict:
     except Exception as e: return {"error": str(e)}
 
 def list_loras(lora_dir, exts=(".safetensors", ".pt", ".ckpt")) -> list: return sorted(f.name for f in Path(lora_dir).glob("*") if f.is_file() and f.suffix.lower() in exts) if Path(lora_dir).exists() else []
+
+# --- Machine / Node Profiles ---
+
+def set_machine_profile(conn_id: str, profile: dict):
+    conn = load_conn_raw(conn_id)
+    if conn: conn["machine_profile"] = profile; save_conn(conn_id, conn)
+
+def get_machine_profile(conn_id: str) -> dict:
+    conn = load_conn_raw(conn_id) or {}
+    return conn.get("machine_profile", {"shares_hardware_with": [], "tags": [], "weight_speed": 1.0, "weight_quality": 1.0, "max_concurrent": 1})
+
+def rank_connections(conn_type: str, tags: list = None, priority: str = "balanced") -> list:
+    """priority: speed | balanced | quality - the three modes from the resource-pool design."""
+    tags = set(tags or [])
+    scored = []
+    for c in list_conns(conn_type):
+        prof = c.get("machine_profile", {})
+        tag_hit = len(tags & set(prof.get("tags", [])))
+        w = {"speed": prof.get("weight_speed",1.0), "quality": prof.get("weight_quality",1.0), "balanced": (prof.get("weight_speed",1.0)+prof.get("weight_quality",1.0))/2}[priority]
+        scored.append((tag_hit * 10 + w, c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored]
