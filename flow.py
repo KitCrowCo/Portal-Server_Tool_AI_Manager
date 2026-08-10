@@ -30,12 +30,8 @@ The system is divided into two primary halves: the **Data Layer** (the source of
 
 ---
 
-flow.py — Segmented DAG core for ai_manager pipelines.
-
-FlowNode/Flow are the source of truth for pipeline structure.
-A pipeline IS a Flow: each FlowNode's payload is {"type": step_type, "config": {...}}; edges (prev/next) are execution order, branches are concurrent, merges wait on incoming prev (all or select).
-Subflows: a node's payload may be {"type": "subflow", "flow": <nested Flow dict>} - engine.py treats this as one step that recursively runs the nested Flow and folds its terminal node outputs back as this node's result.
-Arbitrarily deep nesting works because Flow.to_dict()/FlowNode are the same shape at every level.
+flow.py — Universal-node pipeline core for ai_manager.
+FlowNode/Flow hold node definitions only; execution order is never stored here, it's derived purely from which actual pipeline keys a node needs versus which other nodes produce those keys (see resolve_levels, used only for the graphical builder view, and engine.py's scheduler, which recomputes readiness fresh every wave against the live shared data object).
 """
 
 import os, json, math, uuid
@@ -69,16 +65,13 @@ class DictTools:
 
     @staticmethod
     def clean(data: Any) -> Any:
-        """Recursively removes empty lists and dictionaries in a single highly-efficient pass."""
         if isinstance(data, dict): return {k: v_clean for k, v in data.items() if (v_clean := DictTools.clean(v))}
         if isinstance(data, list): return [v_clean for v in data if (v_clean := DictTools.clean(v))]
         return data
 
     @staticmethod
     def compact_parse(data: Any, continue_func: Callable = None, format_func: Callable = None) -> Any:
-        """A recursive dict parser. Instead of passing massive kwargs, it takes modular lambda/functions."""
-        if isinstance(data, dict): 
-            # Format current level, then recursively parse children if they meet the continue criteria
+        if isinstance(data, dict):
             parsed = {k: format_func(v) if format_func else v for k, v in data.items()}
             for k, v in data.items():
                 if isinstance(v, (dict, list)) and (not continue_func or continue_func(k, v)): parsed[k] = DictTools.compact_parse(v, continue_func, format_func)
@@ -87,11 +80,10 @@ class DictTools:
         return data
 
 class JsonManager:
-    """Flexible JSON serialization toolbox supporting non-standard types (sets, tuples). Uses a targeted token prefix to identify encoded types on deserialization."""
+    """Flexible JSON serialization toolbox supporting non-standard types (sets, tuples)."""
     def __init__(self, token_prefix: str = "*^direct:"): self.prefix = token_prefix
 
     def encode(self, obj: Any) -> Any:
-        """Recursively wraps unsupported Python types into tokenized strings."""
         if isinstance(obj, set): return f"{self.prefix}set:" + json.dumps(list(obj))
         if isinstance(obj, tuple): return f"{self.prefix}tuple:" + json.dumps(list(obj))
         if isinstance(obj, dict): return {str(k): self.encode(v) for k, v in obj.items()}
@@ -99,14 +91,13 @@ class JsonManager:
         return obj
 
     def decode(self, obj: Any) -> Any:
-        """Recursively unwraps tokenized strings back into native Python types."""
         if isinstance(obj, str) and obj.startswith(self.prefix):
             type_str, payload = obj[len(self.prefix):].split(":", 1)
             try:
                 if type_str == "set": return set(json.loads(payload))
                 if type_str == "tuple": return tuple(json.loads(payload))
             except json.JSONDecodeError:
-                pass # Fallback to returning the raw string if parsing fails
+                pass
         if isinstance(obj, dict): return {self.decode(k): self.decode(v) for k, v in obj.items()}
         if isinstance(obj, list): return [self.decode(v) for v in obj]
         return obj
@@ -122,7 +113,6 @@ class JsonManager:
 
 @dataclass
 class TimeWindow:
-    """Truncated Gaussian representation for temporal metadata."""
     t_start: float
     t_end: float
     mu: Optional[float] = None
@@ -139,8 +129,6 @@ class TimeWindow:
     def sample(self, resolution: float = None) -> Tuple[np.ndarray, np.ndarray]:
         res = resolution or min(max(1e-6, self.s_start), max(1e-6, self.s_end))
         t = np.arange(self.t_start, self.t_end + 1e-9, res)
-
-        # Calculate raw PDF and truncate
         raw_pdf = np.exp(-0.5 * ((t - self.mu) / self.sigma) ** 2) / (self.sigma * np.sqrt(2.0 * np.pi))
         mask = (t >= self.t_start) & (t <= self.t_end)
         raw_pdf *= mask
@@ -154,7 +142,6 @@ class TimeWindow:
         return {"mean": float(np.trapz(t * pdf, t)) if pdf.sum() > 0 else self.mu, "p25": float(t[min(max(0, np.searchsorted(cdf, 0.25)), len(t)-1)]) if cdf.size > 0 else self.mu, "p50": float(t[min(max(0, np.searchsorted(cdf, 0.50)), len(t)-1)]) if cdf.size > 0 else self.mu, "p75": float(t[min(max(0, np.searchsorted(cdf, 0.75)), len(t)-1)]) if cdf.size > 0 else self.mu}
 
 class TimeTranslator:
-    """Handles time unit conversions and human-readable formatting."""
     FACTORS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
 
     @classmethod
@@ -169,96 +156,70 @@ class TimeTranslator:
 
     @staticmethod
     def format_window(tw: TimeWindow) -> Dict[str, str]:
-        """Translates a TimeWindow into simplified UI approximations."""
         stats = tw.stats()
         fmt = lambda x: f"{x:g} {tw.unit}".strip()
         return {"window": f"{fmt(tw.t_start)} → {fmt(tw.t_end)}", "peak": fmt(tw.mu), "mean": fmt(stats["mean"]), "p25": fmt(stats["p25"]), "p50": fmt(stats["p50"]), "p75": fmt(stats["p75"])}
 
 class FlowNode:
-    """A generalized DAG node that acts as a dict for data payload while managing structural properties natively."""
+    """Universal pipeline node. Agnostic to any specific step's shape - only knows its own type, config, and the logical<->actual key mapping that lets it read/write the pipeline's shared data object.
+    No prev/next: execution order is derived entirely from key presence (engine.py), never stored here. appearance is UI-only and never read by execution."""
     def __init__(self, data: dict = None):
         data = data or {}
         self.id: str = data.get("id", str(uuid.uuid4()))
-        self.id2: str = data.get("id2", "")
-        self.prev: List[str] = data.get("prev", [])
-        self.next: List[str] = data.get("next", [])
-        self.appearance: dict = data.get("appearance", {"pos": (0, 0)}) # UI State
-        self._payload: dict = {k: v for k, v in data.items() if k not in ["id", "id2", "prev", "next", "appearance"]} # Data Payload
+        self.type: str = data.get("type", "")
+        self.name: str = data.get("name", "")
+        self.config: dict = data.get("config", {})
+        self.key_map: dict = data.get("key_map", {})                    # logical name -> actual pipeline key (applies to in AND out)
+        self.extra_in_keys: List[str] = data.get("extra_in_keys", [])   # actual pipeline keys needed beyond the type's declared logical ins
+        self.extra_out_keys: List[str] = data.get("extra_out_keys", []) # actual pipeline keys promised beyond the type's declared logical outs
+        self.appearance: dict = data.get("appearance", {})
+        self.status: str = data.get("status", "idle")
+        self.ts: str = data.get("ts", "")
+        self.preview: dict = data.get("preview", {})
+        self.message: str = data.get("message", "")
 
-    def get(self, key: str, default: Any = None) -> Any: return self._payload.get(key, default)
-    def __getitem__(self, key: str) -> Any: return self._payload[key]
-    def __setitem__(self, key: str, value: Any): self._payload[key] = value
-    def to_dict(self) -> dict: return {"id": self.id, "id2": self.id2, "prev": self.prev, "next": self.next, "appearance": self.appearance, **self._payload} # Serializes node back to a flat dictionary.
+    def in_key(self, logical: str) -> str: return self.key_map.get(logical, logical)
+    def out_key(self, logical: str) -> str: return self.key_map.get(logical, logical)
+    def to_dict(self) -> dict: return {"id": self.id, "type": self.type, "name": self.name, "config": self.config, "key_map": self.key_map, "extra_in_keys": self.extra_in_keys, "extra_out_keys": self.extra_out_keys, "appearance": self.appearance, "status": self.status, "ts": self.ts, "preview": self.preview, "message": self.message}
 
 class Flow:
-    """Memory-first DAG manager for FlowNodes, supporting insertions, deletions, and hierarchical properties."""
+    """Memory-first container for a set of universal FlowNodes. No structural edges are stored - a node's causal position is entirely a function of which actual pipeline keys it needs versus which other nodes produce those keys, recomputed on demand.
+    Nodes can be freely added, removed, or rewired (by editing key_map) without a second data structure to keep in sync."""
     def __init__(self, flow_data: Union[List[dict], Dict[str, Any]] = None):
         self.nodes: Dict[str, FlowNode] = {}
         self.appearance: dict = {}
-        self.subflows: dict = {}
         if not flow_data: return
-        if isinstance(flow_data, list): # Init from a flat list of dicts (e.g., when generating new stub nodes via UI)
-            for n_data in flow_data:
-                node = FlowNode(n_data)
-                self.nodes[node.id] = node
-        elif isinstance(flow_data, dict): # Init from a saved state dict containing subflows and global appearances
-            for n_data in flow_data.get("nodes", []): 
-                node = FlowNode(n_data)
-                self.nodes[node.id] = node
+        if isinstance(flow_data, list):
+            for n_data in flow_data: node = FlowNode(n_data); self.nodes[node.id] = node
+        elif isinstance(flow_data, dict):
+            for n_data in flow_data.get("nodes", []): node = FlowNode(n_data); self.nodes[node.id] = node
             self.appearance = flow_data.get("appearance", {})
-            self.subflows = flow_data.get("subflows", {})
 
-    def __getitem__(self, index: int) -> FlowNode: return list(self.nodes.values())[index] # Allows for index-based access: flow[0] (used in UI to grab the first generated stub node)
+    def __getitem__(self, index: int) -> FlowNode: return list(self.nodes.values())[index]
+    def add(self, node: FlowNode): self.nodes[node.id] = node
+    def remove(self, node_id: str) -> Optional[FlowNode]: return self.nodes.pop(node_id, None)
+    def to_dict(self) -> dict: return {"nodes": [n.to_dict() for n in self.nodes.values()], "appearance": self.appearance}
+    def required_in_keys(self, node: FlowNode, type_spec: dict) -> set: return {node.in_key(k) for k in type_spec.get("in_keys", [])} | set(node.extra_in_keys) # Actual pipeline keys that must be present in the shared data object before this node can run.
+    def produced_out_keys(self, node: FlowNode, type_spec: dict) -> set: return {node.out_key(k) for k in type_spec.get("out_keys", [])} | set(node.extra_out_keys) # Actual pipeline keys this node promises to write - used only for the causal-level display, never for scheduling (scheduling reacts to keys that actually appear at runtime, not to what a node merely claims it might produce).
 
-    def insert_between(self, sub_flow: 'Flow', p_node_id: Optional[str] = None, n_node_id: Optional[str] = None):
-        """Splices an entire sub-flow (group of nodes) between a given parent and child node ID."""
-        for node_id, node in sub_flow.nodes.items():  self.nodes[node_id] = node # Absorb nodes into main tracker
-        sub_heads = [n for n in sub_flow.nodes.values() if not n.prev]
-        sub_tails = [n for n in sub_flow.nodes.values() if not n.next]
-        if p_node_id and p_node_id in self.nodes: 
-            p_node = self.nodes[p_node_id] # Connect parent to heads of the sub_flow
-            for head in sub_heads:
-                if head.id not in p_node.next: p_node.next.append(head.id)
-                if p_node_id not in head.prev: head.prev.append(p_node_id)
-        if n_node_id and n_node_id in self.nodes: 
-            n_node = self.nodes[n_node_id] # Connect tails of the sub_flow to child
-            for tail in sub_tails:
-                if n_node_id not in tail.next: tail.next.append(n_node_id)
-                if tail.id not in n_node.prev: n_node.prev.append(tail.id)  
-        if p_node_id and n_node_id: self.break_path(p_node_id, n_node_id) # Break previous direct connection between p_node and n_node if it exists
-
-    def pop(self, node_id: str) -> Optional[FlowNode]:
-        """Safely removes a node from the graph and cleans up orphaned connections natively."""
-        if node_id not in self.nodes: return None
-        node = self.nodes.pop(node_id)
-        for p_id in node.prev: # Scrub node ID from parent connections
-            if p_id in self.nodes and node_id in self.nodes[p_id].next: 
-                self.nodes[p_id].next.remove(node_id)
-        for n_id in node.next: # Scrub node ID from child connections
-            if n_id in self.nodes and node_id in self.nodes[n_id].prev: self.nodes[n_id].prev.remove(node_id)
-        return node
-
-    def break_path(self, src_id: str, dst_id: str):
-        """Severs a directional path link between two node IDs."""
-        if src_id in self.nodes and dst_id in self.nodes[src_id].next: self.nodes[src_id].next.remove(dst_id)
-        if dst_id in self.nodes and src_id in self.nodes[dst_id].prev: self.nodes[dst_id].prev.remove(src_id)
-
-    def to_dict(self) -> dict: return {"nodes": [node.to_dict() for node in self.nodes.values()], "appearance": self.appearance, "subflows": self.subflows} # Serializes entire flow object for JSON saving.
-    def heads(self) -> List[FlowNode]: return [n for n in self.nodes.values() if not n.prev]
-    def is_complete(self, done: set, skipped: set = None) -> bool: return all(n.id in (done | (skipped or set())) for n in self.nodes.values())
-
-    def ready(self, done: set, skipped: set = None) -> List[FlowNode]:
-        """Nodes not yet resolved whose join condition against prev is satisfied.
-        join='all' (default): every prev must be done or skipped for this node to be considered - the caller is responsible for deciding whether an all-join node with a skipped prev should itself run or cascade to skipped, since that's an execution-semantics call, not a structural one.
-        join='any': at least one prev must be done (skipped prevs don't block and don't count)."""
-        skipped = skipped or set()
-        resolved = done | skipped
-        out = []
+    def resolve_levels(self, type_specs: dict) -> Dict[str, int]:
+        """Display-only: assigns each node a causal level (0 = no dependencies among current nodes) for the graphical builder view - time flows down, same level means potentially concurrent.
+        Never consulted by the engine."""
+        producers: Dict[str, list] = {}
         for n in self.nodes.values():
-            if n.id in resolved: continue
-            if not n.prev: out.append(n); continue
-            join = n.get("join", "all")
-            if join == "any":
-                if any(p in done for p in n.prev): out.append(n)
-            elif all(p in resolved for p in n.prev): out.append(n)
-        return out
+            spec = type_specs.get(n.type, {})
+            for k in self.produced_out_keys(n, spec): producers.setdefault(k, []).append(n.id)
+        level: Dict[str, int] = {}
+        def _lvl(n: FlowNode, seen: set) -> int:
+            if n.id in level: return level[n.id]
+            if n.id in seen: return 0
+            seen = seen | {n.id}
+            spec = type_specs.get(n.type, {})
+            deps = set()
+            for k in self.required_in_keys(n, spec): deps.update(producers.get(k, []))
+            deps.discard(n.id)
+            lvl = 1 + max((_lvl(self.nodes[d], seen) for d in deps if d in self.nodes), default=-1)
+            level[n.id] = lvl
+            return lvl
+        for n in self.nodes.values(): _lvl(n, set())
+        return level
