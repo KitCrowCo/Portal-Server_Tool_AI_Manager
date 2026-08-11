@@ -12,6 +12,7 @@ from tools.ai_manager import engine
 from tools.ai_manager import steps
 from tools.ai_manager import connections
 from tools.ai_manager import resources
+from tools.ai_manager.flow import Flow
 
 TOOL_META = {"label": "AI Manager", "icon": "&#x1F9E0;", "description": "Centralized AI connections, steps, and pipeline execution"}
 router = APIRouter()
@@ -24,6 +25,7 @@ UI = globals().get("UI", None)
 BI = globals().get("BI", None)
 FM = globals().get("FM", None)
 _PB = globals().get("_PB", None)
+IM = globals().get("IM", None)
 _NAMED_ROOTS = {"common": "./data/_common"}
 
 def register_root(name: str, path: str): _NAMED_ROOTS[name] = path
@@ -31,31 +33,79 @@ def resolve_root(name: str) -> str: return _NAMED_ROOTS.get(name, name)
 def list_roots() -> list: return list(_NAMED_ROOTS.items())
 
 def init_module(env: dict):
-    global ENV, UI, BI, FM, _PB
+    global ENV, UI, BI, FM, _PB, IM
     ENV.update(env)
     UI = ENV["templates"].env.globals.get("UI")
     BI = ENV["tools"]["built_ins"]
     FM = BI.FileManager(TOOL_ROOT)
     _PB = BI.PromptBlockLibrary(PROMPT_BLOCKS_PATH)
+    IM = ENV["InterfaceManager"](nesting_level=1, db_path="ai_manager/im_registry.db")
+    p = self.intent_prefix
+    IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save]})
     engine.init(env)
     steps.init(env)
     steps.register_builtins()
-    print(f"[ai_manager] ready | step types: {[s['type'] for s in steps.list_step_types()]}")
+    print(f"[ai_manager] ready | node types: {[t['type'] for t in steps.list_node_types()]}")
 
 def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
 def prompt_block_picker_fragment(textarea_id: str) -> str: return BI.prompt_block_picker_html(_PB, textarea_id, f"{_P}/prompt_blocks/save")
 
+def _cnode_form_html(cnode: dict = None, cid: str = "") -> str:
+    c = cnode or resources.DEFAULT_CNODE
+    conn_opts = "".join(f'<option value="{f.stem}" {"selected" if f.stem in c.get("conn_ids",[]) else ""}>{f.stem} ({(connections.load_conn_raw(f.stem) or {}).get("connection_type","?")})</option>' for f in sorted(connections.CONN_DIR.glob("*.json")))
+    vals = json.dumps({"type":"cnode_save","lvl":1,"cid":cid})
+    return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals}' hx-include="this" style="display:flex;flex-direction:column;gap:.4rem;padding:.6rem" class="glass">
+                   <label class="dim">Label<input type="text" name="label" value="{UI.escape(c.get('label',''))}" class="module-select" required></label>
+                   <label class="dim">Tags (comma-sep)<input type="text" name="tags" value="{','.join(c.get('tags',[]))}" class="module-select"></label>
+                   <label class="dim">Connections on this CNode<select name="conn_ids" multiple size="5" class="module-select">{conn_opts}</select></label>
+                   <label class="dim">Memory (GB)<input type="number" name="mem_gb" value="{c.get('mem_gb',16)}" step="any" class="module-select"></label>
+                   <label class="dim">Overhead (GB)<input type="number" name="overhead_gb" value="{c.get('overhead_gb',2)}" step="any" class="module-select"></label>
+                   <label class="dim">Compute Score (relative, higher = faster)<input type="number" name="compute_score" value="{c.get('compute_score',1.0)}" step="any" class="module-select"></label>
+                   <label class="dim">Quality Score (relative, higher = better)<input type="number" name="quality_score" value="{c.get('quality_score',1.0)}" step="any" class="module-select"></label>
+                   <label class="dim">Notes<textarea name="notes" class="cm-input" rows="2">{UI.escape(c.get('notes',''))}</textarea></label>
+                   <button type="submit" class="button">Save CNode</button>
+               </form>"""
+
+def _cnode_list_html() -> str:
+    rows = "".join(f"""<div class="glass" style="padding:.5rem .7rem;margin-bottom:.3rem;display:flex;align-items:center;gap:.5rem">
+                            <span style="flex:1;font-weight:600">{UI.escape(c['label'])}</span>
+                            <span class="dim tiny">{', '.join(c.get('tags',[]))}</span>
+                            <span class="dim tiny">{len(c.get('conn_ids',[]))} conn(s)</span>
+                            <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"cnode_edit_form","lvl":1,"cid":c["id"]})}'>Edit</button>
+                            <button class="cm-qbtn" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"cnode_delete","lvl":1,"cid":c["id"]})}' hx-confirm="Delete?">&#x2715;</button>
+                        </div>""" for c in resources.list_cnodes()) or '<div class="dim" style="padding:.5rem">No CNodes yet.</div>'
+    return f'<div id="cnode-list">{rows}</div>'
+
+async def _im_cnode_save(request, payload, imr):
+    cid = payload.get("cid","") or f"cnode_{uuid.uuid4().hex[:8]}"
+    conn_ids = payload.get("conn_ids", [])
+    if isinstance(conn_ids, str): conn_ids = [conn_ids] if conn_ids else []
+    resources.save_cnode(cid, {"label": payload.get("label","").strip(), "tags": [t.strip() for t in payload.get("tags","").split(",") if t.strip()], "conn_ids": conn_ids, "mem_gb": float(payload.get("mem_gb") or 16), "overhead_gb": float(payload.get("overhead_gb") or 2), "compute_score": float(payload.get("compute_score") or 1.0), "quality_score": float(payload.get("quality_score") or 1.0), "notes": payload.get("notes","")})
+    imr.oob(_cnode_list_html(), "cnode-list", swap="outerHTML")
+    imr.oob(_cnode_form_html(), "cnode-form", swap="outerHTML")
+    return imr
+
+async def _im_cnode_delete(request, payload, imr):
+    resources.delete_cnode(payload.get("cid",""))
+    imr.oob(_cnode_list_html(), "cnode-list", swap="outerHTML")
+    return imr
+
+async def _im_cnode_edit_form(request, payload, imr):
+    imr.oob(_cnode_form_html(resources.get_cnode(payload.get("cid","")), payload.get("cid","")), "cnode-form", swap="outerHTML")
+    return imr
+
+@router.get("/resources", response_class=HTMLResponse)
+async def resources_page(request: Request):
+    return HTMLResponse(f"""<div style="max-width:50rem;margin:0 auto;padding:1.5rem">
+                                 <a href="{_P}/" style="color:var(--accent);font-size:.8rem">&#x2190; AI Manager</a>
+                                 <h2 style="margin:.6rem 0 1rem">Resource Pool - CNodes</h2>
+                                 <p style="font-size:.8rem;color:var(--text_muted)">Each CNode is one machine hosting one or more connections. A pipeline's pool (whitelist/blacklist tags) plus a node's own cnode_tags narrow this list at run time.</p>
+                                 {_cnode_list_html()}
+                                 <div id="cnode-form" style="margin-top:.8rem">{_cnode_form_html()}</div>
+                             </div>""")
+
 class PipelineBuilderUI:
     """Universal-node pipeline authoring surface. No prev/next wiring anywhere in this UI - node order is entirely a function of key presence, computed fresh for the graphical view via Flow.resolve_levels()."""
-
-    SCRIPT = """
-    function plbExport(plId) {
-        fetch('/tool/ai_manager/pipelines/' + plId + '/export').then(r => r.json()).then(d => {
-            var blob = new Blob([JSON.stringify(d, null, 2)], {type: 'application/json'});
-            var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = (d.name || 'pipeline') + '.json'; a.click();
-        });
-    }
-    """
 
     def __init__(self, IM, AIM, intent_prefix="plb", nesting_level=2, scope_key="project_id"):
         self.IM, self.AIM, self.intent_prefix, self.nesting_level, self.scope_key = IM, AIM, intent_prefix, nesting_level, scope_key
@@ -66,19 +116,6 @@ class PipelineBuilderUI:
     def _post(self, action, **extra): return f"""hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{self._vals(action, **extra)}'"""
     def _pipelines(self, scope_id): return [p for p in self.AIM.engine.list_pipelines() if p.get(self.scope_key) == scope_id]
 
-    def panel_html(self, scope_id: str, include_modal_slot: bool = True) -> str:
-        p = self.intent_prefix
-        cards = "".join(self._card_html(scope_id, pl) for pl in self._pipelines(scope_id)) or '<div class="list-empty">No pipelines. Click + to create one.</div>'
-        modal_slot = f'<div id="pl-editor-modal-{p}"></div>' if include_modal_slot else ""
-        return f"""<div id="pl-panel-{p}" class="pl-panel">
-                       <div class="pl-panel-hd"><span class="pl-panel-title">Pipelines</span><button class="btn-icon" {self._post("new_form", scope=scope_id)}>+</button></div>
-                       <div id="pl-new-{p}"></div>
-                       <div id="pl-list-{p}" class="pl-list">{cards}</div>
-                       {modal_slot}
-                   </div>"""
-
-    def modal_slot_html(self, scope_id: str = "") -> str: return f'<div id="pl-editor-modal-{self.intent_prefix}"></div>' # Render at a non-transformed DOM level (main content area, not inside a sliding toolbar) - position:fixed modal backdrops are trapped inside any ancestor with an active CSS transform.
-
     def _card_html(self, scope_id, pl) -> str:
         pl_id = pl["id"]
         last_job = self.AIM.engine.load_job(pl.get("last_job_id","")) if pl.get("last_job_id") else None
@@ -86,17 +123,116 @@ class PipelineBuilderUI:
         pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
         pool_badge = f'<span class="status-badge" title="whitelist:{",".join(pool.get("whitelist_tags",[])) or "any"} blacklist:{",".join(pool.get("blacklist_tags",[]))}">{pool.get("priority","balanced")}</span>'
         rows = "".join(self._node_status_row(n) for n in nodes)
-        return f"""<div class="glass pl-card">
-                       <div class="pl-card-hd">
-                           <span class="pl-card-title" {self._post("editor_open", scope=scope_id, pl_id=pl_id)}>{UI.escape(pl.get("name",""))}</span>
+        return f"""<div class="glass list-card">
+                       <div class="list-card-hd">
+                           <span class="list-card-title" {self._post("editor_open", scope=scope_id, pl_id=pl_id)}>{UI.escape(pl.get("name",""))}</span>
+                           <span class="dim tiny" style="font-family:var(--font-mono)">{pl_id}</span>
                            {pool_badge}
-                           <button type="button" class="cm-qbtn" onclick="plbExport('{pl_id}')">&#x2B07;</button>
+                           <a class="cm-qbtn" href="{_P}/pipelines/{pl_id}/export" download="{pl_id}.json">&#x2B07;</a>
                            <button class="btn-icon" style="color:#ff5f5f" {self._post("delete", scope=scope_id, pl_id=pl_id)} onclick="return confirm('Delete pipeline?')">&#x2715;</button>
                        </div>
                        <input type="text" id="pl-input-{pl_id}" name="value" placeholder="Input for this run" class="module-select">
                        <div id="pl-status-{pl_id}">{self._status_block(scope_id, pl_id, last_job)}</div>
-                       <details class="status-list"><summary>Node status ({len(nodes)})</summary><table class="status-table">{rows}</table></details>
+                       <details class="status-details"><summary>Node status ({len(nodes)})</summary><table class="status-table">{rows}</table></details>
                    </div>"""
+    
+    def _node_status_row(self, n) -> str:
+        col = {"done":"#00ffa2","error":"#ff5f5f","running":"#ffcc00","unreached":"var(--text_muted)"}.get(n.get("status","idle"), "var(--text)")
+        preview = n.get("message") or " | ".join(str(v) for v in (n.get("preview") or {}).values())
+        return f"""<tr><td class="qn">{UI.escape(n.get("name") or n["id"])}</td><td class="dim">{UI.escape(n.get("type",""))}</td><td style="color:{col}">{UI.escape(n.get("status","idle"))}</td><td class="dim status-preview">{UI.escape(preview)}</td></tr>"""
+    
+    def panel_html(self, scope_id: str, include_modal_slot: bool = True) -> str:
+        p = self.intent_prefix
+        cards = "".join(self._card_html(scope_id, pl) for pl in self._pipelines(scope_id)) or '<div class="list-empty">No pipelines. Click + to create one.</div>'
+        modal_slot = f'<div id="pl-editor-modal-{p}"></div>' if include_modal_slot else ""
+        return f"""<div id="pl-panel-{p}" class="list-panel">
+                       <div class="list-panel-hd"><span class="list-panel-title">Pipelines</span><button class="btn-icon" {self._post("new_form", scope=scope_id)}>+</button></div>
+                       <div id="pl-new-{p}"></div>
+                       <details class="list-new-form" style="margin:.3rem 0"><summary style="cursor:pointer;font-size:.72rem;color:var(--text_muted)">Import (paste JSON)</summary>
+                           <form {self._post("import", scope=scope_id)} hx-include="this" style="display:flex;flex-direction:column;gap:.3rem;padding:.3rem 0">
+                               <textarea name="json" class="cm-input" rows="4" placeholder="Paste exported pipeline JSON here"></textarea>
+                               <button type="submit" class="button">Import</button>
+                               <span id="pl-import-msg-{p}"></span>
+                           </form>
+                       </details>
+                       <div id="pl-list-{p}" class="list-body">{cards}</div>
+                       {modal_slot}
+                   </div>"""
+    
+    def modal_slot_html(self, scope_id: str = "") -> str: return f'<div id="pl-editor-modal-{self.intent_prefix}"></div>' # Render at a non-transformed DOM level (main content area, not inside a sliding toolbar) - position:fixed modal backdrops are trapped inside any ancestor with an active CSS transform.
+        
+    def _list_view_html(self, scope_id, pl) -> str:
+        p = self.intent_prefix
+        rows = "".join(f"""<div class="node-row" {self._post("node_form", scope=scope_id, pl_id=pl["id"], nid=n["id"])}>{UI.escape(n.get("name") or n["id"])} <span class="dim">({UI.escape(n.get("type",""))})</span></div>""" for n in pl.get("flow",{}).get("nodes",[])) or '<div class="dim">No nodes yet.</div>'
+        return f"""<div id="pl-node-editor-{p}" class="node-editor">
+                       <div class="list-placeholder">Select or add a node.</div>
+                       <div class="node-list">{rows}</div>
+                       <button class="btn-icon" {self._post("node_form", scope=scope_id, pl_id=pl["id"])}>+ Add Node</button>
+                   </div>"""
+    
+    def _graph_view_html(self, pl) -> str:
+        f = Flow(pl.get("flow", {}))
+        type_specs = {t["type"]: t for t in self.AIM.steps.list_node_types()}
+        levels = f.resolve_levels(type_specs)
+        by_level: dict = {}
+        for n in f.nodes.values(): by_level.setdefault(levels.get(n.id, 0), []).append(n)
+        rows = "".join(f"""<div class="node-graph-row"><span class="node-graph-row-lbl">{lvl}</span>{"".join(f'<div class="node-block" {self._post("node_form", scope=pl.get(self.scope_key,""), pl_id=pl["id"], nid=n.id)}><b>{UI.escape(n.name or n.id)}</b><span class="dim">{UI.escape(n.type)}</span></div>' for n in nodes)}</div>""" for lvl, nodes in sorted(by_level.items()))
+        return f'<div class="node-graph">{rows or "<div class=dim>No nodes yet.</div>"}</div>'
+    
+    def _editor_html(self, scope_id, pl, view: str = "list") -> str:
+        p = self.intent_prefix
+        body = self._graph_view_html(pl) if view == "graph" else self._list_view_html(scope_id, pl)
+        toggle = "".join(f"""<button class="cm-qbtn {"active" if view==v else ""}" {self._post("view_toggle", scope=scope_id, pl_id=pl["id"], view=v)}>{lbl}</button>""" for v,lbl in (("list","List"),("graph","Graph")))
+        header = f"""<div style="display:flex;gap:.4rem;align-items:center;margin-bottom:.5rem">
+                         <input type="text" value="{UI.escape(pl.get("name",""))}" class="module-select" {self._post("rename", scope=scope_id, pl_id=pl["id"])} hx-trigger="change" hx-include="this" name="name" style="flex:1">
+                         {toggle}
+                         <button type="button" class="btn-icon" {self._post("pool_form", scope=scope_id, pl_id=pl["id"])} title="Resource pool">Pool</button>
+                     </div>
+                     <div id="pl-pool-{p}"></div>"""
+        return UI.modal(f"{p}-editor", "Pipeline Editor", header + body, width="90%", max_width="70rem")
+    
+    def _pool_form_html(self, scope_id, pl) -> str:
+        pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
+        all_tags = sorted({t for c in self.AIM.resources.list_cnodes() for t in c.get("tags",[])})
+        tag_opts = lambda selected: "".join(f'<option value="{t}" {"selected" if t in selected else ""}>{t}</option>' for t in all_tags)
+        return f"""<form {self._post("pool_save", scope=scope_id, pl_id=pl["id"])} hx-include="this" class="glass" style="padding:.6rem;margin:.3rem 0;display:flex;flex-direction:column;gap:.4rem">
+                       <label class="dim">Priority<select name="priority" class="module-select">{"".join(f'<option value="{v}" {"selected" if v==pool.get("priority","balanced") else ""}>{l}</option>' for v,l in (("speed","Speed"),("balanced","Balanced"),("quality","Quality")))}</select></label>
+                       <label class="dim">Whitelist Tags (empty = any)<select name="whitelist_tags" multiple size="4" class="module-select">{tag_opts(pool.get("whitelist_tags",[]))}</select></label>
+                       <label class="dim">Blacklist Tags<select name="blacklist_tags" multiple size="4" class="module-select">{tag_opts(pool.get("blacklist_tags",[]))}</select></label>
+                       <button type="submit" class="button">Save Pool</button>
+                   </form>"""
+    
+    async def _im_view_toggle(self, request, payload, imr):
+        pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
+        return imr.oob(self._editor_html(payload.get("scope",""), pl, view=payload.get("view","list")), f"pl-editor-modal-{self.intent_prefix}") if pl else imr
+    
+    async def _im_import(self, request, payload, imr):
+        scope_id = payload.get("scope","")
+        try: doc = json.loads(payload.get("json","{}"))
+        except Exception as e:
+            imr.raw(f'<span id="pl-import-msg-{self.intent_prefix}" style="color:#ff5f5f;font-size:.7rem" hx-swap-oob="outerHTML">Invalid JSON: {UI.escape(str(e))}</span>')
+            return imr
+        doc["id"] = f"pl_{uuid.uuid4().hex[:10]}"
+        doc[self.scope_key] = scope_id
+        doc.setdefault("pool", self.AIM.engine.DEFAULT_POOL)
+        doc.setdefault("created", "")
+        self.AIM.engine.save_pipeline(doc)
+        return imr.oob("".join(self._card_html(scope_id, p_) for p_ in self._pipelines(scope_id)) or '<div class="list-empty">No pipelines.</div>', f"pl-list-{self.intent_prefix}")
+    
+    async def _im_pool_form(self, request, payload, imr):
+        pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
+        return imr.oob(self._pool_form_html(payload.get("scope",""), pl), f"pl-pool-{self.intent_prefix}") if pl else imr
+    
+    async def _im_pool_save(self, request, payload, imr):
+        pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
+        if not pl: return imr
+        wl, bl = payload.get("whitelist_tags", []), payload.get("blacklist_tags", [])
+        pl["pool"] = {"priority": payload.get("priority","balanced"), "whitelist_tags": wl if isinstance(wl, list) else ([wl] if wl else []), "blacklist_tags": bl if isinstance(bl, list) else ([bl] if bl else []), "whitelist_cnodes": pl.get("pool",{}).get("whitelist_cnodes",[]), "blacklist_cnodes": pl.get("pool",{}).get("blacklist_cnodes",[])}
+        self.AIM.engine.save_pipeline(pl)
+        scope_id = payload.get("scope","")
+        imr.oob("", f"pl-pool-{self.intent_prefix}")
+        imr.oob("".join(self._card_html(scope_id, p_) for p_ in self._pipelines(scope_id)) or '<div class="list-empty">No pipelines.</div>', f"pl-list-{self.intent_prefix}")
+        return imr
 
     def _status_block(self, scope_id, pl_id, job) -> str:
         live = bool(job and job.get("status") in ("running","queued"))
@@ -110,11 +246,6 @@ class PipelineBuilderUI:
                        <button class="cm-qbtn" {self._post("run", scope=scope_id, pl_id=pl_id)} hx-include="#pl-input-{pl_id}">&#x25B6; Run</button>
                        {resume}<span class="status-label">{label}</span>
                     </div>"""
-
-    def _node_status_row(self, n) -> str:
-        col = {"done":"#00ffa2","error":"#ff5f5f","running":"#ffcc00","unreached":"var(--text_muted)"}.get(n.get("status","idle"), "var(--text)")
-        preview = n.get("message") or " | ".join(str(v) for v in (n.get("preview") or {}).values())
-        return f"""<tr><td class="qn">{UI.escape(n.get("name") or n["id"])}</td><td class="dim">{UI.escape(n.get("type",""))}</td><td style="color:{col}">{UI.escape(n.get("status","idle"))}</td><td class="dim status-preview">{UI.escape(preview)}</td></tr>"""
 
     def _node_type_options(self, selected=""):
         blank = '<option value="" selected disabled>-- select node type --</option>' if not selected else ""
@@ -144,52 +275,6 @@ class PipelineBuilderUI:
                        <div class="form-actions"><button type="submit" class="button">{"Add Node" if is_new else "Save Node"}</button>{del_btn}</div>
                    </form>"""
 
-    def _list_view_html(self, scope_id, pl) -> str:
-        p = self.intent_prefix
-        rows = "".join(f"""<div class="node-row" {self._post("node_form", scope=scope_id, pl_id=pl["id"], nid=n["id"])}>{UI.escape(n.get("name") or n["id"])} <span class="dim">({UI.escape(n.get("type",""))})</span></div>""" for n in pl.get("flow",{}).get("nodes",[])) or '<div class="dim">No nodes yet.</div>'
-        return f"""<div id="pl-node-editor-{p}" class="pl-node-editor">
-                       <div class="pl-placeholder">Select or add a node.</div>
-                       <div class="pl-node-list">{rows}</div>
-                       <button class="btn-icon" {self._post("node_form", scope=scope_id, pl_id=pl["id"])}>+ Add Node</button>
-                   </div>"""
-
-    def _graph_view_html(self, pl) -> str:
-        f = Flow(pl.get("flow", {}))
-        type_specs = {t["type"]: t for t in self.AIM.steps.list_node_types()}
-        levels = f.resolve_levels(type_specs)
-        by_level: dict = {}
-        for n in f.nodes.values(): by_level.setdefault(levels.get(n.id, 0), []).append(n)
-        rows = "".join(f"""<div class="graph-row"><span class="graph-row-lbl">{lvl}</span>{"".join(f'<div class="graph-node" {self._post("node_form", scope=pl.get(self.scope_key,""), pl_id=pl["id"], nid=n.id)}><b>{UI.escape(n.name or n.id)}</b><span class="dim">{UI.escape(n.type)}</span></div>' for n in nodes)}</div>""" for lvl, nodes in sorted(by_level.items()))
-        return f'<div class="pl-graph">{rows or "<div class=dim>No nodes yet.</div>"}</div>'
-
-    def _editor_html(self, scope_id, pl, view: str = "list") -> str:
-        p = self.intent_prefix
-        body = self._graph_view_html(pl) if view == "graph" else self._list_view_html(scope_id, pl)
-        toggle = "".join(f"""<button class="cm-qbtn {"active" if view==v else ""}" {self._post("view_toggle", scope=scope_id, pl_id=pl["id"], view=v)} hx-target="#pl-editor-modal-{p}" hx-swap="innerHTML">{lbl}</button>""" for v,lbl in (("list","List"),("graph","Graph")))
-        return f"""<div class="pl-modal-backdrop" onclick="if(event.target===this) htmx.ajax('POST','/im/in',{{values:{self._vals("editor_close")},swap:'none'}})">
-                       <div class="glass pl-modal">
-                           <div class="pl-modal-hd">
-                               <input type="text" value="{UI.escape(pl.get("name",""))}" class="module-select" {self._post("rename", scope=scope_id, pl_id=pl["id"])} hx-trigger="change" hx-include="this" name="name">
-                               {toggle}
-                               <button type="button" class="btn-icon" {self._post("pool_form", scope=scope_id, pl_id=pl["id"])} hx-target="#pl-pool-{p}" title="Resource pool">&#x1F5C4;</button>
-                               <button type="button" class="close-btn" {self._post("editor_close")}>&#x2715;</button>
-                           </div>
-                           <div id="pl-pool-{p}"></div>
-                           <div class="pl-modal-body">{body}</div>
-                       </div>
-                   </div>"""
-
-    def _pool_form_html(self, scope_id, pl) -> str:
-        pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
-        all_tags = sorted({t for c in self.AIM.resources.list_cnodes() for t in c.get("tags",[])})
-        tag_opts = lambda selected: "".join(f'<option value="{t}" {"selected" if t in selected else ""}>{t}</option>' for t in all_tags)
-        return f"""<form {self._post("pool_save", scope=scope_id, pl_id=pl["id"])} hx-include="this" class="glass" style="padding:.6rem;margin:.3rem 0;display:flex;flex-direction:column;gap:.4rem">
-                       <label class="dim">Priority<select name="priority" class="module-select">{"".join(f'<option value="{v}" {"selected" if v==pool.get("priority","balanced") else ""}>{l}</option>' for v,l in (("speed","Speed"),("balanced","Balanced"),("quality","Quality")))}</select></label>
-                       <label class="dim">Whitelist Tags (empty = any)<select name="whitelist_tags" multiple size="4" class="module-select">{tag_opts(pool.get("whitelist_tags",[]))}</select></label>
-                       <label class="dim">Blacklist Tags<select name="blacklist_tags" multiple size="4" class="module-select">{tag_opts(pool.get("blacklist_tags",[]))}</select></label>
-                       <button type="submit" class="button">Save Pool</button>
-                   </form>"""
-
     async def _im_new_form(self, request, payload, imr):
         return imr.oob(f"""<form {self._post("create", scope=payload.get("scope",""))} hx-include="this" class="pl-new-form"><input type="text" name="name" class="module-select" placeholder="Pipeline name" required autofocus><button type="submit" class="button">Create</button></form>""", f"pl-new-{self.intent_prefix}")
 
@@ -210,20 +295,13 @@ class PipelineBuilderUI:
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
         return imr.oob(self._editor_html(payload.get("scope",""), pl), f"pl-editor-modal-{self.intent_prefix}") if pl else imr
 
-    async def _im_editor_close(self, request, payload, imr): return imr.oob("", f"pl-editor-modal-{self.intent_prefix}")
-
-    async def _im_view_toggle(self, request, payload, imr):
-        pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
-        return imr.oob(self._editor_html(payload.get("scope",""), pl, view=payload.get("view","list")), f"pl-editor-modal-{self.intent_prefix}") if pl else imr
-
     async def _im_node_form(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
         if not pl: return imr
         node = next((n for n in pl.get("flow",{}).get("nodes",[]) if n["id"]==payload.get("nid")), None)
         return imr.oob(self._node_form_html(payload.get("scope",""), pl, node), f"pl-node-editor-{self.intent_prefix}")
 
-    async def _im_node_type_change(self, request, payload, imr):
-        return imr.oob(self._node_config_fields(payload.get("type",""), {}), f"pl-node-cfg-{self.intent_prefix}")
+    async def _im_node_type_change(self, request, payload, imr): return imr.oob(self._node_config_fields(payload.get("type",""), {}), f"pl-node-cfg-{self.intent_prefix}")
 
     async def _im_node_save(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
@@ -264,23 +342,13 @@ class PipelineBuilderUI:
         if pl: pl["name"] = payload.get("name","").strip() or pl["name"]; self.AIM.engine.save_pipeline(pl)
         return imr
 
-    async def _im_pool_form(self, request, payload, imr):
-        pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
-        return imr.oob(self._pool_form_html(payload.get("scope",""), pl), f"pl-pool-{self.intent_prefix}") if pl else imr
-
-    async def _im_pool_save(self, request, payload, imr):
-        pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
-        if not pl: return imr
-        wl = payload.get("whitelist_tags", []); bl = payload.get("blacklist_tags", [])
-        pl["pool"] = {"priority": payload.get("priority","balanced"), "whitelist_tags": wl if isinstance(wl, list) else ([wl] if wl else []), "blacklist_tags": bl if isinstance(bl, list) else ([bl] if bl else []), "whitelist_cnodes": pl.get("pool",{}).get("whitelist_cnodes",[]), "blacklist_cnodes": pl.get("pool",{}).get("blacklist_cnodes",[])}
-        self.AIM.engine.save_pipeline(pl)
-        return imr.oob("", f"pl-pool-{self.intent_prefix}")
-
     async def _im_run(self, request, payload, imr):
         scope_id, pl_id = payload.get("scope",""), payload.get("pl_id","")
         job_id, err = self.AIM.engine.submit(request.state.user.username, kind="id", pipeline_id=pl_id, inputs={"input": payload.get("value","")})
         if not err:
-            pl = self.AIM.engine.load_pipeline(pl_id); pl["last_job_id"] = job_id; self.AIM.engine.save_pipeline(pl)
+            pl = self.AIM.engine.load_pipeline(pl_id)
+            pl["last_job_id"] = job_id
+            self.AIM.engine.save_pipeline(pl)
         return imr.oob(self._status_block(scope_id, pl_id, self.AIM.engine.load_job(job_id) if not err else None), f"pl-status-{pl_id}")
 
     async def _im_resume(self, request, payload, imr):
@@ -346,6 +414,7 @@ async def chat_page(request: Request):
     conn_opts = "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in conns)
     kg_opts = '<option value="">(no knowledge base)</option>' + "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in connections.list_conns(conn_type="lightrag"))
     return HTMLResponse(f"""<div style="max-width:60rem; margin:0 auto; padding:1.5rem; display:flex; flex-direction:column; gap:.6rem; height:100%; box-sizing:border-box">
+                                <div><a href="{_P}/resources" style="color:var(--accent);font-size:.8rem">Resource Pool (CNodes) &#x2192;</a></div>
                                 <div style="display:flex;gap:.5rem">
                                     <select id="chat-conn" name="conn_id" class="module-select" style="flex:1; margin:0" hx-get="{_P}/chat/models" hx-trigger="load, change" hx-target="#chat-model" hx-swap="innerHTML" hx-include="this">{conn_opts}</select>
                                     <select id="chat-model" name="model" class="module-select" style="flex:1; margin:0"></select>
@@ -425,7 +494,8 @@ async def job_status_qs(job_id: str): return JSONResponse(engine.load_job(job_id
 @router.get("/pipelines/{pid}/export", response_class=JSONResponse)
 async def export_pipeline(pid: str):
     pdef = engine.load_pipeline(pid)
-    return JSONResponse(pdef) if pdef else JSONResponse({"error": "not found"}, status_code=404)
+    if not pdef: return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(pdef, headers={"Content-Disposition": f'attachment; filename="{pid}.json"'})
 
 @router.post("/pipelines/import", response_class=JSONResponse)
 async def import_pipeline(request: Request):
@@ -484,16 +554,3 @@ async def resources_page(request: Request):
                                  {_cnode_list_html()}
                                  <div id="cnode-form" style="margin-top:.8rem">{_cnode_form_html()}</div>
                              </div>""")
-
-@router.get("/cnodes/{cid}/edit", response_class=HTMLResponse)
-async def cnode_edit(cid: str): return HTMLResponse(_cnode_form_html(resources.get_cnode(cid), cid))
-
-@router.post("/cnodes/save", response_class=HTMLResponse)
-async def cnode_save(request: Request):
-    f = await request.form()
-    cid = f.get("cid","") or f"cnode_{uuid.uuid4().hex[:8]}"
-    resources.save_cnode(cid, {"label": f.get("label","").strip(), "tags": [t.strip() for t in f.get("tags","").split(",") if t.strip()], "conn_ids": f.getlist("conn_ids"), "mem_gb": float(f.get("mem_gb") or 16), "overhead_gb": float(f.get("overhead_gb") or 2), "compute_score": float(f.get("compute_score") or 1.0), "quality_score": float(f.get("quality_score") or 1.0), "notes": f.get("notes","")})
-    return HTMLResponse(_cnode_list_html())
-
-@router.delete("/cnodes/{cid}", response_class=HTMLResponse)
-async def cnode_delete(cid: str): resources.delete_cnode(cid); return HTMLResponse(_cnode_list_html())

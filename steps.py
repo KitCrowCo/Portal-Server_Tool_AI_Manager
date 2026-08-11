@@ -36,10 +36,27 @@ class NodeContext:
             return str(v) if v is not None else ""
         return re.sub(r"\{(\w+)\}", _sub, template)
 
+    def resolve_value(self, template):
+        """Like resolve(), but a template that is EXACTLY one bare {key} reference returns the raw underlying value (list/dict/number, not stringified).
+        Any other template shape (mixed text, multiple keys) still goes through normal string substitution - this only changes behavior for the single-reference case."""
+        if isinstance(template, str):
+            m = re.fullmatch(r"\{(\w+)\}", template.strip())
+            if m: return self.data.get(m.group(1))
+        return self.resolve(template)
+
     async def progress(self, message): await ENV["push_to_client"](self.username, {"t":"pipeline_event","job_id":self.job_id,"event":"running","payload":{"node":self.node.id,"message":message}})
     async def stream(self, key, delta): await ENV["push_to_client"](self.username, {"t":"pipeline_stream","job_id":self.job_id,"key":key,"delta":delta})
 
 # --- generate: any AI generation call - text or image, picked by modality ---
+
+def _extract_json_fields(text: str, fields: list) -> dict | None:
+    cleaned = re.sub(r'\A```(?:json)?\s*|\s*```\Z', '', text.strip())
+    m = re.search(r'\{.*\}', cleaned, re.S)
+    if not m: return None
+    try: obj = json.loads(m.group(0))
+    except Exception: return None
+    found = {k: obj[k] for k in fields if k in obj}
+    return found or None
 
 async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     modality = config.get("modality", "text")
@@ -76,8 +93,10 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     seed_kwargs = {} if config.get("seed") in (None,"",-1) else {"seed": int(config["seed"])}
     raw_opts = config.get("enforce_options","")
     options = [o.strip() for o in raw_opts.split(",") if o.strip()] if isinstance(raw_opts,str) else (raw_opts or [])
+    json_fields = [f.strip() for f in str(config.get("json_fields","")).split(",") if f.strip()]
     sys_p = ctx.resolve(config.get("system_prompt") or "")
     if options: sys_p = (sys_p + f"\n\nRespond with exactly one of these words and nothing else: {', '.join(options)}").strip()
+    if json_fields: sys_p = (sys_p + f"\n\nRespond ONLY with a single JSON object with exactly these keys: {json.dumps(json_fields)}. No markdown fences, no text before or after the JSON.").strip()
     messages = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": ctx.resolve(config.get("user_template") or "{input}")}]
     full, thinking_full = "", ""
     async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.7), num_ctx=config.get("num_ctx", 16384), num_predict=config.get("num_predict", -1), **seed_kwargs):
@@ -85,6 +104,10 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
         await ctx.stream("text", text)
     if cnode: resources.log_usage(cnode["id"], "generate:text", time.time()-t0)
     result = {"text": full, "thinking": thinking_full}
+    if json_fields:
+        parsed = _extract_json_fields(full, json_fields)
+        if parsed: result.update(parsed)
+        else: await ctx.progress("json_fields requested but parsing failed - raw text kept under 'text'")
     if options: result["choice"] = next((o for o in options if o.lower() in full.lower()), options[0])
     return result
 
@@ -96,7 +119,7 @@ async def node_transform(config: dict, data: dict, ctx: NodeContext) -> dict:
     if mode == "expr":
         try: var_templates = json.loads(config.get("vars_json","{}") or "{}")
         except Exception: var_templates = {}
-        local_vars = {name: ctx.resolve(tpl) for name, tpl in var_templates.items()}
+        local_vars = {name: ctx.resolve_value(tpl) for name, tpl in var_templates.items()}
         safe_builtins = {"len":len,"str":str,"int":int,"float":float,"min":min,"max":max,"sorted":sorted,"round":round}
         try: value = eval(config.get("expr","input"), {"__builtins__": safe_builtins}, {**local_vars, "input": ctx.get("input")})
         except Exception as e: raise RuntimeError(f"transform(expr): {e}")
@@ -293,6 +316,7 @@ def register_builtins():
         BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common"),
         BI.SettingField("binary","Binary Content","checkbox",default=False,advanced=True, hint="Content in-key holds raw bytes or a source file path rather than text."),
         BI.SettingField("allow_empty","Allow Empty Content","checkbox",default=False,advanced=True),
+        BI.SettingField("source_root","Source Root (binary content, when content is a filename)","file_picker",default=".",advanced=True),
         _key_map_field()],
         guide="Never writes directly - always through Shadow Stage (accept/reject before it touches the real file).")
 
@@ -334,5 +358,6 @@ def register_builtins():
         BI.SettingField("default_pipeline_id","Default Pipeline ID","text",advanced=True),
         BI.SettingField("import_keys","Import Keys (comma-sep)","text"),
         BI.SettingField("export_keys","Export Keys (comma-sep)","text"),
+        BI.SettingField("vars_json","Variables (JSON: name -> template)","json",default={},advanced=True),
         *_pool_fields(), _key_map_field()],
         guide="Decides a value, looks it up in Routes, calls whichever sub-pipeline matches (falling back to Default Pipeline ID). Only the chosen path actually runs.")
