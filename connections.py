@@ -150,7 +150,7 @@ async def stream_llm(conn: dict, messages: list, model: str, think: bool = False
         async with c.stream(chat_ep.get("method","POST"), url, json=payload, headers=headers) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
-                yield f"\n[Connection Error {resp.status_code}: {body.decode(errors='replace')[:300]}]", ""; return
+                raise RuntimeError(f"connection error {resp.status_code} calling {conn.get('_id','?')} model '{model}': {body.decode(errors='replace')[:500]}")
             async for line in resp.aiter_lines():
                 if not line: continue
                 if parser.get("stream_format") == "sse":
@@ -164,61 +164,66 @@ async def stream_llm(conn: dict, messages: list, model: str, think: bool = False
                 if text or thinking: yield text, thinking
                 if done_sentinel and chunk.get(done_sentinel.get("key","done")) == done_sentinel.get("value", True): break
 
-# --- LightRAG ---
-# Endpoint names/fields below match the commonly-deployed lightrag-hku API server but HAVE changed across versions. If a call here 404s, check http://<host>:<port>/docs (Swagger UI) on your running instance and adjust the path/field name - the request/response shape otherwise stays the same.
-# "Knowledge groups": each connection (ai_tools/_connections, connection_type="lightrag") is one independent knowledge base.
-# A second group = a second connection pointing at a different host:port. There's no single-server multi-tenancy assumed here, since that's not consistent across LightRAG deployments.
+# --- LightRAG (config-driven - see tools/ai_manager/_connections/lightrag.json) ---
+# No LightRAG-version-specific shape lives in this file. Every operation reads its method/path/body template from the connection's own JSON profile and renders it generically, exactly like stream_llm does for chat completions.
+# Adjusting for a different LightRAG version/fork/API-compatible knowledge backend is a JSON edit, never a code change here - these functions describe a KNOWLEDGE BASE operation, not a specific server's wire format.
 
-async def lightrag_health(conn) -> dict:
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=4.0, read=30.0, write=4.0, pool=4.0)) as c:
-            r = await c.get(f"{_base(conn)}/health")
-            return {"ok": r.status_code == 200, "detail": r.json() if r.status_code == 200 else f"HTTP {r.status_code}"}
-    except Exception as e: return {"ok": False, "detail": str(e)}
+def _lightrag_profile(conn: dict) -> dict:
+    p = _TMPL_DIR / "lightrag.json"
+    return json.loads(p.read_text()) if p.exists() else {}
 
-async def lightrag_query(conn, query: str, mode: str = "hybrid", **extra) -> dict:
-    """mode: naive | local | global | hybrid | mix - check the instance's /docs for the authoritative list.
-    extra: optional params some LightRAG versions accept (top_k, chunk_top_k, ...) - passed through untouched so the dashboard form can expose whatever a given install supports without code changes here."""
-    payload = {"query": query, "mode": mode, **{k:v for k,v in extra.items() if v is not None}}
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=1200.0, write=10.0, pool=10.0)) as c:
-            r = await c.post(f"{_base(conn)}/query", json=payload)
-            return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
-    except Exception as e: return {"error": str(e)}
+def _fmt_path(path: str, params: dict) -> str:
+    for k, v in params.items(): path = path.replace("{" + str(k) + "}", str(v))
+    return path
 
-async def lightrag_insert_text(conn, text: str, source: str = "") -> dict:
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=1200.0, write=10.0, pool=10.0)) as c:
-            r = await c.post(f"{_base(conn)}/documents/text", json={"text": text, "file_source": source or "manual entry"})
-            return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
-    except Exception as e: return {"error": str(e)}
-
-async def lightrag_insert_file(conn, filename: str, content: bytes) -> dict:
-    """Uploads raw bytes for server-side parsing (PDF/docx/etc if your LightRAG install has those extras). Tries /documents/upload first, falls back to /documents/file on 404 - endpoint naming varies by version."""
+async def _lightrag_call(conn, endpoint_name: str, params: dict = None, extra_body: dict = None, file_bytes: bytes = None, file_name: str = "") -> dict:
+    profile = _lightrag_profile(conn)
+    ep = profile.get("endpoints", {}).get(endpoint_name, {})
+    if not ep: return {"error": f"lightrag profile has no '{endpoint_name}' endpoint declared - add it to lightrag.json"}
+    params = params or {}
+    method, path = ep.get("method", "GET"), _fmt_path(ep.get("path", "/"), params)
+    fallback = _fmt_path(ep.get("fallback_path", ""), params) if ep.get("fallback_path") else ""
+    body = _render_template(ep.get("body", {}), params) if ep.get("body") else None
+    if body is not None and extra_body: body = {**body, **extra_body}
+    async def _do(c, p):
+        if file_bytes is not None: return await c.request(method, _base(conn)+p, files={ep.get("file_field","file"): (file_name, file_bytes)})
+        if method == "GET": return await c.request(method, _base(conn)+p, params=body)
+        return await c.request(method, _base(conn)+p, json=body)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=1200.0, write=30.0, pool=10.0)) as c:
-            r = await c.post(f"{_base(conn)}/documents/upload", files={"file": (filename, content)})
-            if r.status_code == 404: r = await c.post(f"{_base(conn)}/documents/file", files={"file": (filename, content)})
-            return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
+            r = await _do(c, path)
+            if r.status_code == 404 and fallback: r = await _do(c, fallback)
+            if r.status_code not in (200, 204): return {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
+            return r.json() if r.content else {"ok": True}
     except Exception as e: return {"error": str(e)}
 
-async def lightrag_list_documents(conn) -> dict:
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=120.0, write=5.0, pool=5.0)) as c:
-            r = await c.get(f"{_base(conn)}/documents")
-            return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
-    except Exception as e: return {"error": str(e)}
+def lightrag_query_options_schema(conn) -> dict:
+    """UI callers (Kimi) render this dynamically as query-time toggles/fields - a new option is a JSON edit, never a new checkbox hand-added to kimi.py."""
+    return _lightrag_profile(conn).get("query_options_schema", {})
+
+async def lightrag_health(conn) -> dict:
+    r = await _lightrag_call(conn, "health")
+    return {"ok": "error" not in r, "detail": r.get("error", r)}
+
+async def lightrag_query(conn, query: str, mode: str = "hybrid", **extra) -> dict:
+    schema = lightrag_query_options_schema(conn)
+    opts = {k: extra.pop(k, spec.get("default")) for k, spec in schema.items()}
+    extra_body = {**{k:v for k,v in opts.items() if v is not None}, **{k:v for k,v in extra.items() if v is not None}}
+    r = await _lightrag_call(conn, "query", {"query": query, "mode": mode}, extra_body=extra_body)
+    if "error" in r: return r
+    parser = _lightrag_profile(conn).get("endpoints",{}).get("query",{}).get("response_parser", {"content_path":"response"})
+    return {"response": _get_nested_value(r, parser.get("content_path","response")) or r.get("response",""), "raw": r}
+
+async def lightrag_insert_text(conn, text: str, source: str = "") -> dict: return await _lightrag_call(conn, "insert_text", {"text": text, "source": source or "manual entry"})
+async def lightrag_insert_file(conn, filename: str, content: bytes) -> dict: return await _lightrag_call(conn, "insert_file", file_bytes=content, file_name=filename)
+async def lightrag_list_documents(conn) -> dict: return await _lightrag_call(conn, "list_documents")
+async def lightrag_delete_document(conn, doc_id: str) -> dict: return await _lightrag_call(conn, "delete_document", {"doc_id": doc_id})
 
 async def lightrag_clear_all(conn) -> dict:
-    """Deletes the entire knowledge graph for this connection. No undo - confirm in the UI before calling."""
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=120.0, write=5.0, pool=5.0)) as c:
-            r = await c.delete(f"{_base(conn)}/documents")
-            return {"ok": True} if r.status_code in (200, 204) else {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
-    except Exception as e: return {"error": str(e)}
+    r = await _lightrag_call(conn, "clear_all")
+    return {"ok": True} if "error" not in r else r
 
 async def lightrag_query_cached(conn, query: str, mode: str = "hybrid", ttl: int = 300, **extra) -> dict:
-    """TTL-cached wrapper - avoids re-running an expensive query you already asked within ttl seconds (useful when trying several phrasings of the same question in one session)."""
     key = (conn.get("_id", id(conn)), mode, query, tuple(sorted(extra.items())))
     now = time.time()
     hit = _QUERY_CACHE.get(key)
@@ -228,108 +233,36 @@ async def lightrag_query_cached(conn, query: str, mode: str = "hybrid", ttl: int
     return result
 
 async def lightrag_context_block(conn, query: str, mode: str = "hybrid", label: str = "Knowledge") -> str:
-    """Ready-to-splice context string for pipeline system prompts (Tessa steps, Athena, etc):
-        ctx = await lightrag_context_block(conn, user_question)
-        if ctx: sys_parts.append(ctx)   # same pattern Tessa/Athena already use for other context sources
-    Returns '' on empty/failed query so callers can skip it cleanly."""
     r = await lightrag_query_cached(conn, query, mode)
     text = r.get("response", "").strip()
     return f"[{label}]\n{text}\n" if text else ""
 
-async def lightrag_graph_dot(conn, limit: int = 1000) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=120.0, write=5.0, pool=5.0)) as c:
-            r = await c.get(f"{_base(conn)}/graphs")
-            if r.status_code != 200: r = await c.get(f"{_base(conn)}/graph/label/list")
-            if r.status_code != 200: 
-                print(f"[LightRAG] graph endpoints both failed: HTTP {r.status_code}")
-                return ""
-            data = r.json()
-    except Exception as e: 
-        print(f"[LightRAG] graph fetch error: {e}")
-        return ""
-    nodes = []
-    edges = []
-    # Safely handle the response shape depending on which endpoint succeeded
-    if isinstance(data, dict):
-        nodes = data.get("nodes", [])
-        edges = data.get("edges", [])
-    elif isinstance(data, list):
-        # Fallback endpoint returns a list of labels/objects
-        for item in data:
-            if isinstance(item, str):
-                nodes.append({"id": item, "label": item})
-            elif isinstance(item, dict):
-                nodes.append(item)
-    else:
-        print(f"[LightRAG] graph response was unexpected type: {type(data)}")
-        return ""
-    if not nodes:
-        print(f"[LightRAG] graph response had no nodes. Preview: {str(data)[:100]}")
-        return ""
+def _parse_graph_response(data) -> tuple:
+    """Normalizes the two response shapes seen across LightRAG versions/forks - {"nodes":[...],"edges":[...]} or a bare list of label strings/objects. Extend here (the one shared place), never per-caller, if a new shape appears."""
+    if isinstance(data, dict): return data.get("nodes", []), data.get("edges", [])
+    if isinstance(data, list): return [{"id": i, "label": i} if isinstance(i, str) else i for i in data], []
+    return [], []
 
-    # 1. layout="fdp": This is the critical setting. It tells the engine to use physics-based attraction/repulsion rather than a hierarchy.
-    # 2. overlap=false: Ensures nodes don't stack on top of each other.
-    # 3. K=0.8: Adjusts the "spring" strength. Lower = more spread out.
-    lines = ["digraph G {", '  graph [layout="fdp", bgcolor="black", splines=curved, overlap=false, K=0.7, nodesep=0.8];',
-                            '  node [shape=circle, style=filled, fontname="Helvetica", fontsize=9, fixedsize=true, width=0.6, height=0.6, color="#2c3e50", fillcolor="#3498db", fontcolor="white"];',      
-                            '  edge [color="#444444", penwidth=1.0, arrowsize=0.5];']
+async def lightrag_graph_dot(conn, limit: int = 1000) -> str:
+    data = await _lightrag_call(conn, "graph", {"limit": limit})
+    if "error" in data: print(f"[LightRAG] graph fetch error: {data['error']}"); return ""
+    nodes, edges = _parse_graph_response(data)
+    if not nodes: return ""
+    lines = ["digraph G {", '  graph [layout="fdp", bgcolor="black", splines=curved, overlap=false, K=0.7, nodesep=0.8];', '  node [shape=circle, style=filled, fontname="Helvetica", fontsize=9, fixedsize=true, width=0.6, height=0.6, color="#2c3e50", fillcolor="#3498db", fontcolor="white"];', '  edge [color="#444444", penwidth=1.0, arrowsize=0.5];']
     for n in nodes[:limit]:
         label = str(n.get("label") or n.get("id") or n.get("entity_name") or "?").replace('"', "'")
-        safe_id = str(n.get("id", label))
-        # xlabel places text outside the circle so it doesn't distort the shape
-        lines.append(f'  "{safe_id}" [xlabel="{label}", label=""];')
+        lines.append(f'  "{str(n.get("id", label))}" [xlabel="{label}", label=""];')
     for e in edges[:limit*2]:
-        src = e.get("source", e.get("from", e.get("src_id")))
-        dst = e.get("target", e.get("to", e.get("tgt_id")))
+        src, dst = e.get("source", e.get("from", e.get("src_id"))), e.get("target", e.get("to", e.get("tgt_id")))
         if src and dst: lines.append(f'  "{src}" -> "{dst}";')
     lines.append("}")
     return "\n".join(lines)
 
-async def lightrag_list_entities(conn, limit: int = 1000) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=120.0, write=5.0, pool=5.0)) as c:
-            r = await c.get(f"{_base(conn)}/graphs")
-            if r.status_code != 200: r = await c.get(f"{_base(conn)}/graph/label/list")
-            if r.status_code != 200:
-                print(f"[LightRAG] graph endpoints both failed: HTTP {r.status_code}")
-                return ""
-            data = r.json()
-    except Exception as e:
-        print(f"[LightRAG] graph fetch error: {e}")
-        return ""
-    nodes = []
-    edges = []
-    # Safely handle the response shape depending on which endpoint succeeded
-    if isinstance(data, dict):
-        nodes = data.get("nodes", [])
-        edges = data.get("edges", [])
-    elif isinstance(data, list):
-        # Fallback endpoint returns a list of labels/objects
-        for item in data:
-            if isinstance(item, str):
-                nodes.append({"id": item, "label": item})
-            elif isinstance(item, dict):
-                nodes.append(item)
-    else:
-        print(f"[LightRAG] graph response was unexpected type: {type(data)}")
-        return ""
-    if not nodes:
-        print(f"[LightRAG] graph response had no nodes. Preview: {str(data)[:100]}")
-        return ""
-
-    # for n in nodes[:limit]:
-    #     label = str(n.get("label") or n.get("id") or n.get("entity_name") or "?").replace('"', "'")
-    #     safe_id = str(n.get("id", label))
-    #     # xlabel places text outside the circle so it doesn't distort the shape
-    #     lines.append(f'  "{safe_id}" [xlabel="{label}", label=""];')
-    # for e in edges[:limit*2]:
-    #     src = e.get("source", e.get("from", e.get("src_id")))
-    #     dst = e.get("target", e.get("to", e.get("tgt_id")))
-    #     if src and dst: lines.append(f'  "{src}" -> "{dst}";')
-    # lines.append("}")
-    return nodes #"\n".join(lines)
-
+async def lightrag_list_entities(conn, limit: int = 1000) -> list:
+    data = await _lightrag_call(conn, "graph", {"limit": limit})
+    if "error" in data: print(f"[LightRAG] graph fetch error: {data['error']}"); return []
+    nodes, _ = _parse_graph_response(data)
+    return nodes
 
 # --- Flux2 Image Pipeline (text encoder + image generator nodes) ---
 # connection_type="flux2_text"  - prompt -> embeds.npy in a shared vault (see modules/ai_tools/_connections/flux2_text.json)

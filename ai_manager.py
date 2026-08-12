@@ -40,69 +40,14 @@ def init_module(env: dict):
     FM = BI.FileManager(TOOL_ROOT)
     _PB = BI.PromptBlockLibrary(PROMPT_BLOCKS_PATH)
     IM = ENV["InterfaceManager"](nesting_level=1, db_path="ai_manager/im_registry.db")
-    p = self.intent_prefix
-    IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save]})
     engine.init(env)
     steps.init(env)
     steps.register_builtins()
+    IM.scripts.update({"cnode_save": [_im_cnode_save], "cnode_delete": [_im_cnode_delete], "cnode_edit_form": [_im_cnode_edit_form], "resources_open": [_im_resources_open]})
     print(f"[ai_manager] ready | node types: {[t['type'] for t in steps.list_node_types()]}")
 
 def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
 def prompt_block_picker_fragment(textarea_id: str) -> str: return BI.prompt_block_picker_html(_PB, textarea_id, f"{_P}/prompt_blocks/save")
-
-def _cnode_form_html(cnode: dict = None, cid: str = "") -> str:
-    c = cnode or resources.DEFAULT_CNODE
-    conn_opts = "".join(f'<option value="{f.stem}" {"selected" if f.stem in c.get("conn_ids",[]) else ""}>{f.stem} ({(connections.load_conn_raw(f.stem) or {}).get("connection_type","?")})</option>' for f in sorted(connections.CONN_DIR.glob("*.json")))
-    vals = json.dumps({"type":"cnode_save","lvl":1,"cid":cid})
-    return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals}' hx-include="this" style="display:flex;flex-direction:column;gap:.4rem;padding:.6rem" class="glass">
-                   <label class="dim">Label<input type="text" name="label" value="{UI.escape(c.get('label',''))}" class="module-select" required></label>
-                   <label class="dim">Tags (comma-sep)<input type="text" name="tags" value="{','.join(c.get('tags',[]))}" class="module-select"></label>
-                   <label class="dim">Connections on this CNode<select name="conn_ids" multiple size="5" class="module-select">{conn_opts}</select></label>
-                   <label class="dim">Memory (GB)<input type="number" name="mem_gb" value="{c.get('mem_gb',16)}" step="any" class="module-select"></label>
-                   <label class="dim">Overhead (GB)<input type="number" name="overhead_gb" value="{c.get('overhead_gb',2)}" step="any" class="module-select"></label>
-                   <label class="dim">Compute Score (relative, higher = faster)<input type="number" name="compute_score" value="{c.get('compute_score',1.0)}" step="any" class="module-select"></label>
-                   <label class="dim">Quality Score (relative, higher = better)<input type="number" name="quality_score" value="{c.get('quality_score',1.0)}" step="any" class="module-select"></label>
-                   <label class="dim">Notes<textarea name="notes" class="cm-input" rows="2">{UI.escape(c.get('notes',''))}</textarea></label>
-                   <button type="submit" class="button">Save CNode</button>
-               </form>"""
-
-def _cnode_list_html() -> str:
-    rows = "".join(f"""<div class="glass" style="padding:.5rem .7rem;margin-bottom:.3rem;display:flex;align-items:center;gap:.5rem">
-                            <span style="flex:1;font-weight:600">{UI.escape(c['label'])}</span>
-                            <span class="dim tiny">{', '.join(c.get('tags',[]))}</span>
-                            <span class="dim tiny">{len(c.get('conn_ids',[]))} conn(s)</span>
-                            <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"cnode_edit_form","lvl":1,"cid":c["id"]})}'>Edit</button>
-                            <button class="cm-qbtn" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"cnode_delete","lvl":1,"cid":c["id"]})}' hx-confirm="Delete?">&#x2715;</button>
-                        </div>""" for c in resources.list_cnodes()) or '<div class="dim" style="padding:.5rem">No CNodes yet.</div>'
-    return f'<div id="cnode-list">{rows}</div>'
-
-async def _im_cnode_save(request, payload, imr):
-    cid = payload.get("cid","") or f"cnode_{uuid.uuid4().hex[:8]}"
-    conn_ids = payload.get("conn_ids", [])
-    if isinstance(conn_ids, str): conn_ids = [conn_ids] if conn_ids else []
-    resources.save_cnode(cid, {"label": payload.get("label","").strip(), "tags": [t.strip() for t in payload.get("tags","").split(",") if t.strip()], "conn_ids": conn_ids, "mem_gb": float(payload.get("mem_gb") or 16), "overhead_gb": float(payload.get("overhead_gb") or 2), "compute_score": float(payload.get("compute_score") or 1.0), "quality_score": float(payload.get("quality_score") or 1.0), "notes": payload.get("notes","")})
-    imr.oob(_cnode_list_html(), "cnode-list", swap="outerHTML")
-    imr.oob(_cnode_form_html(), "cnode-form", swap="outerHTML")
-    return imr
-
-async def _im_cnode_delete(request, payload, imr):
-    resources.delete_cnode(payload.get("cid",""))
-    imr.oob(_cnode_list_html(), "cnode-list", swap="outerHTML")
-    return imr
-
-async def _im_cnode_edit_form(request, payload, imr):
-    imr.oob(_cnode_form_html(resources.get_cnode(payload.get("cid","")), payload.get("cid","")), "cnode-form", swap="outerHTML")
-    return imr
-
-@router.get("/resources", response_class=HTMLResponse)
-async def resources_page(request: Request):
-    return HTMLResponse(f"""<div style="max-width:50rem;margin:0 auto;padding:1.5rem">
-                                 <a href="{_P}/" style="color:var(--accent);font-size:.8rem">&#x2190; AI Manager</a>
-                                 <h2 style="margin:.6rem 0 1rem">Resource Pool - CNodes</h2>
-                                 <p style="font-size:.8rem;color:var(--text_muted)">Each CNode is one machine hosting one or more connections. A pipeline's pool (whitelist/blacklist tags) plus a node's own cnode_tags narrow this list at run time.</p>
-                                 {_cnode_list_html()}
-                                 <div id="cnode-form" style="margin-top:.8rem">{_cnode_form_html()}</div>
-                             </div>""")
 
 class PipelineBuilderUI:
     """Universal-node pipeline authoring surface. No prev/next wiring anywhere in this UI - node order is entirely a function of key presence, computed fresh for the graphical view via Flow.resolve_levels()."""
@@ -110,7 +55,7 @@ class PipelineBuilderUI:
     def __init__(self, IM, AIM, intent_prefix="plb", nesting_level=2, scope_key="project_id"):
         self.IM, self.AIM, self.intent_prefix, self.nesting_level, self.scope_key = IM, AIM, intent_prefix, nesting_level, scope_key
         p = self.intent_prefix
-        IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_editor_open": [self._im_editor_open], f"{p}_editor_close": [self._im_editor_close], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save]})
+        IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change]})
 
     def _vals(self, action, **extra): return json.dumps({"type": f"{self.intent_prefix}_{action}", "branch": self.intent_prefix, "lvl": self.nesting_level, **extra})
     def _post(self, action, **extra): return f"""hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{self._vals(action, **extra)}'"""
@@ -135,12 +80,12 @@ class PipelineBuilderUI:
                        <div id="pl-status-{pl_id}">{self._status_block(scope_id, pl_id, last_job)}</div>
                        <details class="status-details"><summary>Node status ({len(nodes)})</summary><table class="status-table">{rows}</table></details>
                    </div>"""
-    
+
     def _node_status_row(self, n) -> str:
         col = {"done":"#00ffa2","error":"#ff5f5f","running":"#ffcc00","unreached":"var(--text_muted)"}.get(n.get("status","idle"), "var(--text)")
         preview = n.get("message") or " | ".join(str(v) for v in (n.get("preview") or {}).values())
         return f"""<tr><td class="qn">{UI.escape(n.get("name") or n["id"])}</td><td class="dim">{UI.escape(n.get("type",""))}</td><td style="color:{col}">{UI.escape(n.get("status","idle"))}</td><td class="dim status-preview">{UI.escape(preview)}</td></tr>"""
-    
+
     def panel_html(self, scope_id: str, include_modal_slot: bool = True) -> str:
         p = self.intent_prefix
         cards = "".join(self._card_html(scope_id, pl) for pl in self._pipelines(scope_id)) or '<div class="list-empty">No pipelines. Click + to create one.</div>'
@@ -158,9 +103,9 @@ class PipelineBuilderUI:
                        <div id="pl-list-{p}" class="list-body">{cards}</div>
                        {modal_slot}
                    </div>"""
-    
+
     def modal_slot_html(self, scope_id: str = "") -> str: return f'<div id="pl-editor-modal-{self.intent_prefix}"></div>' # Render at a non-transformed DOM level (main content area, not inside a sliding toolbar) - position:fixed modal backdrops are trapped inside any ancestor with an active CSS transform.
-        
+
     def _list_view_html(self, scope_id, pl) -> str:
         p = self.intent_prefix
         rows = "".join(f"""<div class="node-row" {self._post("node_form", scope=scope_id, pl_id=pl["id"], nid=n["id"])}>{UI.escape(n.get("name") or n["id"])} <span class="dim">({UI.escape(n.get("type",""))})</span></div>""" for n in pl.get("flow",{}).get("nodes",[])) or '<div class="dim">No nodes yet.</div>'
@@ -169,7 +114,7 @@ class PipelineBuilderUI:
                        <div class="node-list">{rows}</div>
                        <button class="btn-icon" {self._post("node_form", scope=scope_id, pl_id=pl["id"])}>+ Add Node</button>
                    </div>"""
-    
+
     def _graph_view_html(self, pl) -> str:
         f = Flow(pl.get("flow", {}))
         type_specs = {t["type"]: t for t in self.AIM.steps.list_node_types()}
@@ -178,7 +123,7 @@ class PipelineBuilderUI:
         for n in f.nodes.values(): by_level.setdefault(levels.get(n.id, 0), []).append(n)
         rows = "".join(f"""<div class="node-graph-row"><span class="node-graph-row-lbl">{lvl}</span>{"".join(f'<div class="node-block" {self._post("node_form", scope=pl.get(self.scope_key,""), pl_id=pl["id"], nid=n.id)}><b>{UI.escape(n.name or n.id)}</b><span class="dim">{UI.escape(n.type)}</span></div>' for n in nodes)}</div>""" for lvl, nodes in sorted(by_level.items()))
         return f'<div class="node-graph">{rows or "<div class=dim>No nodes yet.</div>"}</div>'
-    
+
     def _editor_html(self, scope_id, pl, view: str = "list") -> str:
         p = self.intent_prefix
         body = self._graph_view_html(pl) if view == "graph" else self._list_view_html(scope_id, pl)
@@ -190,7 +135,7 @@ class PipelineBuilderUI:
                      </div>
                      <div id="pl-pool-{p}"></div>"""
         return UI.modal(f"{p}-editor", "Pipeline Editor", header + body, width="90%", max_width="70rem")
-    
+
     def _pool_form_html(self, scope_id, pl) -> str:
         pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
         all_tags = sorted({t for c in self.AIM.resources.list_cnodes() for t in c.get("tags",[])})
@@ -201,11 +146,11 @@ class PipelineBuilderUI:
                        <label class="dim">Blacklist Tags<select name="blacklist_tags" multiple size="4" class="module-select">{tag_opts(pool.get("blacklist_tags",[]))}</select></label>
                        <button type="submit" class="button">Save Pool</button>
                    </form>"""
-    
+
     async def _im_view_toggle(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
         return imr.oob(self._editor_html(payload.get("scope",""), pl, view=payload.get("view","list")), f"pl-editor-modal-{self.intent_prefix}") if pl else imr
-    
+
     async def _im_import(self, request, payload, imr):
         scope_id = payload.get("scope","")
         try: doc = json.loads(payload.get("json","{}"))
@@ -218,11 +163,11 @@ class PipelineBuilderUI:
         doc.setdefault("created", "")
         self.AIM.engine.save_pipeline(doc)
         return imr.oob("".join(self._card_html(scope_id, p_) for p_ in self._pipelines(scope_id)) or '<div class="list-empty">No pipelines.</div>', f"pl-list-{self.intent_prefix}")
-    
+
     async def _im_pool_form(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
         return imr.oob(self._pool_form_html(payload.get("scope",""), pl), f"pl-pool-{self.intent_prefix}") if pl else imr
-    
+
     async def _im_pool_save(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
         if not pl: return imr
@@ -250,12 +195,6 @@ class PipelineBuilderUI:
     def _node_type_options(self, selected=""):
         blank = '<option value="" selected disabled>-- select node type --</option>' if not selected else ""
         return blank + "".join(f'<option value="{t["type"]}" {"selected" if t["type"]==selected else ""}>{UI.escape(t.get("label",t["type"]))}</option>' for t in self.AIM.steps.list_node_types())
-
-    def _node_config_fields(self, node_type, config):
-        spec = self.AIM.steps.get_node_type(node_type)
-        if not spec: return '<div class="dim">Pick a node type to configure it.</div>'
-        guide_html = f"""<details class="glass status-list"><summary>&#x2139; How this node works</summary><div>{UI.escape(spec.get("guide",""))}</div></details>""" if spec.get("guide") else ""
-        return guide_html + BI.SettingsGroup(name="cfg", label="", fields=spec["config_schema"], json_path="").render(config, name_prefix="cfg_")
 
     def _node_form_html(self, scope_id, pl, node=None) -> str:
         p = self.intent_prefix
@@ -365,6 +304,21 @@ class PipelineBuilderUI:
         job = self.AIM.engine.load_job(pl.get("last_job_id","")) if pl and pl.get("last_job_id") else None
         return imr.oob(self._status_block(payload.get("scope",""), payload.get("pl_id",""), job), f"pl-status-{payload.get('pl_id','')}")
 
+    def _node_config_fields(self, node_type, config):
+        spec = self.AIM.steps.get_node_type(node_type)
+        if not spec: return '<div class="dim">Pick a node type to configure it.</div>'
+        schema = [copy.copy(f) if f.name == "conn_id" else f for f in spec["config_schema"]]
+        for f in schema:
+            if f.name == "conn_id": f.hx_intent, f.hx_target = f"{self.intent_prefix}_node_conn_change", "#cfg_model_wrap"
+        guide_html = f"""<details class="glass status-list"><summary>&#x2139; How this node works</summary><div>{UI.escape(spec.get("guide",""))}</div></details>""" if spec.get("guide") else ""
+        return guide_html + BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
+
+    async def _im_node_conn_change(self, request, payload, imr):
+        conn = self.AIM.connections.get_conn(payload.get("cfg_conn_id",""))
+        models = self.AIM.connections.list_models_sync(conn) if conn else []
+        opts = "".join(f'<option value="{m}">{m}{" - looks like embedding" if self.AIM.steps.looks_like_embedding(m) else ""}</option>' for m in models)
+        return imr.oob(f'<label id="cfg_model_wrap" class="dim">Model<select name="cfg_model" class="module-select"><option value="">(auto)</option>{opts}</select></label>', "cfg_model_wrap")
+
 @router.get("/pipelines", response_class=JSONResponse)
 async def api_list_pipelines(tag: str = None): return JSONResponse(engine.list_pipelines(tag))
 
@@ -414,7 +368,10 @@ async def chat_page(request: Request):
     conn_opts = "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in conns)
     kg_opts = '<option value="">(no knowledge base)</option>' + "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in connections.list_conns(conn_type="lightrag"))
     return HTMLResponse(f"""<div style="max-width:60rem; margin:0 auto; padding:1.5rem; display:flex; flex-direction:column; gap:.6rem; height:100%; box-sizing:border-box">
-                                <div><a href="{_P}/resources" style="color:var(--accent);font-size:.8rem">Resource Pool (CNodes) &#x2192;</a></div>
+                                <div style="display:flex;justify-content:flex-end">
+                                    <button class="ui-btn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"resources_open","lvl":1})}'>Resource Pool (CNodes)</button>
+                                </div>
+                                <div id="resources-modal-slot"></div>
                                 <div style="display:flex;gap:.5rem">
                                     <select id="chat-conn" name="conn_id" class="module-select" style="flex:1; margin:0" hx-get="{_P}/chat/models" hx-trigger="load, change" hx-target="#chat-model" hx-swap="innerHTML" hx-include="this">{conn_opts}</select>
                                     <select id="chat-model" name="model" class="module-select" style="flex:1; margin:0"></select>
@@ -519,38 +476,59 @@ async def shadow_selftest(request: Request):
     history = shadow.history("note.txt")
     return JSONResponse({"staged_status": entry["status"], "diff": diff_before_accept, "accepted": accepted, "final_file_content": final_content, "history_timestamps": history})
 
+# --- Compute Nodes ---
+
 def _cnode_form_html(cnode: dict = None, cid: str = "") -> str:
     c = cnode or resources.DEFAULT_CNODE
-    conn_opts = "".join(f'<option value="{cid2}" {"selected" if cid2 in c.get("conn_ids",[]) else ""}>{cid2} ({conn.get("connection_type","?")})</option>'
-                         for f in sorted(connections.CONN_DIR.glob("*.json")) for cid2 in [f.stem] for conn in [connections.load_conn_raw(cid2)] if conn)
-    return f"""<form hx-post="{_P}/cnodes/save" hx-target="#cnode-list" hx-swap="outerHTML" style="display:flex;flex-direction:column;gap:.4rem;padding:.6rem" class="glass">
-                   <input type="hidden" name="cid" value="{cid}">
-                   <label class="dim">Label<input type="text" name="label" value="{c.get('label','')}" class="module-select" required></label>
+    conn_opts = "".join(f'<option value="{cid2}" {"selected" if cid2 in c.get("conn_ids",[]) else ""}>{cid2} ({conn.get("connection_type","?")})</option>' for f in sorted(connections.CONN_DIR.glob("*.json")) for cid2 in [f.stem] for conn in [connections.load_conn_raw(cid2)] if conn)
+    vals = json.dumps({"type":"cnode_save","lvl":1,"cid":cid})
+    return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals}' hx-include="this" style="display:flex;flex-direction:column;gap:.4rem;padding:.6rem" class="glass">
+                   <label class="dim">Label<input type="text" name="label" value="{UI.escape(c.get('label',''))}" class="module-select" required></label>
                    <label class="dim">Tags (comma-sep)<input type="text" name="tags" value="{','.join(c.get('tags',[]))}" class="module-select"></label>
                    <label class="dim">Connections on this CNode<select name="conn_ids" multiple size="5" class="module-select">{conn_opts}</select></label>
                    <label class="dim">Memory (GB)<input type="number" name="mem_gb" value="{c.get('mem_gb',16)}" step="any" class="module-select"></label>
                    <label class="dim">Overhead (GB)<input type="number" name="overhead_gb" value="{c.get('overhead_gb',2)}" step="any" class="module-select"></label>
                    <label class="dim">Compute Score (relative, higher = faster)<input type="number" name="compute_score" value="{c.get('compute_score',1.0)}" step="any" class="module-select"></label>
                    <label class="dim">Quality Score (relative, higher = better)<input type="number" name="quality_score" value="{c.get('quality_score',1.0)}" step="any" class="module-select"></label>
-                   <label class="dim">Notes<textarea name="notes" class="cm-input" rows="2">{c.get('notes','')}</textarea></label>
+                   <label class="dim">Notes<textarea name="notes" class="cm-input" rows="2">{UI.escape(c.get('notes',''))}</textarea></label>
                    <button type="submit" class="button">Save CNode</button>
                </form>"""
 
 def _cnode_list_html() -> str:
-    rows = "".join(f"""<div class="glass" style="padding:.5rem .7rem;margin-bottom:.3rem;display:flex;align-items:center;gap:.5rem">
-                            <span style="flex:1;font-weight:600">{c['label']}</span>
-                            <span class="dim tiny">{', '.join(c.get('tags',[]))}</span>
-                            <span class="dim tiny">{len(c.get('conn_ids',[]))} conn(s)</span>
-                            <button class="cm-qbtn" hx-get="{_P}/cnodes/{c['id']}/edit" hx-target="#cnode-form">Edit</button>
-                            <button class="cm-qbtn" style="color:#ff5f5f" hx-delete="{_P}/cnodes/{c['id']}" hx-target="#cnode-list" hx-swap="outerHTML" hx-confirm="Delete?">&#x2715;</button>
-                        </div>""" for c in resources.list_cnodes()) or '<div class="dim" style="padding:.5rem">No CNodes yet.</div>'
-    return f'<div id="cnode-list">{rows}</div>'
+    rows = ""
+    for c in resources.list_cnodes():
+        conn_names = ", ".join((connections.load_conn_raw(cid) or {}).get("display_name", cid) for cid in c.get("conn_ids", [])) or "no connections"
+        rows += f"""<div class="glass" style="padding:.5rem .7rem;margin-bottom:.3rem;display:flex;align-items:center;gap:.5rem">
+                        <span style="flex:1;font-weight:600">{UI.escape(c['label'])}</span>
+                        <span class="dim tiny">{UI.escape(', '.join(c.get('tags',[])))}</span>
+                        <span class="dim tiny">{UI.escape(conn_names)}</span>
+                        <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"cnode_edit_form","lvl":1,"cid":c["id"]})}'>Edit</button>
+                        <button class="cm-qbtn" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"cnode_delete","lvl":1,"cid":c["id"]})}' hx-confirm="Delete?">&#x2715;</button>
+                    </div>"""
+    return f'<div id="cnode-list">{rows or "<div class=dim style=padding:.5rem>No CNodes yet.</div>"}</div>'
 
-@router.get("/resources", response_class=HTMLResponse)
-async def resources_page(request: Request):
-    return HTMLResponse(f"""<div style="max-width:50rem;margin:0 auto;padding:1.5rem">
-                                 <h2 style="margin:0 0 1rem">Resource Pool - CNodes</h2>
-                                 <p style="font-size:.8rem;color:var(--text_muted)">Each CNode is one machine hosting one or more connections. Pipeline pool + node cnode_tags filter this list - see a pipeline's pool icon in the editor.</p>
-                                 {_cnode_list_html()}
-                                 <div id="cnode-form" style="margin-top:.8rem">{_cnode_form_html()}</div>
-                             </div>""")
+async def _im_cnode_save(request, payload, imr):
+    cid = payload.get("cid","") or f"cnode_{uuid.uuid4().hex[:8]}"
+    conn_ids = payload.get("conn_ids", [])
+    if isinstance(conn_ids, str): conn_ids = [conn_ids] if conn_ids else []
+    resources.save_cnode(cid, {"label": payload.get("label","").strip(), "tags": [t.strip() for t in payload.get("tags","").split(",") if t.strip()], "conn_ids": conn_ids, "mem_gb": float(payload.get("mem_gb") or 16), "overhead_gb": float(payload.get("overhead_gb") or 2), "compute_score": float(payload.get("compute_score") or 1.0), "quality_score": float(payload.get("quality_score") or 1.0), "notes": payload.get("notes","")})
+    imr.oob(_cnode_list_html(), "cnode-list", swap="outerHTML")
+    imr.oob(_cnode_form_html(), "cnode-form", swap="outerHTML")
+    return imr
+
+async def _im_cnode_delete(request, payload, imr):
+    resources.delete_cnode(payload.get("cid",""))
+    imr.oob(_cnode_list_html(), "cnode-list", swap="outerHTML")
+    return imr
+
+async def _im_cnode_edit_form(request, payload, imr):
+    imr.oob(_cnode_form_html(resources.get_cnode(payload.get("cid","")), payload.get("cid","")), "cnode-form", swap="outerHTML")
+    return imr
+
+def _resources_modal_html() -> str:
+    body = f"""<p style="font-size:.8rem;color:var(--text_muted)">Each CNode is one machine hosting one or more connections. A pipeline's pool (whitelist/blacklist tags) plus a node's own cnode_tags narrow this list at run time.</p>
+               {_cnode_list_html()}
+               <div id="cnode-form" style="margin-top:.8rem">{_cnode_form_html()}</div>"""
+    return UI.modal("ai-resources", "Resource Pool - CNodes", body, width="90%", max_width="42rem")
+
+async def _im_resources_open(request, payload, imr): return imr.oob(_resources_modal_html(), "resources-modal-slot")

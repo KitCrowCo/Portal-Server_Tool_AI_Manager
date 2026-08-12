@@ -1,11 +1,26 @@
 {
-  "_meta": {"display_name": "LightRAG", "icon": "&#x1F578;", "connection_type": "lightrag"},
+  "_meta": {"display_name": "LightRAG", "icon": "&#x1F578;", "connection_type": "lightrag", "docs_url": "https://github.com/HKUDS/LightRAG"},
   "connection": {
     "host": {"type": "string", "label": "Host", "default": "127.0.0.1"},
     "port": {"type": "integer", "label": "Port", "default": 9621},
     "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
     "base_path": {"type": "string", "label": "Base Path", "default": ""}
   },
-  "domain_notes": {"type": "string", "label": "Domain Notes", "default": "", "hint": "What kind of knowledge lives here (e.g. 'Household code & scripts', 'Lease/insurance docs', 'Worldbuilding lore') - shown under the selector in Kimi."},
-  "endpoints": {"health": {"path": "/health", "method": "GET"}}
+  "domain_notes": {"type": "string", "label": "Domain Notes", "default": "", "hint": "What kind of knowledge lives here - shown under the selector in Kimi."},
+  "endpoints": {
+    "health":         {"method": "GET",    "path": "/health"},
+    "query":          {"method": "POST",   "path": "/query", "body": {"query": "{query}", "mode": "{mode}"}, "response_parser": {"content_path": "response"}},
+    "insert_text":    {"method": "POST",   "path": "/documents/text", "body": {"text": "{text}", "file_source": "{source}"}},
+    "insert_file":    {"method": "POST",   "path": "/documents/upload", "fallback_path": "/documents/file", "file_field": "file"},
+    "list_documents": {"method": "GET",    "path": "/documents"},
+    "clear_all":      {"method": "DELETE", "path": "/documents"},
+    "delete_document":{"method": "DELETE", "path": "/documents/{doc_id}", "fallback_path": "/documents/delete_document"},
+    "graph":          {"method": "GET",    "path": "/graphs", "fallback_path": "/graph/label/list"}
+  },
+  "query_options_schema": {
+    "enable_rerank":     {"type": "boolean", "default": null, "label": "Rerank results", "hint": "Uses a reranker model if the server has one configured."},
+    "only_need_context": {"type": "boolean", "default": null, "label": "Vector-only (no LLM synthesis)", "hint": "Returns raw retrieved context, skips LightRAG's own re-synthesis pass."},
+    "top_k":             {"type": "integer", "default": null, "label": "Top K"},
+    "chunk_top_k":       {"type": "integer", "default": null, "label": "Chunk Top K"}
+  }
 }

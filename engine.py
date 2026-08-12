@@ -89,7 +89,7 @@ async def _run_flow(flow: dict, data: dict, job_id: str, username: str, pool_cfg
                 ctx = NodeContext(n, data, job_id, username, pool_cfg, depth)
                 result = await spec["fn"](n.config, data, ctx)
                 for logical, val in (result or {}).items(): data[n.out_key(logical)] = val
-                preview = {k: str(v)[:100] for k, v in (result or {}).items()}
+                preview = {k: str(v)[:500] for k, v in (result or {}).items()}
                 await _set_node_status(job_id, username, n.id, "done", {"preview": preview, "elapsed_s": round(time.time()-t0, 2)})
                 return n.id
             except Exception as e:

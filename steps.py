@@ -88,8 +88,8 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     model = config.get("model","")
     if not model:
         models = list_models_sync(conn)
-        if not models: raise RuntimeError(f"generate: connection {conn.get('_id','')} has no models available")
-        model = models[0]
+        model = pick_default_chat_model(models)
+        if not model: raise RuntimeError(f"generate: connection {conn.get('_id','?')} has no non-embedding models available - pin one explicitly via the Model field. Available: {models}")
     seed_kwargs = {} if config.get("seed") in (None,"",-1) else {"seed": int(config["seed"])}
     raw_opts = config.get("enforce_options","")
     options = [o.strip() for o in raw_opts.split(",") if o.strip()] if isinstance(raw_opts,str) else (raw_opts or [])
@@ -99,7 +99,7 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     if json_fields: sys_p = (sys_p + f"\n\nRespond ONLY with a single JSON object with exactly these keys: {json.dumps(json_fields)}. No markdown fences, no text before or after the JSON.").strip()
     messages = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": ctx.resolve(config.get("user_template") or "{input}")}]
     full, thinking_full = "", ""
-    async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.7), num_ctx=config.get("num_ctx", 16384), num_predict=config.get("num_predict", -1), **seed_kwargs):
+    async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.7), num_ctx = int(resources.resolve_bound(config.get("num_ctx_mode","exact"), config.get("num_ctx", 16384), config.get("num_ctx_max"), fallback=16384)), num_predict=config.get("num_predict", -1), **seed_kwargs):
         full += text; thinking_full += thinking
         await ctx.stream("text", text)
     if cnode: resources.log_usage(cnode["id"], "generate:text", time.time()-t0)
@@ -264,14 +264,40 @@ async def node_branch(config: dict, data: dict, ctx: NodeContext) -> dict:
     sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1)
     return {**{k: sub_data.get(k, "") for k in export_keys}, "decision": decision}
 
+_EMBED_PATTERNS = ("embed", "minilm", "bge-", "gte-", "e5-", "nomic-embed", "arctic-embed")
+def looks_like_embedding(model_name: str) -> bool: return any(p in model_name.lower() for p in _EMBED_PATTERNS)
+
+def pick_default_chat_model(models: list) -> str:
+    """Best-effort exclusion of obvious embedding-only models from an auto-pick default. A real capability check (per-model /api/show) would be more accurate but costs a network round-trip per candidate
+    - this stays a fast heuristic; pin a model explicitly via the Model field whenever it matters."""
+    candidates = [m for m in models if not looks_like_embedding(m)]
+    return candidates[0] if candidates else ""
+
+def _llm_conn_options(values=None): return [("", "(pool-resolved by priority)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns("ollama")]
+
+def _model_options_for_pinned_conn(values=None):
+    conn_id = (values or {}).get("conn_id","")
+    if not conn_id: return [("", "(auto - non-embedding models only)")]
+    conn = get_conn(conn_id)
+    models = list_models_sync(conn) if conn else []
+    cur = (values or {}).get("model","")
+    opts = [("", "(auto)")] + [(m, m + (" - looks like embedding" if looks_like_embedding(m) else "")) for m in models]
+    if cur and cur not in models: opts.append((cur, cur + " (saved, not currently listed)"))
+    return opts
+
+
 # --- registration ---
 
 def register_builtins():
     BI = ENV["tools"]["built_ins"]
     def _key_map_field(): return BI.SettingField("key_map", "Key Map (JSON: logical -> actual pipeline key)", type="json", default={}, advanced=True, hint='Only needed to rename this node\'s in/out keys, e.g. {"input":"user_query","text":"draft"}. Unmapped logical names pass through unchanged.')
-    def _pool_fields(): return [BI.SettingField("cnode_tags", "Resource Pool Tags (comma-sep)", type="text", advanced=True, hint="Narrows the pipeline's own pool to CNodes carrying ALL these tags. Blank = use the whole pipeline pool."),
-                                 BI.SettingField("priority", "Priority", type="select", default="", options=[("","(inherit pipeline default)"),("speed","Speed"),("balanced","Balanced"),("quality","Quality")], advanced=True),
-                                 BI.SettingField("conn_id", "Pin Connection (optional)", type="text", advanced=True, hint="Explicit connection id - bypasses the resource pool entirely when set.")]
+    def _pool_fields(include_model=True):
+        fields = [BI.SettingField("cnode_tags", "Resource Pool Tags (comma-sep)", type="text", advanced=True, hint="Narrows the pipeline's own pool to CNodes carrying ALL these tags. Blank = use the whole pipeline pool."),
+                  BI.SettingField("priority", "Priority", type="select", default="", options=[("","(inherit pipeline default)"),("speed","Speed"),("balanced","Balanced"),("quality","Quality")], advanced=True),
+                  BI.SettingField("conn_id", "Connection", type="select", default="", options=_llm_conn_options, hint="Full pool auto-selection (multi-candidate scoring) is planned but not yet built - pin a connection here until then.")]
+        if include_model: fields.append(BI.SettingField("model", "Model", type="select", default="", options=_model_options_for_pinned_conn, hint="Populates once a connection is pinned above. Leave blank to auto-pick the first non-embedding model."))
+        return fields
+
 
     register_node_type("generate", node_generate, "Generate (text or image)", in_keys=["input"], out_keys=["text","thinking"], config_schema=[
         BI.SettingField("modality","Modality","select",default="text", options=[("text","Text"),("image","Image")]),
@@ -279,13 +305,15 @@ def register_builtins():
         BI.SettingField("system_prompt","System Prompt","textarea",default="You are a helpful AI assistant."),
         BI.SettingField("user_template","User/Prompt Template","textarea",default="{input}", hint="{key} substitutes real pipeline keys directly."),
         BI.SettingField("temperature","Temperature","number",default=0.7),
-        BI.SettingField("num_ctx","Context Window","number",default=16384,step=1),
+        BI.SettingField("num_ctx_mode","Context Window Mode","select",default="exact",options=[("exact","Exact"),("at_least","At least"),("no_more_than","No more than"),("range","Range (min-max)")],advanced=True),
+        BI.SettingField("num_ctx","Context Window Tokens","number",default=16384,step=1),
+        BI.SettingField("num_ctx_max","Context Window Max (range mode only)","number",default=None,step=1,advanced=True),
         BI.SettingField("num_predict","Max Output Tokens","number",default=-1,step=1),
         BI.SettingField("think","Enable Thinking Mode","checkbox",default=False),
         BI.SettingField("enforce_options","Enforced Options (comma-sep)","text",advanced=True),
         BI.SettingField("seed","Seed (blank/-1 = random)","number",default=None,advanced=True,step=1),
-        BI.SettingField("width","Width (image)","number",default=1024,step=16,advanced=True),
-        BI.SettingField("height","Height (image)","number",default=1024,step=16,advanced=True),
+        BI.SettingField("width","Width (image)","number",default=1024,step=1,advanced=True), # Step 16 is only for some instances, should probably warn)
+        BI.SettingField("height","Height (image)","number",default=1024,step=1,advanced=True),
         BI.SettingField("steps","Steps (image)","number",default=4,step=1,advanced=True),
         BI.SettingField("cfg","Guidance Scale (image)","number",default=1.0,advanced=True),
         *_pool_fields(), _key_map_field()],
@@ -332,7 +360,7 @@ def register_builtins():
         BI.SettingField("text_template","Insert Text Template","textarea",advanced=True),
         BI.SettingField("source_label","Insert Source Label","text",advanced=True),
         BI.SettingField("limit","Entity Limit","number",default=500,step=1,advanced=True),
-        *_pool_fields(), _key_map_field()],
+        *_pool_fields(include_model=False), _key_map_field()],
         guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.")
 
     register_node_type("pipeline", node_pipeline, "Call Pipeline", in_keys=[], out_keys=[], config_schema=[
