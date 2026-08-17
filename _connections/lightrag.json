@@ -4,12 +4,14 @@
     "host": {"type": "string", "label": "Host", "default": "127.0.0.1"},
     "port": {"type": "integer", "label": "Port", "default": 9621},
     "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
-    "base_path": {"type": "string", "label": "Base Path", "default": ""}
+    "base_path": {"type": "string", "label": "Base Path", "default": ""},
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 2400, "hint": "Max seconds to wait for query/insert - raise on slow indexing"}
   },
   "domain_notes": {"type": "string", "label": "Domain Notes", "default": "", "hint": "What kind of knowledge lives here - shown under the selector in Kimi."},
   "endpoints": {
     "health":         {"method": "GET",    "path": "/health"},
-    "query":          {"method": "POST",   "path": "/query", "body": {"query": "{query}", "mode": "{mode}"}, "response_parser": {"content_path": "response"}},
+    "query":          {"method": "POST",   "path": "/query/stream", "body": {"query": "{query}", "mode": "{mode}", "stream": false}, "response_parser": {"content_path": "response"}},
+    "query_stream":   {"method": "POST",   "path": "/query/stream", "body": {"query": "{query}", "mode": "{mode}", "stream": true}},
     "insert_text":    {"method": "POST",   "path": "/documents/text", "body": {"text": "{text}", "file_source": "{source}"}},
     "insert_file":    {"method": "POST",   "path": "/documents/upload", "fallback_path": "/documents/file", "file_field": "file"},
     "list_documents": {"method": "GET",    "path": "/documents"},
@@ -20,7 +22,7 @@
   "query_options_schema": {
     "enable_rerank":     {"type": "boolean", "default": null, "label": "Rerank results", "hint": "Uses a reranker model if the server has one configured."},
     "only_need_context": {"type": "boolean", "default": null, "label": "Vector-only (no LLM synthesis)", "hint": "Returns raw retrieved context, skips LightRAG's own re-synthesis pass."},
-    "top_k":             {"type": "integer", "default": null, "label": "Top K"},
-    "chunk_top_k":       {"type": "integer", "default": null, "label": "Chunk Top K"}
+    "top_k":             {"type": "integer", "default": 20, "label": "Top K"},
+    "chunk_top_k":       {"type": "integer", "default": 10, "label": "Chunk Top K"}
   }
 }

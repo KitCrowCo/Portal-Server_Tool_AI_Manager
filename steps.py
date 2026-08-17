@@ -117,8 +117,7 @@ async def node_transform(config: dict, data: dict, ctx: NodeContext) -> dict:
     mode = config.get("mode", "template")
     if mode == "template": return {"value": ctx.resolve(config.get("template", "{input}"))}
     if mode == "expr":
-        try: var_templates = json.loads(config.get("vars_json","{}") or "{}")
-        except Exception: var_templates = {}
+        var_templates = _parse_json_config(config.get("vars_json"), {})
         local_vars = {name: ctx.resolve_value(tpl) for name, tpl in var_templates.items()}
         safe_builtins = {"len":len,"str":str,"int":int,"float":float,"min":min,"max":max,"sorted":sorted,"round":round}
         try: value = eval(config.get("expr","input"), {"__builtins__": safe_builtins}, {**local_vars, "input": ctx.get("input")})
@@ -247,15 +246,15 @@ async def node_pipeline_foreach(config: dict, data: dict, ctx: NodeContext) -> d
 
 async def node_branch(config: dict, data: dict, ctx: NodeContext) -> dict:
     """Decides a value (expression or LLM), looks it up in Routes, and calls whichever sub-pipeline matches.
-    The branch is one atomic node to the outer pipeline's scheduler - only the chosen sub-pipeline actually runs;
-    the others are simply never invoked, exactly like any other unreached path in this architecture."""
+    The branch is one atomic node to the outer pipeline's scheduler - only the chosen sub-pipeline actually runs; the others are simply never invoked, exactly like any other unreached path in this architecture."""
     if config.get("decide_mode", "expr") == "llm":
         decision = (await node_generate({**config, "enforce_options": config.get("options",""), "user_template": config.get("decide_template","{input}")}, data, ctx)).get("choice","")
     else:
-        try: decision = str(eval(config.get("decide_expr","input"), {"__builtins__": {"len":len,"str":str,"int":int}}, {"input": ctx.get("input")}))
+        var_templates = _parse_json_config(config.get("vars_json"), {})
+        local_vars = {name: ctx.resolve_value(tpl) for name, tpl in var_templates.items()}
+        try: decision = str(eval(config.get("decide_expr","input"), {"__builtins__": {"len":len,"str":str,"int":int}}, {**local_vars, "input": ctx.get("input")}))
         except Exception as e: raise RuntimeError(f"branch: decide_expr failed: {e}")
-    try: routes = json.loads(config.get("routes_json","{}") or "{}")
-    except Exception: routes = {}
+    routes = _parse_json_config(config.get("routes_json"), {})
     pid = routes.get(decision) or config.get("default_pipeline_id","")
     if not pid: raise RuntimeError(f"branch: no route for decision '{decision}' and no default_pipeline_id set")
     import_keys = [k.strip() for k in str(config.get("import_keys","")).split(",") if k.strip()]
@@ -284,6 +283,14 @@ def _model_options_for_pinned_conn(values=None):
     opts = [("", "(auto)")] + [(m, m + (" - looks like embedding" if looks_like_embedding(m) else "")) for m in models]
     if cur and cur not in models: opts.append((cur, cur + " (saved, not currently listed)"))
     return opts
+
+def _parse_json_config(val, default=None):
+    """Config fields of type 'json' arrive already-parsed as a dict/list (the builder parses them once at save time) OR as a raw JSON string (hand-edited pipeline JSON, imports).
+    Accept either without double-parsing - json.loads() on an already-parsed dict raises TypeError, which was previously swallowed and silently produced an empty fallback instead of the real variables."""
+    if val is None or val == "": return default if default is not None else {}
+    if isinstance(val, (dict, list)): return val
+    try: return json.loads(val)
+    except Exception: return default if default is not None else {}
 
 
 # --- registration ---

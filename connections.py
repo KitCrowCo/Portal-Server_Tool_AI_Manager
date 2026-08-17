@@ -145,7 +145,7 @@ async def stream_llm(conn: dict, messages: list, model: str, think: bool = False
     if api_key: headers["Authorization"] = f"Bearer {api_key}"
     parser = profile.get("response_parser", {"stream_format": "jsonl", "content_path": "message.content"})
     done_sentinel = profile.get("status_map", {}).get("stream_done_sentinel", {})
-    timeout_s = float(conn.get("values", {}).get("timeout_s", 600))
+    timeout_s = float(conn.get("values", {}).get("timeout_s", 3000))
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=10.0, pool=10.0)) as c:
         async with c.stream(chat_ep.get("method","POST"), url, json=payload, headers=headers) as resp:
             if resp.status_code != 200:
@@ -185,12 +185,13 @@ async def _lightrag_call(conn, endpoint_name: str, params: dict = None, extra_bo
     fallback = _fmt_path(ep.get("fallback_path", ""), params) if ep.get("fallback_path") else ""
     body = _render_template(ep.get("body", {}), params) if ep.get("body") else None
     if body is not None and extra_body: body = {**body, **extra_body}
+    read_timeout = float(conn.get("values", {}).get("timeout_s", 2400))
     async def _do(c, p):
         if file_bytes is not None: return await c.request(method, _base(conn)+p, files={ep.get("file_field","file"): (file_name, file_bytes)})
         if method == "GET": return await c.request(method, _base(conn)+p, params=body)
         return await c.request(method, _base(conn)+p, json=body)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=1200.0, write=30.0, pool=10.0)) as c:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=read_timeout, write=60.0, pool=20.0)) as c:
             r = await _do(c, path)
             if r.status_code == 404 and fallback: r = await _do(c, fallback)
             if r.status_code not in (200, 204): return {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
@@ -205,12 +206,39 @@ async def lightrag_health(conn) -> dict:
     r = await _lightrag_call(conn, "health")
     return {"ok": "error" not in r, "detail": r.get("error", r)}
 
+async def lightrag_query_stream(conn, query: str, mode: str = "mix", **extra):
+    """NDJSON streaming query against /query/stream per LightRAG's documented contract.
+    Yields (chunk_text, references, error) - references arrive on the first line if requested, error terminates iteration."""
+    profile = _lightrag_profile(conn)
+    ep = profile.get("endpoints", {}).get("query_stream", {})
+    if not ep: yield "", None, "lightrag profile has no 'query_stream' endpoint declared"; return
+    schema = lightrag_query_options_schema(conn)
+    opts = {k: extra.pop(k, spec.get("default")) for k, spec in schema.items()}
+    body = {"query": query, "mode": mode, "stream": True, **{k:v for k,v in opts.items() if v is not None}, **{k:v for k,v in extra.items() if v is not None}}
+    read_timeout = float(conn.get("values", {}).get("timeout_s", 2400))
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=read_timeout, write=60.0, pool=20.0)) as c:
+            async with c.stream("POST", _base(conn) + ep.get("path", "/query/stream"), json=body) as resp:
+                if resp.status_code != 200:
+                    text = await resp.aread()
+                    yield "", None, f"HTTP {resp.status_code}: {text.decode(errors='replace')[:300]}"
+                    return
+                async for line in resp.aiter_lines():
+                    if not line.strip(): continue
+                    try: data = json.loads(line)
+                    except json.JSONDecodeError: continue
+                    if "error" in data: yield "", None, data["error"]; return
+                    if "references" in data: yield "", data["references"], None
+                    if "response" in data: yield data["response"], None, None
+    except Exception as e:
+        yield "", None, str(e)
+
 async def lightrag_query(conn, query: str, mode: str = "hybrid", **extra) -> dict:
     schema = lightrag_query_options_schema(conn)
     opts = {k: extra.pop(k, spec.get("default")) for k, spec in schema.items()}
     extra_body = {**{k:v for k,v in opts.items() if v is not None}, **{k:v for k,v in extra.items() if v is not None}}
     r = await _lightrag_call(conn, "query", {"query": query, "mode": mode}, extra_body=extra_body)
-    if "error" in r: return r
+    if _lr_failed(r): return r
     parser = _lightrag_profile(conn).get("endpoints",{}).get("query",{}).get("response_parser", {"content_path":"response"})
     return {"response": _get_nested_value(r, parser.get("content_path","response")) or r.get("response",""), "raw": r}
 
@@ -245,7 +273,7 @@ def _parse_graph_response(data) -> tuple:
 
 async def lightrag_graph_dot(conn, limit: int = 1000) -> str:
     data = await _lightrag_call(conn, "graph", {"limit": limit})
-    if "error" in data: print(f"[LightRAG] graph fetch error: {data['error']}"); return ""
+    if _lr_failed(data): print(f"[LightRAG] graph fetch error: {data['error']}"); return ""
     nodes, edges = _parse_graph_response(data)
     if not nodes: return ""
     lines = ["digraph G {", '  graph [layout="fdp", bgcolor="black", splines=curved, overlap=false, K=0.7, nodesep=0.8];', '  node [shape=circle, style=filled, fontname="Helvetica", fontsize=9, fixedsize=true, width=0.6, height=0.6, color="#2c3e50", fillcolor="#3498db", fontcolor="white"];', '  edge [color="#444444", penwidth=1.0, arrowsize=0.5];']
@@ -260,9 +288,13 @@ async def lightrag_graph_dot(conn, limit: int = 1000) -> str:
 
 async def lightrag_list_entities(conn, limit: int = 1000) -> list:
     data = await _lightrag_call(conn, "graph", {"limit": limit})
-    if "error" in data: print(f"[LightRAG] graph fetch error: {data['error']}"); return []
+    if _lr_failed(data): print(f"[LightRAG] graph fetch error: {data['error']}"); return []
     nodes, _ = _parse_graph_response(data)
     return nodes
+
+def _lr_failed(r) -> bool:
+    """True only on a REAL failure. Only our own _lightrag_call ever sets 'error' to a truthy message (on an exception or non-2xx status) - a response dict that merely contains a falsy 'error' key (some LightRAG versions include this as a no-op success sentinel) is not a failure and must not be treated as one."""
+    return isinstance(r, dict) and bool(r.get("error"))
 
 # --- Flux2 Image Pipeline (text encoder + image generator nodes) ---
 # connection_type="flux2_text"  - prompt -> embeds.npy in a shared vault (see modules/ai_tools/_connections/flux2_text.json)

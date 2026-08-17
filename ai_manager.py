@@ -78,7 +78,7 @@ class PipelineBuilderUI:
                        </div>
                        <input type="text" id="pl-input-{pl_id}" name="value" placeholder="Input for this run" class="module-select">
                        <div id="pl-status-{pl_id}">{self._status_block(scope_id, pl_id, last_job)}</div>
-                       <details class="status-details"><summary>Node status ({len(nodes)})</summary><table class="status-table">{rows}</table></details>
+                       <details class="status-details"><summary>Node status (<span id="pl-nodecount-{pl_id}">{len(nodes)}</span>)</summary><table class="status-table" id="pl-nodetable-{pl_id}">{rows}</table></details>
                    </div>"""
 
     def _node_status_row(self, n) -> str:
@@ -284,11 +284,12 @@ class PipelineBuilderUI:
     async def _im_run(self, request, payload, imr):
         scope_id, pl_id = payload.get("scope",""), payload.get("pl_id","")
         job_id, err = self.AIM.engine.submit(request.state.user.username, kind="id", pipeline_id=pl_id, inputs={"input": payload.get("value","")})
+        job = self.AIM.engine.load_job(job_id) if not err else None
         if not err:
-            pl = self.AIM.engine.load_pipeline(pl_id)
-            pl["last_job_id"] = job_id
-            self.AIM.engine.save_pipeline(pl)
-        return imr.oob(self._status_block(scope_id, pl_id, self.AIM.engine.load_job(job_id) if not err else None), f"pl-status-{pl_id}")
+            pl = self.AIM.engine.load_pipeline(pl_id); pl["last_job_id"] = job_id; self.AIM.engine.save_pipeline(pl)
+        imr.oob(self._status_block(scope_id, pl_id, job), f"pl-status-{pl_id}")
+        imr.oob("".join(self._node_status_row(n) for n in (job["flow"]["nodes"] if job else [])), f"pl-nodetable-{pl_id}")
+        return imr
 
     async def _im_resume(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
@@ -300,9 +301,13 @@ class PipelineBuilderUI:
         return imr.oob(self._status_block(payload.get("scope",""), payload.get("pl_id",""), self.AIM.engine.load_job(payload.get("job_id",""))), f"pl-status-{payload.get('pl_id','')}")
 
     async def _im_status(self, request, payload, imr):
-        pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
+        pl_id = payload.get("pl_id","")
+        pl = self.AIM.engine.load_pipeline(pl_id)
         job = self.AIM.engine.load_job(pl.get("last_job_id","")) if pl and pl.get("last_job_id") else None
-        return imr.oob(self._status_block(payload.get("scope",""), payload.get("pl_id",""), job), f"pl-status-{payload.get('pl_id','')}")
+        imr.oob(self._status_block(payload.get("scope",""), pl_id, job), f"pl-status-{pl_id}")
+        nodes = job["flow"]["nodes"] if job else (pl.get("flow",{}).get("nodes",[]) if pl else [])
+        imr.oob("".join(self._node_status_row(n) for n in nodes), f"pl-nodetable-{pl_id}")
+        return imr
 
     def _node_config_fields(self, node_type, config):
         spec = self.AIM.steps.get_node_type(node_type)

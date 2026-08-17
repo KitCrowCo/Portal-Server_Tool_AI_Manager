@@ -44,7 +44,7 @@
     "timeout_s": {
       "label": "Request Timeout (s)",
       "type": "integer",
-      "default": 600,
+      "default": 3000,
       "hint": "Max seconds to wait for a response before aborting"
     }
   },
@@ -68,7 +68,7 @@
     "pull":        { "method": "POST",   "path": "/api/pull",       "body": { "name":  "{model}", "stream": true } },
     "delete":      { "method": "DELETE", "path": "/api/delete",     "body": { "name":  "{model}" } },
     "generate":    { "method": "POST",   "path": "/api/generate",   "body": { "model": "{model}", "prompt":   "{prompt}", "stream": true, "options": "{options}" } },
-    "chat":        { "method": "POST",   "path": "/api/chat",       "body": { "model": "{model}", "messages": "{messages}", "stream": true, "think": "{think}", "options": "{options}" } },
+    "chat":        { "method": "POST",   "path": "/api/chat",       "body": { "model": "{model}", "messages": "{messages}", "stream": true, "think": "{think}", "keep_alive": "{keep_alive}", "options": "{options}" } },
     "embeddings":  { "method": "POST",   "path": "/api/embeddings", "body": { "model": "{model}", "prompt":   "{text}" } }
   },
 
@@ -87,7 +87,8 @@
     "num_ctx":        { "type": "integer", "default": 16384, "min":  1,   "max": 13107200,   "hint": "Context window in tokens" },
     "num_predict":    { "type": "integer", "default": -1,    "min":  -1,  "max": 32768,    "hint": "-1 = unlimited" },
     "repeat_penalty": { "type": "float",   "default": 1.1,   "min":  0.5, "max": 2.0 },
-    "seed":           { "type": "integer", "default": -1,     "hint": "-1 = random" },
+    "keep_alive":     { "type": "string",  "default": "24h", "hint": "How long the model + its KV cache stay resident after the last request - long values let a paused conversation resume without reprocessing the whole prompt" },
+    "seed":           { "type": "integer", "default": -1,    "hint": "-1 = random" },
     "stop":           { "type": "list",    "default": [],    "hint": "List of stop sequences" }
   },
 
