@@ -293,18 +293,23 @@ def _parse_json_config(val, default=None):
     except Exception: return default if default is not None else {}
 
 
+
 # --- registration ---
 
 def register_builtins():
     BI = ENV["tools"]["built_ins"]
     def _key_map_field(): return BI.SettingField("key_map", "Key Map (JSON: logical -> actual pipeline key)", type="json", default={}, advanced=True, hint='Only needed to rename this node\'s in/out keys, e.g. {"input":"user_query","text":"draft"}. Unmapped logical names pass through unchanged.')
-    def _pool_fields(include_model=True):
+
+    def _conn_options_for_type(conn_type):
+        def _opts(values=None): return [("", "(pool-resolved by priority)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns(conn_type)]
+        return _opts
+
+    def _pool_fields(include_model=True, conn_type="ollama"):
         fields = [BI.SettingField("cnode_tags", "Resource Pool Tags (comma-sep)", type="text", advanced=True, hint="Narrows the pipeline's own pool to CNodes carrying ALL these tags. Blank = use the whole pipeline pool."),
                   BI.SettingField("priority", "Priority", type="select", default="", options=[("","(inherit pipeline default)"),("speed","Speed"),("balanced","Balanced"),("quality","Quality")], advanced=True),
-                  BI.SettingField("conn_id", "Connection", type="select", default="", options=_llm_conn_options, hint="Full pool auto-selection (multi-candidate scoring) is planned but not yet built - pin a connection here until then.")]
+                  BI.SettingField("conn_id", "Connection", type="select", default="", options=_conn_options_for_type(conn_type), hint="Full pool auto-selection (multi-candidate scoring) is planned but not yet built - pin a connection here until then.")]
         if include_model: fields.append(BI.SettingField("model", "Model", type="select", default="", options=_model_options_for_pinned_conn, hint="Populates once a connection is pinned above. Leave blank to auto-pick the first non-embedding model."))
         return fields
-
 
     register_node_type("generate", node_generate, "Generate (text or image)", in_keys=["input"], out_keys=["text","thinking"], config_schema=[
         BI.SettingField("modality","Modality","select",default="text", options=[("text","Text"),("image","Image")]),
@@ -367,7 +372,7 @@ def register_builtins():
         BI.SettingField("text_template","Insert Text Template","textarea",advanced=True),
         BI.SettingField("source_label","Insert Source Label","text",advanced=True),
         BI.SettingField("limit","Entity Limit","number",default=500,step=1,advanced=True),
-        *_pool_fields(include_model=False), _key_map_field()],
+        *_pool_fields(include_model=False, conn_type="lightrag"), _key_map_field()],
         guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.")
 
     register_node_type("pipeline", node_pipeline, "Call Pipeline", in_keys=[], out_keys=[], config_schema=[

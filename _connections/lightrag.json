@@ -10,7 +10,7 @@
   "domain_notes": {"type": "string", "label": "Domain Notes", "default": "", "hint": "What kind of knowledge lives here - shown under the selector in Kimi."},
   "endpoints": {
     "health":         {"method": "GET",    "path": "/health"},
-    "query":          {"method": "POST",   "path": "/query/stream", "body": {"query": "{query}", "mode": "{mode}", "stream": false}, "response_parser": {"content_path": "response"}},
+    "query":          {"method": "POST",   "path": "/query", "body": {"query": "{query}", "mode": "{mode}"}, "response_parser": {"content_path": "response"}},
     "query_stream":   {"method": "POST",   "path": "/query/stream", "body": {"query": "{query}", "mode": "{mode}", "stream": true}},
     "insert_text":    {"method": "POST",   "path": "/documents/text", "body": {"text": "{text}", "file_source": "{source}"}},
     "insert_file":    {"method": "POST",   "path": "/documents/upload", "fallback_path": "/documents/file", "file_field": "file"},
