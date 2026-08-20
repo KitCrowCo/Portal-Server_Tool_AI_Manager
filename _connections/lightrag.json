@@ -17,7 +17,7 @@
     "list_documents": {"method": "GET",    "path": "/documents"},
     "clear_all":      {"method": "DELETE", "path": "/documents"},
     "delete_document":{"method": "DELETE", "path": "/documents/{doc_id}", "fallback_path": "/documents/delete_document"},
-    "graph":          {"method": "GET",    "path": "/graphs", "fallback_path": "/graph/label/list"}
+    "graph":          {"method": "GET",    "path": "/graphs", "fallback_path": "/graph/label/list", "body": {"label": "{label}", "max_depth": "{max_depth}", "max_nodes": "{max_nodes}"}}
   },
   "query_options_schema": {
     "enable_rerank":     {"type": "boolean", "default": null, "label": "Rerank results", "hint": "Uses a reranker model if the server has one configured."},

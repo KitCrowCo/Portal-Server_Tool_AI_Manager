@@ -7,7 +7,7 @@ The engine remaps those to actual pipeline keys via the node's key_map and merge
 import re, json, sys, asyncio, uuid, time
 from pathlib import Path
 from tools.ai_manager import engine, resources
-from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync
+from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns
 
 _NODE_TYPES: dict = {}
 ENV: dict = {}

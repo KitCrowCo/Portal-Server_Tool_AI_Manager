@@ -271,8 +271,8 @@ def _parse_graph_response(data) -> tuple:
     if isinstance(data, list): return [{"id": i, "label": i} if isinstance(i, str) else i for i in data], []
     return [], []
 
-async def lightrag_graph_dot(conn, limit: int = 1000) -> str:
-    data = await _lightrag_call(conn, "graph", {"limit": limit})
+async def lightrag_graph_dot(conn, limit: int = 1000, label: str = "*") -> str:
+    data = await _lightrag_call(conn, "graph", {"limit": limit, "label": label, "max_depth": 3, "max_nodes": limit})
     if _lr_failed(data): print(f"[LightRAG] graph fetch error: {data['error']}"); return ""
     nodes, edges = _parse_graph_response(data)
     if not nodes: return ""
