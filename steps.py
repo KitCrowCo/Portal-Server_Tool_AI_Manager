@@ -222,8 +222,9 @@ async def node_pipeline(config: dict, data: dict, ctx: NodeContext) -> dict:
     import_keys = [k.strip() for k in str(config.get("import_keys","")).split(",") if k.strip()]
     export_keys = [k.strip() for k in str(config.get("export_keys","")).split(",") if k.strip()]
     sub_inputs = {k: data.get(k, "") for k in import_keys}
-    sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1)
-    return {k: sub_data.get(k, "") for k in export_keys}
+    sub_job_id = f"job_{uuid.uuid4().hex[:10]}"
+    sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1, job_id=sub_job_id)
+    return {**{k: sub_data.get(k, "") for k in export_keys}, "_sub_job_id": sub_job_id}
 
 async def node_pipeline_foreach(config: dict, data: dict, ctx: NodeContext) -> dict:
     items = ctx.get("items")
@@ -291,8 +292,6 @@ def _parse_json_config(val, default=None):
     if isinstance(val, (dict, list)): return val
     try: return json.loads(val)
     except Exception: return default if default is not None else {}
-
-
 
 # --- registration ---
 

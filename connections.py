@@ -87,6 +87,8 @@ def model_opts_html(conn_id="", selected_model="") -> str:
     opts = "".join(f'<option value="{m}" {"selected" if m==selected_model else ""}>{m}</option>' for m in models)
     return opts or f'<option value="{selected_model}">{selected_model or "-- select connection first --"}</option>'
 
+def is_prefix_breaking_change(conn: dict, changed_field: str) -> bool: return changed_field in _conn_profile(conn).get("prefix_breaking_fields", []) # True if changing this field on an active conversation invalidates the model's cached KV prefix for that connection type. A caller should warn before applying such a change to a conversation with existing history, per this connection type's own declared profile - not guessed at per-module.
+
 # --- Universal LLM Generation (Template-Driven Provider Interface) ---
 # Each connection_type's JSON profile (modules/ai_tools/_connections/{type}.json) declares its own wire format under payload_template/stream_format/content_path - stream_llm never hardcodes a provider.
 # Adding a new backend (vLLM, LM Studio, a cloud API) is a JSON file drop, not a code change here.

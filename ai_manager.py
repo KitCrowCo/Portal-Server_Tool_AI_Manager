@@ -58,6 +58,7 @@ class PipelineBuilderUI:
 
     _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") == "image" else ["ollama"], "knowledge": lambda cfg: ["lightrag"], "branch": lambda cfg: ["ollama"] if cfg.get("decide_mode") == "llm" else []}
     _NODE_RECURSES = {"pipeline", "pipeline_foreach", "branch"}  # branch is both: may need ollama itself AND recurses into routes_json targets
+    _NODE_CALLS = {"pipeline": lambda cfg: [cfg["pipeline_id"]] if cfg.get("pipeline_id") else [], "pipeline_foreach": lambda cfg: [cfg["pipeline_id"]] if cfg.get("pipeline_id") else [], "branch": lambda cfg: list({v for v in cfg.get("routes_json",{}).values() if v} | ({cfg["default_pipeline_id"]} if cfg.get("default_pipeline_id") else set()))}
 
     def _vals(self, action, **extra): return json.dumps({"type": f"{self.intent_prefix}_{action}", "branch": self.intent_prefix, "lvl": self.nesting_level, **extra})
     def _post(self, action, **extra): return f"""hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{self._vals(action, **extra)}'"""
@@ -150,11 +151,11 @@ class PipelineBuilderUI:
     def _pool_form_html(self, scope_id, pl) -> str:
         pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
         all_tags = sorted({t for c in self.AIM.resources.list_cnodes() for t in c.get("tags",[])})
-        tag_opts = lambda selected: "".join(f'<option value="{t}" {"selected" if t in selected else ""}>{t}</option>' for t in all_tags)
-        return f"""<form {self._post("pool_save", scope=scope_id, pl_id=pl["id"])} hx-include="this" class="glass" style="padding:.6rem;margin:.3rem 0;display:flex;flex-direction:column;gap:.4rem">
+        def _tag_checks(name, selected): return "".join(f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.75rem"><input type="checkbox" name="{name}" value="{t}" {"checked" if t in selected else ""}> {UI.escape(t)}</label>' for t in all_tags) or '<span class="dim tiny">No tags defined on any CNode yet.</span>'
+        return f"""<form {self._post("pool_save", scope=scope_id, pl_id=pl["id"])} hx-include="this" class="glass" style="padding:.6rem;margin:.3rem 0;display:flex;flex-direction:column;gap:.5rem">
                        <label class="dim">Priority<select name="priority" class="module-select">{"".join(f'<option value="{v}" {"selected" if v==pool.get("priority","balanced") else ""}>{l}</option>' for v,l in (("speed","Speed"),("balanced","Balanced"),("quality","Quality")))}</select></label>
-                       <label class="dim">Whitelist Tags (empty = any)<select name="whitelist_tags" multiple size="4" class="module-select">{tag_opts(pool.get("whitelist_tags",[]))}</select></label>
-                       <label class="dim">Blacklist Tags<select name="blacklist_tags" multiple size="4" class="module-select">{tag_opts(pool.get("blacklist_tags",[]))}</select></label>
+                       <div class="dim">Whitelist Tags (empty = any)<div style="display:flex;flex-direction:column;gap:.15rem;margin-top:.2rem">{_tag_checks("whitelist_tags", pool.get("whitelist_tags",[]))}</div></div>
+                       <div class="dim">Blacklist Tags<div style="display:flex;flex-direction:column;gap:.15rem;margin-top:.2rem">{_tag_checks("blacklist_tags", pool.get("blacklist_tags",[]))}</div></div>
                        <button type="submit" class="button">Save Pool</button>
                    </form>"""
 
@@ -392,30 +393,58 @@ class PipelineBuilderUI:
             out[conn_type] = ("pool_ok", picked[1].get("display_name", picked[1].get("_id",""))) if picked else ("pool_empty", f"{len(candidates)} CNode(s) matched tags/pool, none carry a {conn_type} connection" if candidates else "no CNode matches this pool's whitelist/blacklist + node tags")
         return out
 
-    def _preflight_pipeline(self, pl) -> list:
-        """One row per node: name, type, and a resolved/unresolved verdict per connection type it needs. Sub-pipeline-calling node types (pipeline/pipeline_foreach/branch-with-route) are flagged as 'recurses' rather than silently treated as fine - walking the full call graph is future work, not guessed at here."""
+    def _preflight_pipeline(self, pl, _visited=None) -> list:
+        """One row per node, recursing into called sub-pipelines (pipeline/pipeline_foreach/branch routes) up to a depth guard. _visited prevents infinite recursion on a cyclic pipeline reference."""
+        _visited = _visited or set()
+        if pl["id"] in _visited or len(_visited) > 20: return []
+        _visited = _visited | {pl["id"]}
         rows = []
         for n in pl.get("flow", {}).get("nodes", []):
             needs = self._preflight_node(pl, n)
-            recurses = n.get("type") in self._NODE_RECURSES
-            rows.append({"id": n["id"], "name": n.get("name") or n["id"], "type": n.get("type",""), "needs": needs, "recurses": recurses, "ok": all(v[0] in ("pinned_ok","pool_ok") for v in needs.values())})
+            called_ids = self._NODE_CALLS.get(n.get("type",""), lambda c: [])(n.get("config", {}))
+            sub_pipelines = []
+            for cid in called_ids:
+                sub_pl = self.AIM.engine.load_pipeline(cid)
+                if not sub_pl: sub_pipelines.append({"id": cid, "name": None, "rows": []}); continue
+                sub_pipelines.append({"id": cid, "name": sub_pl.get("name", cid), "rows": self._preflight_pipeline(sub_pl, _visited)})
+            rows.append({"id": n["id"], "name": n.get("name") or n["id"], "type": n.get("type",""), "needs": needs, "sub_pipelines": sub_pipelines, "ok": all(v[0] in ("pinned_ok","pool_ok") for v in needs.values()) and all(all(r["ok"] for r in sp["rows"]) for sp in sub_pipelines if sp["name"])})
         return rows
 
-    def _preflight_html(self, pl) -> str:
+    def _preflight_html(self, pl, depth: int = 0) -> str:
         rows = self._preflight_pipeline(pl)
-        if not rows: return '<div class="dim tiny">No nodes yet.</div>'
+        if not rows: return '<div class="dim tiny">No nodes yet.</div>' if depth == 0 else ""
+        indent = f'style="padding-left:{depth*1.2}rem"'
         body = ""
         for r in rows:
-            if not r["needs"] and not r["recurses"]:
-                body += f'<tr><td class="qn">{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])}</td><td colspan="2" class="dim tiny">no connection required</td></tr>'
-                continue
-            if r["recurses"]:
-                body += f'<tr><td class="qn">{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])}</td><td colspan="2" style="color:#ffaa44">calls another pipeline - not checked, verify that pipeline separately</td></tr>'
+            if not r["needs"] and not r["sub_pipelines"]:
+                body += f'<tr><td class="qn" {indent}>{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])}</td><td colspan="2" class="dim tiny">no connection required</td></tr>'
                 continue
             for conn_type, (status, detail) in r["needs"].items():
                 ok = status in ("pinned_ok", "pool_ok")
-                body += f'<tr><td class="qn">{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])} / {conn_type}</td><td style="color:{"#00ffa2" if ok else "#ff5f5f"}">{status.replace("_"," ")}</td><td class="dim tiny">{UI.escape(detail)}</td></tr>'
-        return f'<table class="data-table"><thead><tr><th>Node</th><th>Needs</th><th>Status</th><th>Detail</th></tr></thead><tbody>{body}</tbody></table>'
+                body += f'<tr><td class="qn" {indent}>{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])} / {conn_type}</td><td style="color:{"#00ffa2" if ok else "#ff5f5f"}">{status.replace("_"," ")}</td><td class="dim tiny">{UI.escape(detail)}</td></tr>'
+            for sp in r["sub_pipelines"]:
+                if sp["name"] is None:
+                    body += f'<tr><td class="qn" {indent}>&#x21B3; {UI.escape(sp["id"])}</td><td colspan="3" style="color:#ff5f5f">pipeline not found - id may be stale/deleted</td></tr>'
+                    continue
+                body += f'<tr><td colspan="4" {indent} style="color:var(--text_muted);font-weight:600;padding-top:.4rem">&#x21B3; calls: {UI.escape(sp["name"])} ({sp["id"]})</td></tr>'
+                body += self._preflight_html_rows(sp["rows"], depth+1) if sp["rows"] else f'<tr><td colspan="4" {indent} class="dim tiny">no nodes in sub-pipeline</td></tr>'
+        return f'<table class="data-table"><thead><tr><th>Node</th><th>Needs</th><th>Status</th><th>Detail</th></tr></thead><tbody>{body}</tbody></table>' if depth == 0 else body
+
+    def _preflight_html_rows(self, rows, depth) -> str:
+        """Row-only renderer for recursive sub-pipeline sections - same logic as _preflight_html's body loop, factored out so nesting doesn't re-wrap in its own <table>."""
+        indent = f'style="padding-left:{depth*1.2}rem"'
+        body = ""
+        for r in rows:
+            if not r["needs"] and not r["sub_pipelines"]:
+                body += f'<tr><td class="qn" {indent}>{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])}</td><td colspan="2" class="dim tiny">no connection required</td></tr>'
+                continue
+            for conn_type, (status, detail) in r["needs"].items():
+                ok = status in ("pinned_ok", "pool_ok")
+                body += f'<tr><td class="qn" {indent}>{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])} / {conn_type}</td><td style="color:{"#00ffa2" if ok else "#ff5f5f"}">{status.replace("_"," ")}</td><td class="dim tiny">{UI.escape(detail)}</td></tr>'
+            for sp in r["sub_pipelines"]:
+                if sp["name"] is None: body += f'<tr><td class="qn" {indent}>&#x21B3; {UI.escape(sp["id"])}</td><td colspan="3" style="color:#ff5f5f">pipeline not found</td></tr>'; continue
+                body += f'<tr><td colspan="4" {indent} style="color:var(--text_muted);font-weight:600">&#x21B3; calls: {UI.escape(sp["name"])}</td></tr>' + self._preflight_html_rows(sp["rows"], depth+1)
+        return body
 
     async def _im_preflight(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
