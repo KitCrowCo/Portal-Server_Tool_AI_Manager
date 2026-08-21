@@ -51,11 +51,13 @@ def prompt_block_picker_fragment(textarea_id: str) -> str: return BI.prompt_bloc
 
 class PipelineBuilderUI:
     """Universal-node pipeline authoring surface. No prev/next wiring anywhere in this UI - node order is entirely a function of key presence, computed fresh for the graphical view via Flow.resolve_levels()."""
-
     def __init__(self, IM, AIM, intent_prefix="plb", nesting_level=2, scope_key="project_id"):
         self.IM, self.AIM, self.intent_prefix, self.nesting_level, self.scope_key = IM, AIM, intent_prefix, nesting_level, scope_key
         p = self.intent_prefix
-        IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change], f"{p}_node_pool_preview": [self._im_node_pool_preview]})
+        IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change], f"{p}_node_pool_preview": [self._im_node_pool_preview], f"{p}_preflight": [self._im_preflight]})
+
+    _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") == "image" else ["ollama"], "knowledge": lambda cfg: ["lightrag"], "branch": lambda cfg: ["ollama"] if cfg.get("decide_mode") == "llm" else []}
+    _NODE_RECURSES = {"pipeline", "pipeline_foreach", "branch"}  # branch is both: may need ollama itself AND recurses into routes_json targets
 
     def _vals(self, action, **extra): return json.dumps({"type": f"{self.intent_prefix}_{action}", "branch": self.intent_prefix, "lvl": self.nesting_level, **extra})
     def _post(self, action, **extra): return f"""hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{self._vals(action, **extra)}'"""
@@ -66,12 +68,15 @@ class PipelineBuilderUI:
         last_job = self.AIM.engine.load_job(pl.get("last_job_id","")) if pl.get("last_job_id") else None
         nodes = (last_job["flow"]["nodes"] if last_job else pl.get("flow",{}).get("nodes",[]))
         pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
-        match_count = len(self.AIM.resources.resolve_candidates(pool))
-        pool_badge = f"""<span class="status-badge" style="color:{"#00ffa2" if match_count else "#ff5f5f"}" title="whitelist:{",".join(pool.get("whitelist_tags",[])) or "any"} blacklist:{",".join(pool.get("blacklist_tags",[]))}">{pool.get("priority","balanced")} - {match_count} CNode{"s" if match_count != 1 else ""}</span>"""
+        preflight = self._preflight_pipeline(pl)
+        gaps = [r["name"] for r in preflight if not r["ok"] and not r["recurses"]]
+        badge_color = "#ff5f5f" if gaps else "#00ffa2"
+        badge_text = f"{len(gaps)} node(s) unresolved" if gaps else "all nodes resolved"
+        pool_badge = f'<span class="status-badge" style="color:{badge_color}" title="{UI.escape(", ".join(gaps))}">{pool.get("priority","balanced")} - {badge_text}</span>'
         rows = "".join(self._node_status_row(n) for n in nodes)
         return f"""<div class="glass list-card">
                        <div class="list-card-hd">
-                           <span class="list-card-title" {self._post("editor_open", scope=scope_id, pl_id=pl_id)}>{UI.escape(pl.get("name",""))}</span>
+                           <span class="list-card-title" {self._post("editor_open", scope=scope_id, pl_id=pl_id)}>{UI.escape(pl.get("name","") or pl_id)}</span>
                            <span class="dim tiny" style="font-family:var(--font-mono)">{pl_id}</span>
                            {pool_badge}
                            <a class="cm-qbtn" href="{_P}/pipelines/{pl_id}/export" download="{pl_id}.json" title="Export pipeline as JSON">&#x2B07;</a>
@@ -79,13 +84,18 @@ class PipelineBuilderUI:
                        </div>
                        <input type="text" id="pl-input-{pl_id}" name="value" placeholder="Input for this run" class="module-select">
                        <div id="pl-status-{pl_id}">{self._status_block(scope_id, pl_id, last_job)}</div>
-                       <details class="status-details"><summary>Node status (<span id="pl-nodecount-{pl_id}">{len(nodes)}</span>)</summary><table class="status-table" id="pl-nodetable-{pl_id}">{rows}</table></details>
+                       <details class="status-details"><summary>Preflight check</summary>{self._preflight_html(pl)}</details>
+                       <details class="status-details"><summary>Node status (<span id="pl-nodecount-{pl_id}">{len(nodes)}</span>)</summary><table class="data-table" id="pl-nodetable-{pl_id}">{rows}</table></details>
                    </div>"""
 
-    def _node_status_row(self, n) -> str:
+    def _node_status_row(self, n, pl=None) -> str:
         col = {"done":"#00ffa2","error":"#ff5f5f","running":"#ffcc00","unreached":"var(--text_muted)"}.get(n.get("status","idle"), "var(--text)")
         preview = n.get("message") or " | ".join(str(v) for v in (n.get("preview") or {}).values())
-        return f"""<tr><td class="qn">{UI.escape(n.get("name") or n["id"])}</td><td class="dim">{UI.escape(n.get("type",""))}</td><td style="color:{col}">{UI.escape(n.get("status","idle"))}</td><td class="dim status-preview">{UI.escape(preview)}</td></tr>"""
+        conn_cell = ""
+        if pl is not None:
+            ok, detail = self._node_conn_ok(pl, n)
+            conn_cell = f'<td style="color:{"#00ffa2" if ok else "#ff5f5f"};text-align:center" title="{UI.escape(detail)}">{"&#x2713;" if ok else "&#x2715;"}</td>'
+        return f"""<tr><td class="qn">{UI.escape(n.get("name") or n["id"])}</td><td class="dim">{UI.escape(n.get("type",""))}</td><td style="color:{col}">{UI.escape(n.get("status","idle"))}</td>{conn_cell}<td class="dim status-preview">{UI.escape(preview)}</td></tr>"""
 
     def panel_html(self, scope_id: str, include_modal_slot: bool = True) -> str:
         p = self.intent_prefix
@@ -231,7 +241,7 @@ class PipelineBuilderUI:
                        <input type="hidden" name="pl_id" value="{pl["id"]}">
                        <span class="form-title">{"New Node" if is_new else "Edit Node"}</span>
                        <input type="text" name="name" value="{UI.escape((node or {}).get('name',''))}" placeholder="Node name" class="module-select">
-                       <label class="dim">Node Type<select name="type" class="module-select" {self._post("node_type_change", scope=scope_id, pl_id=pl["id"])} hx-trigger="change" hx-include="this" hx-target="#pl-node-cfg-{p}">{self._node_type_options(ntype)}</select></label>
+                       <label class="dim">Node Type<select name="node_type" class="module-select" {self._post("node_type_change", scope=scope_id, pl_id=pl["id"])} hx-trigger="change" hx-include="this" hx-target="#pl-node-cfg-{p}">{self._node_type_options(ntype)}</select></label>
                        <div id="pl-node-cfg-{p}">{self._node_config_fields(ntype, config) if ntype else '<div class="dim">Pick a node type to configure it.</div>'}</div>
                        <label class="dim">Extra In Keys (comma-sep, actual pipeline keys)<input type="text" name="extra_in_keys" value="{UI.escape(extra_in)}" class="module-select"></label>
                        <label class="dim">Extra Out Keys (comma-sep, actual pipeline keys)<input type="text" name="extra_out_keys" value="{UI.escape(extra_out)}" class="module-select"></label>
@@ -265,13 +275,13 @@ class PipelineBuilderUI:
         node = next((n for n in pl.get("flow",{}).get("nodes",[]) if n["id"]==payload.get("nid")), None)
         return imr.oob(self._node_form_html(payload.get("scope",""), pl, node), f"pl-node-editor-{self.intent_prefix}")
 
-    async def _im_node_type_change(self, request, payload, imr): return imr.oob(self._node_config_fields(payload.get("type",""), {}, self.AIM.engine.load_pipeline(payload.get("pl_id",""))), f"pl-node-cfg-{self.intent_prefix}")
+    async def _im_node_type_change(self, request, payload, imr): return imr.oob(self._node_config_fields(payload.get("node_type",""), {}, self.AIM.engine.load_pipeline(payload.get("pl_id",""))), f"pl-node-cfg-{self.intent_prefix}")
 
     async def _im_node_save(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
         if not pl: return imr
         flow = pl.setdefault("flow", {"nodes": []})
-        nid, ntype = payload.get("nid",""), payload.get("type","")
+        nid, ntype = payload.get("nid",""), payload.get("node_type","")
         spec = self.AIM.steps.get_node_type(ntype)
         config = {}
         if spec:
@@ -292,7 +302,7 @@ class PipelineBuilderUI:
         else: flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "name": payload.get("name","").strip(), "type": ntype, "config": config, "key_map": key_map, "extra_in_keys": extra_in, "extra_out_keys": extra_out, "status": "idle"})
         self.AIM.engine.save_pipeline(pl)
         imr.oob(self._editor_html(payload.get("scope",""), pl), f"pl-editor-modal-{self.intent_prefix}")
-        imr.oob("".join(self._node_status_row(n) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
+        imr.oob("".join(self._node_status_row(n, pl) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
         imr.oob("".join(self._card_html(payload.get("scope",""), p_) for p_ in self._pipelines(payload.get("scope",""))) or '<div class="list-empty">No pipelines.</div>', f"pl-list-{self.intent_prefix}")
         return imr
 
@@ -303,7 +313,7 @@ class PipelineBuilderUI:
         flow["nodes"] = [n for n in flow["nodes"] if n["id"] != payload.get("nid","")]
         self.AIM.engine.save_pipeline(pl)
         imr.oob(self._editor_html(payload.get("scope",""), pl), f"pl-editor-modal-{self.intent_prefix}")
-        imr.oob("".join(self._node_status_row(n) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
+        imr.oob("".join(self._node_status_row(n, pl) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
         return imr
 
     async def _im_rename(self, request, payload, imr):
@@ -315,11 +325,20 @@ class PipelineBuilderUI:
         scope_id, pl_id = payload.get("scope",""), payload.get("pl_id","")
         job_id, err = self.AIM.engine.submit(request.state.user.username, kind="id", pipeline_id=pl_id, inputs={"input": payload.get("value","")})
         job = self.AIM.engine.load_job(job_id) if not err else None
-        if not err:
-            pl = self.AIM.engine.load_pipeline(pl_id); pl["last_job_id"] = job_id; self.AIM.engine.save_pipeline(pl)
+        pl = self.AIM.engine.load_pipeline(pl_id)
+        if not err and pl: pl["last_job_id"] = job_id; self.AIM.engine.save_pipeline(pl)
         imr.oob(self._status_block(scope_id, pl_id, job), f"pl-status-{pl_id}")
-        imr.oob("".join(self._node_status_row(n) for n in (job["flow"]["nodes"] if job else [])), f"pl-nodetable-{pl_id}")
+        imr.oob("".join(self._node_status_row(n, pl) for n in (job["flow"]["nodes"] if job else [])), f"pl-nodetable-{pl_id}")
         return imr
+
+    async def _im_status(self, request, payload, imr):
+        pl_id = payload.get("pl_id","")
+        pl = self.AIM.engine.load_pipeline(pl_id)
+        job = self.AIM.engine.load_job(pl.get("last_job_id","")) if pl and pl.get("last_job_id") else None
+        imr.oob(self._status_block(payload.get("scope",""), pl_id, job), f"pl-status-{pl_id}")
+        nodes = job["flow"]["nodes"] if job else (pl.get("flow",{}).get("nodes",[]) if pl else [])
+        imr.oob("".join(self._node_status_row(n, pl) for n in nodes), f"pl-nodetable-{pl_id}")
+        return imr    
 
     async def _im_resume(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
@@ -330,29 +349,77 @@ class PipelineBuilderUI:
         self.AIM.engine.stop(payload.get("job_id",""))
         return imr.oob(self._status_block(payload.get("scope",""), payload.get("pl_id",""), self.AIM.engine.load_job(payload.get("job_id",""))), f"pl-status-{payload.get('pl_id','')}")
 
-    async def _im_status(self, request, payload, imr):
-        pl_id = payload.get("pl_id","")
-        pl = self.AIM.engine.load_pipeline(pl_id)
-        job = self.AIM.engine.load_job(pl.get("last_job_id","")) if pl and pl.get("last_job_id") else None
-        imr.oob(self._status_block(payload.get("scope",""), pl_id, job), f"pl-status-{pl_id}")
-        nodes = job["flow"]["nodes"] if job else (pl.get("flow",{}).get("nodes",[]) if pl else [])
-        imr.oob("".join(self._node_status_row(n) for n in nodes), f"pl-nodetable-{pl_id}")
-        return imr
-
-    def _node_config_fields(self, node_type, config):
-        spec = self.AIM.steps.get_node_type(node_type)
-        if not spec: return '<div class="dim">Pick a node type to configure it.</div>'
-        schema = [copy.copy(f) if f.name == "conn_id" else f for f in spec["config_schema"]]
-        for f in schema:
-            if f.name == "conn_id": f.hx_intent, f.hx_target = f"{self.intent_prefix}_node_conn_change", "#cfg_model_wrap"
-        guide_html = f"""<details class="glass status-list"><summary>&#x2139; How this node works</summary><div>{UI.escape(spec.get("guide",""))}</div></details>""" if spec.get("guide") else ""
-        return guide_html + BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
-
     async def _im_node_conn_change(self, request, payload, imr):
         conn = self.AIM.connections.get_conn(payload.get("cfg_conn_id",""))
         models = self.AIM.connections.list_models_sync(conn) if conn else []
         opts = "".join(f'<option value="{m}">{m}{" - looks like embedding" if self.AIM.steps.looks_like_embedding(m) else ""}</option>' for m in models)
         return imr.oob(f'<label id="cfg_model_wrap" class="dim">Model<select name="cfg_model" class="module-select"><option value="">(auto)</option>{opts}</select></label>', "cfg_model_wrap")
+
+    def _node_conn_types(self, node) -> list:
+        """Which connection_type(s) this node needs, if any. Not exhaustive of every node type - branch/pipeline/pipeline_foreach recurse into sub-pipelines and aren't validated here (that would require walking the whole call graph); flagged as a known gap, not silently assumed fine."""
+        t, cfg = node.get("type",""), node.get("config",{})
+        if t == "generate": return ["flux2_text","flux2_image"] if cfg.get("modality")=="image" else ["ollama"]
+        if t == "knowledge": return ["lightrag"]
+        if t == "branch" and cfg.get("decide_mode") == "llm": return ["ollama"]
+        return []
+
+    def _node_conn_ok(self, pl, node) -> tuple:
+        types = self._node_conn_types(node)
+        if not types: return True, ""
+        cfg = node.get("config", {})
+        if cfg.get("conn_id"): return (self.AIM.connections.get_conn(cfg["conn_id"]) is not None), "pinned connection missing"
+        pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
+        tags = [t.strip() for t in str(cfg.get("cnode_tags","")).split(",") if t.strip()]
+        candidates = self.AIM.resources.resolve_candidates(pool, tags)
+        missing = [ct for ct in types if not self.AIM.resources.pick_conn(candidates, ct)]
+        return (not missing), ", ".join(missing)
+
+    def _preflight_node(self, pl, node) -> dict:
+        """Returns {conn_type: (status, detail)} for every connection type this node needs. status is 'pinned_ok' | 'pinned_missing' | 'pool_ok' | 'pool_empty'.
+        Uses resources.resolve_candidates + resources.pick_conn directly - the identical functions node_generate/node_knowledge call in steps.py - so this can never disagree with what actually happens on Run."""
+        cfg = node.get("config", {})
+        needs = self._NODE_CONN_NEEDS.get(node.get("type",""), lambda c: [])(cfg)
+        out = {}
+        for conn_type in needs:
+            if cfg.get("conn_id"):
+                conn = self.AIM.connections.get_conn(cfg["conn_id"])
+                out[conn_type] = ("pinned_ok", conn.get("display_name", cfg["conn_id"])) if conn else ("pinned_missing", cfg["conn_id"])
+                continue
+            pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
+            tags = [t.strip() for t in str(cfg.get("cnode_tags","")).split(",") if t.strip()]
+            candidates = self.AIM.resources.resolve_candidates(pool, tags, conn_type)
+            picked = self.AIM.resources.pick_conn(candidates, conn_type, pool.get("priority","balanced"))
+            out[conn_type] = ("pool_ok", picked[1].get("display_name", picked[1].get("_id",""))) if picked else ("pool_empty", f"{len(candidates)} CNode(s) matched tags/pool, none carry a {conn_type} connection" if candidates else "no CNode matches this pool's whitelist/blacklist + node tags")
+        return out
+
+    def _preflight_pipeline(self, pl) -> list:
+        """One row per node: name, type, and a resolved/unresolved verdict per connection type it needs. Sub-pipeline-calling node types (pipeline/pipeline_foreach/branch-with-route) are flagged as 'recurses' rather than silently treated as fine - walking the full call graph is future work, not guessed at here."""
+        rows = []
+        for n in pl.get("flow", {}).get("nodes", []):
+            needs = self._preflight_node(pl, n)
+            recurses = n.get("type") in self._NODE_RECURSES
+            rows.append({"id": n["id"], "name": n.get("name") or n["id"], "type": n.get("type",""), "needs": needs, "recurses": recurses, "ok": all(v[0] in ("pinned_ok","pool_ok") for v in needs.values())})
+        return rows
+
+    def _preflight_html(self, pl) -> str:
+        rows = self._preflight_pipeline(pl)
+        if not rows: return '<div class="dim tiny">No nodes yet.</div>'
+        body = ""
+        for r in rows:
+            if not r["needs"] and not r["recurses"]:
+                body += f'<tr><td class="qn">{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])}</td><td colspan="2" class="dim tiny">no connection required</td></tr>'
+                continue
+            if r["recurses"]:
+                body += f'<tr><td class="qn">{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])}</td><td colspan="2" style="color:#ffaa44">calls another pipeline - not checked, verify that pipeline separately</td></tr>'
+                continue
+            for conn_type, (status, detail) in r["needs"].items():
+                ok = status in ("pinned_ok", "pool_ok")
+                body += f'<tr><td class="qn">{UI.escape(r["name"])}</td><td class="dim">{UI.escape(r["type"])} / {conn_type}</td><td style="color:{"#00ffa2" if ok else "#ff5f5f"}">{status.replace("_"," ")}</td><td class="dim tiny">{UI.escape(detail)}</td></tr>'
+        return f'<table class="data-table"><thead><tr><th>Node</th><th>Needs</th><th>Status</th><th>Detail</th></tr></thead><tbody>{body}</tbody></table>'
+
+    async def _im_preflight(self, request, payload, imr):
+        pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
+        return imr.oob(self._preflight_html(pl), f"pl-preflight-{self.intent_prefix}") if pl else imr
 
 @router.get("/pipelines", response_class=JSONResponse)
 async def api_list_pipelines(tag: str = None): return JSONResponse(engine.list_pipelines(tag))
@@ -515,7 +582,7 @@ async def shadow_selftest(request: Request):
 
 def _cnode_form_html(cnode: dict = None, cid: str = "") -> str:
     c = cnode or resources.DEFAULT_CNODE
-    conn_opts = "".join(f'<option value="{cid2}" {"selected" if cid2 in c.get("conn_ids",[]) else ""}>{cid2} ({conn.get("connection_type","?")})</option>' for f in sorted(connections.CONN_DIR.glob("*.json")) for cid2 in [f.stem] for conn in [connections.load_conn_raw(cid2)] if conn)
+    conn_opts = "".join(f'<option value="{cid2}" {"selected" if cid2 in c.get("conn_ids",[]) else ""}>{conn.get("display_name",cid2)} ({conn.get("connection_type","?")})</option>' for f in sorted(connections.CONN_DIR.glob("*.json")) for cid2 in [f.stem] for conn in [connections.load_conn_raw(cid2)] if conn)
     vals = json.dumps({"type":"cnode_save","lvl":1,"cid":cid})
     return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals}' hx-include="this" style="display:flex;flex-direction:column;gap:.4rem;padding:.6rem" class="glass">
                    <label class="dim">Label<input type="text" name="label" value="{UI.escape(c.get('label',''))}" class="module-select" required></label>

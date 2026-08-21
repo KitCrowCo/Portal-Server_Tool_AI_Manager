@@ -313,7 +313,6 @@ def register_builtins():
 
     register_node_type("generate", node_generate, "Generate (text or image)", in_keys=["input"], out_keys=["text","thinking"], config_schema=[
         BI.SettingField("modality","Modality","select",default="text", options=[("text","Text"),("image","Image")]),
-        BI.SettingField("model","Model (blank = first available)","text",default=""),
         BI.SettingField("system_prompt","System Prompt","textarea",default="You are a helpful AI assistant."),
         BI.SettingField("user_template","User/Prompt Template","textarea",default="{input}", hint="{key} substitutes real pipeline keys directly."),
         BI.SettingField("temperature","Temperature","number",default=0.7),
@@ -324,7 +323,7 @@ def register_builtins():
         BI.SettingField("think","Enable Thinking Mode","checkbox",default=False),
         BI.SettingField("enforce_options","Enforced Options (comma-sep)","text",advanced=True),
         BI.SettingField("seed","Seed (blank/-1 = random)","number",default=None,advanced=True,step=1),
-        BI.SettingField("width","Width (image)","number",default=1024,step=1,advanced=True), # Step 16 is only for some instances, should probably warn)
+        BI.SettingField("width","Width (image)","number",default=1024,step=1,advanced=True),
         BI.SettingField("height","Height (image)","number",default=1024,step=1,advanced=True),
         BI.SettingField("steps","Steps (image)","number",default=4,step=1,advanced=True),
         BI.SettingField("cfg","Guidance Scale (image)","number",default=1.0,advanced=True),
