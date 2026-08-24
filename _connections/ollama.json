@@ -88,6 +88,7 @@
     "num_ctx":        { "type": "integer", "default": 16384, "min":  1,   "max": 13107200,   "hint": "Context window in tokens" },
     "num_predict":    { "type": "integer", "default": -1,    "min":  -1,  "max": 32768,    "hint": "-1 = unlimited" },
     "repeat_penalty": { "type": "float",   "default": 1.1,   "min":  0.5, "max": 2.0 },
+    "num_gpu": { "type": "integer", "default": -1, "min": 0, "max": 999, "hint": "Layers offloaded to GPU. 0 forces CPU-only for this request - useful for a specific heavy vision call without changing the server's global GPU behavior. -1/default lets Ollama decide." },
     "keep_alive":     { "type": "string",  "default": "24h", "hint": "How long the model + its KV cache stay resident after the last request - long values let a paused conversation resume without reprocessing the whole prompt" },
     "seed":           { "type": "integer", "default": -1,    "hint": "-1 = random" },
     "stop":           { "type": "list",    "default": [],    "hint": "List of stop sequences" }

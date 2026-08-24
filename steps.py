@@ -10,19 +10,19 @@ from tools.ai_manager import engine, resources
 from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns
 
 _NODE_TYPES: dict = {}
+_EMBED_PATTERNS = ("embed", "minilm", "bge-", "gte-", "e5-", "nomic-embed", "arctic-embed")
 ENV: dict = {}
+
 def init(env: dict):
     global ENV
     ENV = env
 
-def register_node_type(name, fn, label="", in_keys=None, out_keys=None, config_schema=None, guide=""):
-    _NODE_TYPES[name] = {"fn": fn, "label": label or name, "in_keys": in_keys or [], "out_keys": out_keys or [], "config_schema": config_schema or [], "guide": guide}
+def register_node_type(name, fn, label="", in_keys=None, out_keys=None, config_schema=None, guide=""): _NODE_TYPES[name] = {"fn": fn, "label": label or name, "in_keys": in_keys or [], "out_keys": out_keys or [], "config_schema": config_schema or [], "guide": guide}
 def get_node_type(name: str) -> dict: return _NODE_TYPES.get(name)
 def list_node_types() -> list: return [{"type": k, **{kk: vv for kk, vv in v.items() if kk != "fn"}} for k, v in _NODE_TYPES.items()]
 
 class NodeContext:
-    """Wraps one node's own key_map so a type's implementation only ever deals in its own logical names, never in actual pipeline key strings
-    - the same function works unmodified no matter what keys a pipeline instance wires it to."""
+    """Wraps one node's own key_map so a type's implementation only ever deals in its own logical names, never in actual pipeline key strings - the same function works unmodified no matter what keys a pipeline instance wires it to."""
     def __init__(self, node, data, job_id, username, pool_cfg, depth=0):
         self.node, self.data, self.job_id, self.username, self.pool_cfg, self.depth = node, data, job_id, username, pool_cfg, depth
 
@@ -237,17 +237,18 @@ async def node_pipeline_foreach(config: dict, data: dict, ctx: NodeContext) -> d
     item_key = config.get("item_key","item")
     import_keys = [k.strip() for k in str(config.get("import_keys","")).split(",") if k.strip()]
     export_keys = [k.strip() for k in str(config.get("export_keys","")).split(",") if k.strip()]
-    results = []
+    results, sub_job_ids = [], []
     for i, item in enumerate(items):
         await ctx.progress(f"item {i+1}/{len(items)}")
         sub_inputs = {item_key: item, **{k: data.get(k, "") for k in import_keys}}
-        sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1)
+        sub_job_id = f"job_{uuid.uuid4().hex[:10]}"
+        sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1, job_id=sub_job_id)
         results.append({k: sub_data.get(k, "") for k in export_keys})
-    return {"results": results, "count": len(results)}
+        sub_job_ids.append(sub_job_id)
+    return {"results": results, "count": len(results), "_sub_job_ids": sub_job_ids}
 
 async def node_branch(config: dict, data: dict, ctx: NodeContext) -> dict:
-    """Decides a value (expression or LLM), looks it up in Routes, and calls whichever sub-pipeline matches.
-    The branch is one atomic node to the outer pipeline's scheduler - only the chosen sub-pipeline actually runs; the others are simply never invoked, exactly like any other unreached path in this architecture."""
+    """Decides a value (expression or LLM), looks it up in Routes, and calls whichever sub-pipeline matches."""
     if config.get("decide_mode", "expr") == "llm":
         decision = (await node_generate({**config, "enforce_options": config.get("options",""), "user_template": config.get("decide_template","{input}")}, data, ctx)).get("choice","")
     else:
@@ -261,10 +262,11 @@ async def node_branch(config: dict, data: dict, ctx: NodeContext) -> dict:
     import_keys = [k.strip() for k in str(config.get("import_keys","")).split(",") if k.strip()]
     export_keys = [k.strip() for k in str(config.get("export_keys","")).split(",") if k.strip()]
     sub_inputs = {k: data.get(k, "") for k in import_keys}
-    sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1)
-    return {**{k: sub_data.get(k, "") for k in export_keys}, "decision": decision}
+    sub_job_id = f"job_{uuid.uuid4().hex[:10]}"
+    sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1, job_id=sub_job_id)
+    return {**{k: sub_data.get(k, "") for k in export_keys}, "decision": decision, "_sub_job_id": sub_job_id}
 
-_EMBED_PATTERNS = ("embed", "minilm", "bge-", "gte-", "e5-", "nomic-embed", "arctic-embed")
+
 def looks_like_embedding(model_name: str) -> bool: return any(p in model_name.lower() for p in _EMBED_PATTERNS)
 
 def pick_default_chat_model(models: list) -> str:
@@ -393,7 +395,7 @@ def register_builtins():
         BI.SettingField("decide_template","LLM Decision Prompt","textarea",advanced=True),
         BI.SettingField("options","LLM Options (comma-sep)","text",advanced=True),
         BI.SettingField("routes_json","Routes (JSON: value -> pipeline id)","json",default={}),
-        BI.SettingField("default_pipeline_id","Default Pipeline ID","text",advanced=True),
+        BI.SettingField("default_pipeline_id","Default Pipeline ID","select",options=_pipeline_options,advanced=True),
         BI.SettingField("import_keys","Import Keys (comma-sep)","text"),
         BI.SettingField("export_keys","Export Keys (comma-sep)","text"),
         BI.SettingField("vars_json","Variables (JSON: name -> template)","json",default={},advanced=True),

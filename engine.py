@@ -170,15 +170,16 @@ def stop(job_id: str):
     job = load_job(job_id)
     if job: job["status"] = "stopping"; _save_job(job)
 
-async def run_inline(username: str, pipeline_id: str, inputs: dict = None, pool_cfg: dict = None, depth: int = 0, max_depth = 100) -> dict:
-    """Runs a saved pipeline to completion and returns its final data object - used by the pipeline/pipeline_foreach/branch node types to compose pipelines together. Depth guards against runaway self-referential recursion."""
+async def run_inline(username: str, pipeline_id: str, inputs: dict = None, pool_cfg: dict = None, depth: int = 0, max_depth = 100, job_id: str = None) -> dict:
+    """Runs a saved pipeline to completion and returns its final data object - used by the pipeline/pipeline_foreach/branch node types to compose pipelines together. Depth guards against runaway self-referential recursion.
+    job_id, if supplied by the caller, lets a parent node stash a stable reference to this sub-run's job record for later inspection (see steps.py's node_pipeline) - otherwise one is generated as before."""
     if depth > max_depth: raise RuntimeError(f"run_inline: max pipeline call depth ({max_depth}) exceeded - likely an unbounded recursive branch")
     pdef = load_pipeline(pipeline_id)
     if not pdef: raise RuntimeError(f"run_inline: pipeline not found: {pipeline_id}")
     flow_data = json.loads(json.dumps(pdef["flow"]))
     for n in flow_data.get("nodes", []): n["status"] = "idle"; n.pop("ts", None); n.pop("preview", None); n.pop("message", None)
     pool = pool_cfg or pdef.get("pool", DEFAULT_POOL)
-    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    job_id = job_id or f"job_{uuid.uuid4().hex[:10]}"
     job = {"id": job_id, "username": username, "flow": flow_data, "pool": pool, "status": "queued", "data": dict(inputs or {}), "log": [], "heartbeat": time.time(), "created": datetime.utcnow().isoformat()}
     _save_job(job)
     data = await _run_flow(flow_data, dict(job["data"]), job_id, username, pool, depth=depth)

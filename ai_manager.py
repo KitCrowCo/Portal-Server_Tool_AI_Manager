@@ -54,7 +54,7 @@ class PipelineBuilderUI:
     def __init__(self, IM, AIM, intent_prefix="plb", nesting_level=2, scope_key="project_id"):
         self.IM, self.AIM, self.intent_prefix, self.nesting_level, self.scope_key = IM, AIM, intent_prefix, nesting_level, scope_key
         p = self.intent_prefix
-        IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change], f"{p}_node_pool_preview": [self._im_node_pool_preview], f"{p}_preflight": [self._im_preflight]})
+        IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change], f"{p}_node_pool_preview": [self._im_node_pool_preview], f"{p}_preflight": [self._im_preflight], f"{p}_view_subjob": [self._im_view_subjob]})
 
     _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") == "image" else ["ollama"], "knowledge": lambda cfg: ["lightrag"], "branch": lambda cfg: ["ollama"] if cfg.get("decide_mode") == "llm" else []}
     _NODE_RECURSES = {"pipeline", "pipeline_foreach", "branch"}  # branch is both: may need ollama itself AND recurses into routes_json targets
@@ -89,14 +89,23 @@ class PipelineBuilderUI:
                        <details class="status-details"><summary>Node status (<span id="pl-nodecount-{pl_id}">{len(nodes)}</span>)</summary><table class="data-table" id="pl-nodetable-{pl_id}">{rows}</table></details>
                    </div>"""
 
-    def _node_status_row(self, n, pl=None) -> str:
+    def _node_status_row(self, n) -> str:
         col = {"done":"#00ffa2","error":"#ff5f5f","running":"#ffcc00","unreached":"var(--text_muted)"}.get(n.get("status","idle"), "var(--text)")
-        preview = n.get("message") or " | ".join(str(v) for v in (n.get("preview") or {}).values())
-        conn_cell = ""
-        if pl is not None:
-            ok, detail = self._node_conn_ok(pl, n)
-            conn_cell = f'<td style="color:{"#00ffa2" if ok else "#ff5f5f"};text-align:center" title="{UI.escape(detail)}">{"&#x2713;" if ok else "&#x2715;"}</td>'
-        return f"""<tr><td class="qn">{UI.escape(n.get("name") or n["id"])}</td><td class="dim">{UI.escape(n.get("type",""))}</td><td style="color:{col}">{UI.escape(n.get("status","idle"))}</td>{conn_cell}<td class="dim status-preview">{UI.escape(preview)}</td></tr>"""
+        preview_dict = n.get("preview") or {}
+        sub_job_id = preview_dict.get("_sub_job_id", "")
+        preview = n.get("message") or " | ".join(str(v) for k, v in preview_dict.items() if not k.startswith("_sub_job"))
+        subjob_btn = f"""<button class="cm-qbtn" style="font-size:.62rem;padding:.05rem .3rem;margin-left:.3rem" {self._post("view_subjob", job_id=sub_job_id)}>view sub-run</button>""" if sub_job_id else ""
+        return f"""<tr><td class="qn">{UI.escape(n.get("name") or n["id"])}</td><td class="dim">{UI.escape(n.get("type",""))}</td><td style="color:{col}">{UI.escape(n.get("status","idle"))}</td><td class="dim status-preview">{UI.escape(preview)}{subjob_btn}</td></tr>"""
+
+    async def _im_view_subjob(self, request, payload, imr):
+        job = self.AIM.engine.load_job(payload.get("job_id",""))
+        if not job:
+            imr.oob('<div class="err-box">Sub-job not found - it may not have started yet, or is a job record that predates this feature.</div>', f"pl-editor-modal-{self.intent_prefix}")
+            return imr
+        rows = "".join(self._node_status_row(n) for n in job.get("flow",{}).get("nodes",[]))
+        body = f'<div style="font-size:.75rem;margin-bottom:.4rem">Sub-pipeline job <code>{payload.get("job_id","")}</code> - status: <b>{job.get("status","?")}</b></div><table class="data-table">{rows}</table>'
+        imr.oob(UI.modal(f"subjob-{payload.get('job_id','')}", "Sub-pipeline Status", body, width="90%", max_width="50rem"), f"pl-editor-modal-{self.intent_prefix}")
+        return imr
 
     def panel_html(self, scope_id: str, include_modal_slot: bool = True) -> str:
         p = self.intent_prefix
