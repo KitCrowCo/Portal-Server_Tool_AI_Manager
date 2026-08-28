@@ -70,7 +70,7 @@ class PipelineBuilderUI:
         nodes = (last_job["flow"]["nodes"] if last_job else pl.get("flow",{}).get("nodes",[]))
         pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
         preflight = self._preflight_pipeline(pl)
-        gaps = [r["name"] for r in preflight if not r["ok"] and not r["recurses"]]
+        gaps = [r["name"] for r in preflight if not r["ok"] and not r.get("recurses")]
         badge_color = "#ff5f5f" if gaps else "#00ffa2"
         badge_text = f"{len(gaps)} node(s) unresolved" if gaps else "all nodes resolved"
         pool_badge = f'<span class="status-badge" style="color:{badge_color}" title="{UI.escape(", ".join(gaps))}">{pool.get("priority","balanced")} - {badge_text}</span>'
@@ -416,7 +416,7 @@ class PipelineBuilderUI:
                 sub_pl = self.AIM.engine.load_pipeline(cid)
                 if not sub_pl: sub_pipelines.append({"id": cid, "name": None, "rows": []}); continue
                 sub_pipelines.append({"id": cid, "name": sub_pl.get("name", cid), "rows": self._preflight_pipeline(sub_pl, _visited)})
-            rows.append({"id": n["id"], "name": n.get("name") or n["id"], "type": n.get("type",""), "needs": needs, "sub_pipelines": sub_pipelines, "ok": all(v[0] in ("pinned_ok","pool_ok") for v in needs.values()) and all(all(r["ok"] for r in sp["rows"]) for sp in sub_pipelines if sp["name"])})
+            rows.append({"id": n["id"], "name": n.get("name") or n["id"], "type": n.get("type",""), "needs": needs, "sub_pipelines": sub_pipelines, "recurses": n.get("type","") in self._NODE_RECURSES, "ok": all(v[0] in ("pinned_ok","pool_ok") for v in needs.values()) and all(all(r["ok"] for r in sp["rows"]) for sp in sub_pipelines if sp["name"])})
         return rows
 
     def _preflight_html(self, pl, depth: int = 0) -> str:
@@ -499,11 +499,9 @@ async def prompt_blocks_delete(block_id: str): _PB.delete(block_id); return JSON
 @router.get("/", response_class=HTMLResponse)
 @router.get("/chat", response_class=HTMLResponse)
 async def chat_page(request: Request):
-    """
-    Raw engine + WS wire-level debug harness - not a chat UI.
+    """Raw engine + WS wire-level debug harness - not a chat UI.
     Deliberately bypasses IM/im-in and ChatManager so failures are visible at the protocol level (raw POST payload, raw job_id, raw WS event stream) instead of hidden behind abstraction.
-    Real chat surfaces (Athena, Tessa) use ChatManager.
-    """
+    Real chat surfaces (Athena, Tessa) use ChatManager."""
     conns = connections.list_conns()
     conn_opts = "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in conns)
     kg_opts = '<option value="">(no knowledge base)</option>' + "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in connections.list_conns(conn_type="lightrag"))

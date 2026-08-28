@@ -45,7 +45,7 @@ class NodeContext:
         return self.resolve(template)
 
     async def progress(self, message): await ENV["push_to_client"](self.username, {"t":"pipeline_event","job_id":self.job_id,"event":"running","payload":{"node":self.node.id,"message":message}})
-    async def stream(self, key, delta): await ENV["push_to_client"](self.username, {"t":"pipeline_stream","job_id":self.job_id,"key":key,"delta":delta})
+    async def stream(self, key, delta): await ENV["push_to_client"](self.username, {"t":"pipeline_stream","job_id":self.job_id,"node":self.node.id,"key":key,"delta":delta})
 
 # --- generate: any AI generation call - text or image, picked by modality ---
 
@@ -266,7 +266,6 @@ async def node_branch(config: dict, data: dict, ctx: NodeContext) -> dict:
     sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1, job_id=sub_job_id)
     return {**{k: sub_data.get(k, "") for k in export_keys}, "decision": decision, "_sub_job_id": sub_job_id}
 
-
 def looks_like_embedding(model_name: str) -> bool: return any(p in model_name.lower() for p in _EMBED_PATTERNS)
 
 def pick_default_chat_model(models: list) -> str:
@@ -321,7 +320,7 @@ def register_builtins():
         BI.SettingField("num_ctx","Context Window Tokens","number",default=16384,step=1),
         BI.SettingField("num_ctx_max","Context Window Max (range mode only)","number",default=None,step=1,advanced=True),
         BI.SettingField("num_predict","Max Output Tokens","number",default=-1,step=1),
-        BI.SettingField("think","Enable Thinking Mode","checkbox",default=False),
+        BI.SettingField("think","Thinking Effort","select",default="medium", options=[("","Off"),("low","Low"),("medium","Medium"),("high","High")]),
         BI.SettingField("enforce_options","Enforced Options (comma-sep)","text",advanced=True),
         BI.SettingField("seed","Seed (blank/-1 = random)","number",default=None,advanced=True,step=1),
         BI.SettingField("width","Width (image)","number",default=1024,step=1,advanced=True),

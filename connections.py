@@ -130,7 +130,7 @@ def _get_nested_value(data, path: str):
         if data is None: return ""
     return data
 
-async def stream_llm(conn: dict, messages: list, model: str, think: bool = False, **kwargs):
+async def stream_llm(conn: dict, messages: list, model: str, think = False, **kwargs):
     """Agnostic chat stream. Yields (text, thinking) tuples per chunk - thinking is "" for providers/calls that don't produce it.
     think=True is honored only if the connection's profile declares supports_thinking;
     otherwise it's silently dropped with a console warning, never an error - a provider lacking a capability is a gap in that provider, not a reason to remove the capability for providers that have it."""
@@ -138,9 +138,9 @@ async def stream_llm(conn: dict, messages: list, model: str, think: bool = False
     chat_ep = profile.get("endpoints", {}).get("chat", {})
     if not chat_ep: raise RuntimeError(f"stream_llm: connection_type '{conn.get('connection_type')}' has no endpoints.chat")
     supports_thinking = profile.get("supports_thinking", False)
-    if think and not supports_thinking: print(f"[stream_llm] '{conn.get('connection_type')}' has no supports_thinking - think=True ignored for this call")
+    if think and not supports_thinking: print(f"[stream_llm] '{conn.get('connection_type')}' has no supports_thinking - think={think!r} ignored for this call")
     options = _resolved_options(profile, kwargs)
-    payload = _render_template(chat_ep.get("body", {}), {"model": model, "messages": messages, "think": think and supports_thinking, "options": options, **options})
+    payload = _render_template(chat_ep.get("body", {}), {"model": model, "messages": messages, "think": (think if supports_thinking else False), "options": options, **options})
     url = _base(conn) + chat_ep.get("path", "/api/chat")
     headers = {}
     api_key = conn.get("values", {}).get("api_key", "")
