@@ -312,7 +312,7 @@ class PipelineBuilderUI:
         else: flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "name": payload.get("name","").strip(), "type": ntype, "config": config, "key_map": key_map, "extra_in_keys": extra_in, "extra_out_keys": extra_out, "status": "idle"})
         self.AIM.engine.save_pipeline(pl)
         imr.oob(self._editor_html(payload.get("scope",""), pl), f"pl-editor-modal-{self.intent_prefix}")
-        imr.oob("".join(self._node_status_row(n, pl) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
+        imr.oob("".join(self._node_status_row(n) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
         imr.oob("".join(self._card_html(payload.get("scope",""), p_) for p_ in self._pipelines(payload.get("scope",""))) or '<div class="list-empty">No pipelines.</div>', f"pl-list-{self.intent_prefix}")
         return imr
 
@@ -323,7 +323,7 @@ class PipelineBuilderUI:
         flow["nodes"] = [n for n in flow["nodes"] if n["id"] != payload.get("nid","")]
         self.AIM.engine.save_pipeline(pl)
         imr.oob(self._editor_html(payload.get("scope",""), pl), f"pl-editor-modal-{self.intent_prefix}")
-        imr.oob("".join(self._node_status_row(n, pl) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
+        imr.oob("".join(self._node_status_row(n) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
         return imr
 
     async def _im_rename(self, request, payload, imr):
@@ -338,7 +338,7 @@ class PipelineBuilderUI:
         pl = self.AIM.engine.load_pipeline(pl_id)
         if not err and pl: pl["last_job_id"] = job_id; self.AIM.engine.save_pipeline(pl)
         imr.oob(self._status_block(scope_id, pl_id, job), f"pl-status-{pl_id}")
-        imr.oob("".join(self._node_status_row(n, pl) for n in (job["flow"]["nodes"] if job else [])), f"pl-nodetable-{pl_id}")
+        imr.oob("".join(self._node_status_row(n) for n in (job["flow"]["nodes"] if job else [])), f"pl-nodetable-{pl_id}")
         return imr
 
     async def _im_status(self, request, payload, imr):
@@ -347,7 +347,7 @@ class PipelineBuilderUI:
         job = self.AIM.engine.load_job(pl.get("last_job_id","")) if pl and pl.get("last_job_id") else None
         imr.oob(self._status_block(payload.get("scope",""), pl_id, job), f"pl-status-{pl_id}")
         nodes = job["flow"]["nodes"] if job else (pl.get("flow",{}).get("nodes",[]) if pl else [])
-        imr.oob("".join(self._node_status_row(n, pl) for n in nodes), f"pl-nodetable-{pl_id}")
+        imr.oob("".join(self._node_status_row(n) for n in nodes), f"pl-nodetable-{pl_id}")
         return imr    
 
     async def _im_resume(self, request, payload, imr):
@@ -605,7 +605,7 @@ async def import_pipeline(request: Request):
 async def shadow_selftest(request: Request):
     """Proves ShadowStore stage/diff/accept/reject/rollback independent of git or any AI call.
     Writes into a scratch folder under data/ai_manager/_selftest so it never touches real project files."""
-    shadow = BI.ShadowStore(fm, root / "_shadow")
+    shadow = BI.ShadowStore(FM, TOOL_ROOT / "_shadow")
     FM.write("note.txt", "original line one\noriginal line two\n")
     entry = shadow.stage("note.txt", "original line one\nCHANGED line two\nnew line three\n", author="selftest")
     diff_before_accept = shadow.diff("note.txt")
