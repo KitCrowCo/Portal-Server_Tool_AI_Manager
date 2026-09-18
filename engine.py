@@ -20,7 +20,41 @@ _ACTIVE: dict = {}
 logger = logging.getLogger("ai_manager.engine")
 
 DEFAULT_POOL = {"whitelist_tags": [], "blacklist_tags": [], "whitelist_cnodes": [], "blacklist_cnodes": [], "priority": "balanced"}
+_SELF_HEAL_SYSTEM = """You are diagnosing why one deterministic pipeline step failed, given its type, its own configuration, the error it raised, and the actual input it received.
+You may ONLY propose changed values for keys already present in its configuration - never new keys, never code, never anything about other nodes or the pipeline structure, never a change to the input data itself.
+Respond with JSON: {"diagnosis": "one or two sentences", "config_patch": {...} or null}.
+Return config_patch: null if no config value can fix this - e.g. the step's own code/script needs to change, or the input itself is the actual problem."""
 
+async def _attempt_self_heal(n, spec, data, job_id, username, pool_cfg, depth, exc):
+    if n.config.get("_heal_attempted"): return None
+    from tools.ai_manager import resources, connections
+    picked = resources.pick_conn(resources.resolve_candidates(pool_cfg, [], "ollama"), "ollama", pool_cfg.get("priority", "balanced"))
+    if not picked: return None
+    _, conn = picked
+    keys_seen = spec.get("in_keys", []) + n.extra_in_keys
+    snapshot = {k: str(data.get(k, ""))[:800] for k in keys_seen}
+    prompt = json.dumps({"node_type": n.type, "config": n.config, "error": str(exc), "input_snapshot": snapshot}, indent=2)
+    full = ""
+    try:
+        async for text, _think in connections.stream_llm(conn, [{"role":"system","content":_SELF_HEAL_SYSTEM}, {"role":"user","content":prompt}], "", temperature=0.1, num_predict=500):
+            full += text
+    except Exception: return None
+
+    bi = ENV["tools"]["built_ins"]
+    log_root = Path("./data/_common/_self_heal_log")
+    shadow = bi.ShadowStore(bi.FileManager(log_root), log_root / "_shadow")  # default auto_accept=False - every attempt needs a human look, success or failure
+    shadow.stage(f"{job_id}_{n.id}.md", f"# Self-heal: {n.name or n.id} ({n.type})\n\nJob: {job_id}\n\n## Error\n```\n{exc}\n```\n\n## Original config\n```json\n{json.dumps(n.config, indent=2)}\n```\n\n## Model diagnosis\n```\n{full}\n```\n", author="self_heal")
+
+    try: parsed = json.loads(re.search(r'\{.*\}', full, re.S).group(0))
+    except Exception: return None
+    patch = parsed.get("config_patch")
+    if not patch or not isinstance(patch, dict) or "script_body" in patch or "script_path" in patch:
+        return None  # no usable patch, or the fix needs code - either way, stop here, human decides
+    patched_config = {**n.config, **patch, "_heal_attempted": True}
+    ctx = NodeContext(FlowNode({**n.to_dict(), "config": patched_config}), data, job_id, username, pool_cfg, depth)
+    try: return await spec["fn"](patched_config, data, ctx)
+        
+    except Exception: return None
 # --- Pipeline definitions ---
 
 def _pdp(pid: str) -> Path: return PIPE_DIR / f"{Path(pid).name}.json"
@@ -88,14 +122,17 @@ async def _run_flow(flow: dict, data: dict, job_id: str, username: str, pool_cfg
             try:
                 ctx = NodeContext(n, data, job_id, username, pool_cfg, depth)
                 result = await spec["fn"](n.config, data, ctx)
-                for logical, val in (result or {}).items(): data[n.out_key(logical)] = val
-                preview = {k: str(v)[:500] for k, v in (result or {}).items()}
-                await _set_node_status(job_id, username, n.id, "done", {"preview": preview, "elapsed_s": round(time.time()-t0, 2)})
-                return n.id
+                # for logical, val in (result or {}).items(): data[n.out_key(logical)] = val
+                # preview = {k: str(v)[:500] for k, v in (result or {}).items()}
+                # await _set_node_status(job_id, username, n.id, "done", {"preview": preview, "elapsed_s": round(time.time()-t0, 2)})
+                # return n.id
             except Exception as e:
-                traceback.print_exc()
-                await _set_node_status(job_id, username, n.id, "error", {"message": str(e)})
-                raise
+                if n.config.get("on_error") == "escalate": result = await _attempt_self_heal(n, spec, data, job_id, username, pool_cfg, depth, e)
+                else: result = None
+                if result is None:
+                    traceback.print_exc()
+                    await _set_node_status(job_id, username, n.id, "error", {"message": str(e)})
+                    raise
 
         try:
             finished = await asyncio.gather(*[run_one(n, spec) for n, spec in ready])

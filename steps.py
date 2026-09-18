@@ -21,6 +21,39 @@ def register_node_type(name, fn, label="", in_keys=None, out_keys=None, config_s
 def get_node_type(name: str) -> dict: return _NODE_TYPES.get(name)
 def list_node_types() -> list: return [{"type": k, **{kk: vv for kk, vv in v.items() if kk != "fn"}} for k, v in _NODE_TYPES.items()]
 
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+_FORCED_CUT_MARK = "[...chunk split - no sentence boundary found, cut forced here...]"
+
+def _pack(units: list, target: int, overlap: int = 0) -> list:
+    chunks, cur = [], ""
+    for u in units:
+        if cur and len(cur) + len(u) + 1 > target:
+            chunks.append(cur)
+            cur = (cur[-overlap:] + " " + u) if overlap else u
+        else:
+            cur = f"{cur} {u}" if cur else u
+    if cur: chunks.append(cur)
+    return chunks
+
+def _hard_split(text: str, target: int) -> list:
+    """Last-resort character split for a run-on with no usable punctuation at all - marks every forced cut so a downstream reader (human or LLM) can see a guess was forced, rather than trusting what looks like a clean break but isn't one."""
+    out = []
+    for i in range(0, len(text), target):
+        piece = text[i:i+target]
+        out.append(piece + (f" {_FORCED_CUT_MARK}" if i + target < len(text) else ""))
+    return out
+
+def _chunk_paragraphs(text: str, target_chars: int, overlap_chars: int = 0, hard_split_ratio: float = 2.0) -> list:
+    """Tries paragraph boundaries first, falls back to sentence boundaries for an oversized paragraph, and only hard-splits (marked, not silent) when a single run-on still exceeds target_chars * hard_split_ratio with no punctuation to split on at all.
+    This is deliberately NOT a rule that guarantees clean breaks - raw notes have too many edge cases for that to be worth hand-coding; the goal is graceful degradation with a visible flag, not silent failure."""
+    segments = []
+    for p in (p for p in text.split("\n\n") if p.strip()):
+        if len(p) <= target_chars:
+            segments.append(p); continue
+        for seg in _pack(_SENTENCE_SPLIT_RE.split(p), target_chars):
+            segments.extend(_hard_split(seg, target_chars) if len(seg) > target_chars * hard_split_ratio else [seg])
+    return _pack(segments, target_chars, overlap_chars)
+
 class NodeContext:
     """Wraps one node's own key_map so a type's implementation only ever deals in its own logical names, never in actual pipeline key strings - the same function works unmodified no matter what keys a pipeline instance wires it to."""
     def __init__(self, node, data, job_id, username, pool_cfg, depth=0):
@@ -137,6 +170,12 @@ async def node_transform(config: dict, data: dict, ctx: NodeContext) -> dict:
             for i, g in enumerate(m.groups() or []): r = r.replace(f"{{{i}}}", g or "")
             return r
         return {"value": re.sub(config.get("pattern",""), _sub, source, count=(0 if config.get("replace_mode","all")=="all" else 1))}
+    if mode == "chunk":
+        text = ctx.get("input")
+        target = int(config.get("chunk_chars", 4000) or 4000)
+        overlap = int(config.get("overlap_chars", 0) or 0)
+        chunks = _chunk_paragraphs(text, target, overlap)
+        return {"chunks": chunks, "count": len(chunks)}
     if mode == "python":
         if config.get("script_body"):
             tmp = Path(f"./data/ai_manager/_scratch_scripts/{ctx.job_id}_{ctx.node.id}.py")
@@ -172,7 +211,7 @@ async def node_file_write(config: dict, data: dict, ctx: NodeContext) -> dict:
     bi = ENV["tools"]["built_ins"]
     fm_root = config.get("fm_root") or "./data/_common"
     fm = bi.FileManager(fm_root)
-    shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(fm_root) / "_shadow"))
+    shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(fm_root) / "_shadow"), auto_accept=bool(config.get("auto_accept")))
     path = ctx.resolve(config.get("path") or "")
     if not path.strip(): raise RuntimeError("file_write: resolved path is empty")
     content = ctx.get("content")
@@ -246,6 +285,31 @@ async def node_pipeline_foreach(config: dict, data: dict, ctx: NodeContext) -> d
         results.append({k: sub_data.get(k, "") for k in export_keys})
         sub_job_ids.append(sub_job_id)
     return {"results": results, "count": len(results), "_sub_job_ids": sub_job_ids}
+
+async def node_pipeline_reduce(config: dict, data: dict, ctx: NodeContext) -> dict:
+    """Like pipeline_foreach but SEQUENTIAL: threads an accumulator value through each item in order, so the sub-pipeline can build on its own prior output as it goes (a running summary, a running edited document).
+    pipeline_foreach's per-item calls are independent and cannot see each other's results - use this instead whenever the processing order matters."""
+    items = ctx.get("items")
+    if isinstance(items, str):
+        try: items = json.loads(items)
+        except Exception: items = [x.strip() for x in items.split("\n") if x.strip()]
+    if not isinstance(items, list) or not items: raise RuntimeError("pipeline_reduce: items resolved to an empty list")
+    pid = config.get("pipeline_id","")
+    if not pid: raise RuntimeError("pipeline_reduce: no pipeline selected")
+    item_key = config.get("item_key","item")
+    acc_key = config.get("accumulator_key","accumulator")
+    acc_export_key = config.get("accumulator_export_key") or acc_key
+    import_keys = [k.strip() for k in str(config.get("import_keys","")).split(",") if k.strip()]
+    accumulator = ctx.get("accumulator")
+    sub_job_ids = []
+    for i, item in enumerate(items):
+        await ctx.progress(f"item {i+1}/{len(items)}")
+        sub_inputs = {item_key: item, acc_key: accumulator, **{k: data.get(k, "") for k in import_keys}}
+        sub_job_id = f"job_{uuid.uuid4().hex[:10]}"
+        sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1, job_id=sub_job_id)
+        accumulator = sub_data.get(acc_export_key, accumulator)
+        sub_job_ids.append(sub_job_id)
+    return {"accumulator": accumulator, "count": len(items), "_sub_job_ids": sub_job_ids}
 
 async def node_branch(config: dict, data: dict, ctx: NodeContext) -> dict:
     """Decides a value (expression or LLM), looks it up in Routes, and calls whichever sub-pipeline matches."""
@@ -327,11 +391,10 @@ def register_builtins():
         BI.SettingField("height","Height (image)","number",default=1024,step=1,advanced=True),
         BI.SettingField("steps","Steps (image)","number",default=4,step=1,advanced=True),
         BI.SettingField("cfg","Guidance Scale (image)","number",default=1.0,advanced=True),
-        *_pool_fields(), _key_map_field()],
-        guide="One universal generation node - text or image, picked by Modality. With no connection pinned, resolves one from this node's resource pool (pipeline pool intersected with this node's own tags) using Priority.")
+        *_pool_fields(), _key_map_field()], guide="One universal generation node - text or image, picked by Modality. With no connection pinned, resolves one from this node's resource pool (pipeline pool intersected with this node's own tags) using Priority.")
 
     register_node_type("transform", node_transform, "Transform (deterministic)", in_keys=["input"], out_keys=["value"], config_schema=[
-        BI.SettingField("mode","Mode","select",default="template", options=[("template","Template fill"),("expr","Python expression"),("regex_find","Regex find"),("regex_replace","Regex replace"),("python","Inline script")]),
+        BI.SettingField("mode", "Mode", "select", default="template", options=[("template","Template fill"), ("expr","Python expression"), ("chunk","Chunk (paragraph-safe split)"), ("regex_find","Regex find"), ("regex_replace","Regex replace"),("python","Inline script")]),
         BI.SettingField("template","Template","textarea",default="{input}"),
         BI.SettingField("expr","Expression","text",default="input",advanced=True),
         BI.SettingField("vars_json","Variables (JSON)","json",default={},advanced=True),
@@ -342,27 +405,29 @@ def register_builtins():
         BI.SettingField("script_body","Inline Script Body","textarea",advanced=True),
         BI.SettingField("script_path","Script File (instead of inline)","file_picker",advanced=True),
         BI.SettingField("timeout_s","Timeout (s)","number",default=600,step=1,advanced=True),
-        _key_map_field()],
-        guide="One deterministic node covering template-fill, a sandboxed Python expression, regex search/replace, or a full inline/file script. No AI call, no resource pool.")
+        BI.SettingField("chunk_chars","Chunk Target Size (chars)","number",default=4000,step=1,advanced=True),
+        BI.SettingField("overlap_chars","Chunk Overlap (chars, carried into next chunk)","number",default=0,step=1,advanced=True),
+        BI.SettingField("hard_split_ratio", "Hard-split threshold (x target size)", "number", default=2.0, advanced=True),
+        _key_map_field()], guide="One deterministic node covering template-fill, a sandboxed Python expression, regex search/replace, or a full inline/file script. No AI call, no resource pool.")
 
     register_node_type("file_read", node_file_read, "File Read", in_keys=["path"], out_keys=["text"], config_schema=[
         BI.SettingField("path","Path Override","text",advanced=True, hint="Leave blank to read the resolved 'path' in-key instead."),
-        BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common"), _key_map_field()],
-        guide="Reads a file's text content.")
+        BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common"),
+        _key_map_field()], guide="Reads a file's text content.")
 
     register_node_type("file_write", node_file_write, "File Write (shadow-staged)", in_keys=["path","content"], out_keys=["path","status"], config_schema=[
         BI.SettingField("path","Destination Path Template","text", hint="Supports {key} against real pipeline keys, e.g. articles/{slug}.md."),
         BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common"),
         BI.SettingField("binary","Binary Content","checkbox",default=False,advanced=True, hint="Content in-key holds raw bytes or a source file path rather than text."),
         BI.SettingField("allow_empty","Allow Empty Content","checkbox",default=False,advanced=True),
+        BI.SettingField("auto_accept","Auto-accept (skip review)","checkbox",default=False,advanced=True,hint="Writes and immediately accepts into the real file, with full rollback history still kept. Use only for files this pipeline itself owns and manages - never for the user's own source content."),
         BI.SettingField("source_root","Source Root (binary content, when content is a filename)","file_picker",default=".",advanced=True),
-        _key_map_field()],
-        guide="Never writes directly - always through Shadow Stage (accept/reject before it touches the real file).")
+        _key_map_field()], guide="Never writes directly - always through Shadow Stage (accept/reject before it touches the real file).")
 
     register_node_type("file_list", node_file_list, "File List", in_keys=[], out_keys=["files"], config_schema=[
         BI.SettingField("root","Target Directory","text",default="./data/ai_tools/_knowledge"),
-        BI.SettingField("extensions","Extensions (comma-sep)","text",advanced=True), _key_map_field()],
-        guide="Lists relative file paths under a directory. No dependencies - runs as soon as the pipeline starts.")
+        BI.SettingField("extensions","Extensions (comma-sep)","text", advanced=True),
+        _key_map_field()], guide="Lists relative file paths under a directory. No dependencies - runs as soon as the pipeline starts.")
 
     register_node_type("knowledge", node_knowledge, "Knowledge (query / insert / entities)", in_keys=["input"], out_keys=["response","raw"], config_schema=[
         BI.SettingField("mode","Mode","select",default="query",options=[("query","Query"),("insert","Insert Text"),("entities","List Entities")]),
@@ -370,23 +435,29 @@ def register_builtins():
         BI.SettingField("query_mode","Search Mode","select",default="hybrid",options=[("hybrid","Hybrid"),("local","Local"),("global","Global"),("naive","Naive"),("mix","Mix")]),
         BI.SettingField("text_template","Insert Text Template","textarea",advanced=True),
         BI.SettingField("source_label","Insert Source Label","text",advanced=True),
-        BI.SettingField("limit","Entity Limit","number",default=500,step=1,advanced=True),
-        *_pool_fields(include_model=False, conn_type="lightrag"), _key_map_field()],
-        guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.")
+        BI.SettingField("limit","Entity Limit","number", default=500,step=1,advanced=True),
+        *_pool_fields(include_model=False, conn_type="lightrag"), _key_map_field()], guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.")
 
     register_node_type("pipeline", node_pipeline, "Call Pipeline", in_keys=[], out_keys=[], config_schema=[
         BI.SettingField("pipeline_id","Pipeline","select", options=_pipeline_options),
         BI.SettingField("import_keys","Import Keys (comma-sep, actual names)","text", hint="Which of THIS pipeline's keys to seed the sub-pipeline with, under the same names. Also add these to Extra In Keys below so the scheduler waits for them."),
         BI.SettingField("export_keys","Export Keys (comma-sep, actual names)","text"),
-        _key_map_field()],
-        guide="Runs another saved pipeline to completion inline. import_keys/export_keys are the only channel between parent and sub-pipeline data objects.")
+        _key_map_field()], guide="Runs another saved pipeline to completion inline. import_keys/export_keys are the only channel between parent and sub-pipeline data objects.")
 
     register_node_type("pipeline_foreach", node_pipeline_foreach, "For Each Item, Call Pipeline", in_keys=["items"], out_keys=["results","count"], config_schema=[
         BI.SettingField("pipeline_id","Pipeline","select", options=_pipeline_options),
         BI.SettingField("item_key","Item Key (sub-pipeline name for one item)","text",default="item"),
         BI.SettingField("import_keys","Import Keys (comma-sep, actual names)","text",advanced=True),
-        BI.SettingField("export_keys","Export Keys (comma-sep, actual names)","text"), _key_map_field()],
-        guide="Runs the sub-pipeline once per item in 'items', sequentially, collecting each run's export_keys into 'results'.")
+        BI.SettingField("export_keys","Export Keys (comma-sep, actual names)","text"),
+        _key_map_field()], guide="Runs the sub-pipeline once per item in 'items', sequentially, collecting each run's export_keys into 'results'.")
+
+    register_node_type("pipeline_reduce", node_pipeline_reduce, "For Each Item, Call Pipeline (Sequential Fold)", in_keys=["items","accumulator"], out_keys=["accumulator"], config_schema=[
+        BI.SettingField("pipeline_id","Pipeline","select", options=_pipeline_options),
+        BI.SettingField("item_key","Item Key (sub-pipeline name for one item)","text",default="item"),
+        BI.SettingField("accumulator_key","Accumulator Key (sub-pipeline name for the running value)","text",default="accumulator"),
+        BI.SettingField("accumulator_export_key","Sub-pipeline's Export Key for the Updated Accumulator","text",default="",advanced=True,hint="Leave blank to reuse Accumulator Key."),
+        BI.SettingField("import_keys","Import Keys (comma-sep, actual names, constant across every iteration)","text",advanced=True),
+        _key_map_field()], guide="Like For Each Item but SEQUENTIAL: each call sees the previous call's updated accumulator, so the sub-pipeline builds on its own output as it works through the list in order. Use For Each instead when items are independent.")
 
     register_node_type("branch", node_branch, "Branch (decide + call one pipeline)", in_keys=["input"], out_keys=["decision"], config_schema=[
         BI.SettingField("decide_mode","Decide Using","select",default="expr",options=[("expr","Python expression"),("llm","LLM (enforced options)")]),
@@ -398,5 +469,4 @@ def register_builtins():
         BI.SettingField("import_keys","Import Keys (comma-sep)","text"),
         BI.SettingField("export_keys","Export Keys (comma-sep)","text"),
         BI.SettingField("vars_json","Variables (JSON: name -> template)","json",default={},advanced=True),
-        *_pool_fields(), _key_map_field()],
-        guide="Decides a value, looks it up in Routes, calls whichever sub-pipeline matches (falling back to Default Pipeline ID). Only the chosen path actually runs.")
+        *_pool_fields(), _key_map_field()], guide="Decides a value, looks it up in Routes, calls whichever sub-pipeline matches (falling back to Default Pipeline ID). Only the chosen path actually runs.")

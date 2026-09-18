@@ -27,10 +27,58 @@ FM = globals().get("FM", None)
 _PB = globals().get("_PB", None)
 IM = globals().get("IM", None)
 _NAMED_ROOTS = {"common": "./data/_common"}
+RUNNER_DIR = Path("./data/ai_manager/_runners")
+_RUNNER_TASKS: dict = {}
 
 def register_root(name: str, path: str): _NAMED_ROOTS[name] = path
 def resolve_root(name: str) -> str: return _NAMED_ROOTS.get(name, name)
 def list_roots() -> list: return list(_NAMED_ROOTS.items())
+
+# --- Repeating Pipeline Runner ---
+# General "run this saved pipeline N times, unattended, stoppable between passes" wrapper - not specific to any one pipeline.
+# Survives restarts: a runner left "running" resumes on startup, same reconcile pattern engine.py already uses for interrupted jobs.
+
+def _runner_path(rid): return RUNNER_DIR / f"{Path(rid).name}.json"
+def load_runner(rid): p = _runner_path(rid); return json.loads(p.read_text()) if p.exists() else None
+def save_runner(doc): RUNNER_DIR.mkdir(parents=True, exist_ok=True); _runner_path(doc["id"]).write_text(json.dumps(doc, indent=2))
+def list_runners(): return [json.loads(f.read_text()) for f in sorted(RUNNER_DIR.glob("*.json"))]
+def new_runner(pipeline_id, name, max_runs=20, delay_s=30, username="") -> dict: return {"id": f"run_{uuid.uuid4().hex[:10]}", "pipeline_id": pipeline_id, "name": name, "username": username, "max_runs": max_runs, "runs_done": 0, "delay_s": delay_s, "status": "stopped", "last_job_id": "", "log": []}
+
+async def _runner_loop(rid: str):
+    while True:
+        doc = load_runner(rid)
+        if not doc or doc["status"] != "running": return
+        if doc["runs_done"] >= doc["max_runs"]: doc["status"] = "done"; save_runner(doc); return
+        job_id, err = engine.submit(doc["username"], kind="id", pipeline_id=doc["pipeline_id"], inputs={"trigger": "go"})
+        if err: doc["status"] = "error"; doc.setdefault("log", []).append(f"submit failed: {err}"); save_runner(doc); return
+        doc["last_job_id"] = job_id; save_runner(doc)
+        while True:
+            await asyncio.sleep(2)
+            job = engine.load_job(job_id)
+            if not job or job["status"] in ("done","error","stopped","interrupted"): break
+        doc = load_runner(rid)  # reload - stop may have been requested while the pass was running
+        if not doc or doc["status"] != "running": return
+        doc["runs_done"] += 1
+        doc.setdefault("log", []).append(f"pass {doc['runs_done']}/{doc['max_runs']}: {job['status'] if job else 'lost'}")
+        doc["log"] = doc["log"][-50:]
+        save_runner(doc)
+        if job and job["status"] == "error": doc["status"] = "error"; save_runner(doc); return  # a bad pass stops the runner rather than silently repeating a broken state onto disk
+        await asyncio.sleep(doc["delay_s"])
+
+def start_runner(rid: str):
+    doc = load_runner(rid)
+    if not doc: return
+    doc["status"] = "running"; save_runner(doc)
+    _RUNNER_TASKS[rid] = asyncio.create_task(_runner_loop(rid))
+
+def stop_runner(rid: str):
+    doc = load_runner(rid)
+    if doc: doc["status"] = "stopped"; save_runner(doc)
+    if doc and doc.get("last_job_id"): engine.stop(doc["last_job_id"])
+
+def _resume_runners_on_startup():
+    for doc in list_runners():
+        if doc["status"] == "running": start_runner(doc["id"])
 
 def init_module(env: dict):
     global ENV, UI, BI, FM, _PB, IM
@@ -45,6 +93,7 @@ def init_module(env: dict):
     steps.register_builtins()
     IM.scripts.update({"cnode_save": [_im_cnode_save], "cnode_delete": [_im_cnode_delete], "cnode_edit_form": [_im_cnode_edit_form], "resources_open": [_im_resources_open]})
     print(f"[ai_manager] ready | node types: {[t['type'] for t in steps.list_node_types()]}")
+    _resume_runners_on_startup()
 
 def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
 def prompt_block_picker_fragment(textarea_id: str) -> str: return BI.prompt_block_picker_html(_PB, textarea_id, f"{_P}/prompt_blocks/save")
@@ -491,6 +540,33 @@ async def prompt_blocks_list(): return JSONResponse(_PB.list())
 
 @router.delete("/prompt_blocks/{block_id}", response_class=JSONResponse)
 async def prompt_blocks_delete(block_id: str): _PB.delete(block_id); return JSONResponse({"status": "ok"})
+
+@router.get("/refiner", response_class=HTMLResponse)
+async def refiner_list(request: Request):
+    rows = "".join(f"""<tr><td>{r['id']}</td><td>{UI.escape(r['name'])}</td><td>{r['status']}</td><td>{r['runs_done']}/{r['max_runs']}</td>
+                            <td><button class="ui-btn" onclick="fetch('{_P}/refiner/{r['id']}/start',{{method:'POST'}}).then(()=>location.reload())">Start</button>
+                                <button class="ui-btn" onclick="fetch('{_P}/refiner/{r['id']}/stop',{{method:'POST'}}).then(()=>location.reload())">Stop</button></td></tr>""" for r in list_runners())
+    return HTMLResponse(f"""<div style="padding:1.5rem;max-width:50rem;margin:0 auto">
+        <h3>Pipeline Runners</h3>
+        <form onsubmit="event.preventDefault();fetch('{_P}/refiner/create',{{method:'POST',body:new FormData(this)}}).then(()=>location.reload())" style="display:flex;gap:.5rem;margin-bottom:1rem">
+            <input name="pipeline_id" placeholder="pipeline id" class="module-select">
+            <input name="max_runs" type="number" value="20" class="module-select" style="width:6rem">
+            <input name="delay_s" type="number" value="30" class="module-select" style="width:6rem" title="seconds between passes">
+            <button class="ui-btn" type="submit">Create</button>
+        </form>
+        <table class="data-table"><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Progress</th><th></th></tr></thead><tbody>{rows}</tbody></table>
+    </div>""")
+
+@router.post("/refiner/create")
+async def refiner_create(request: Request, pipeline_id: str = Form(...), max_runs: int = Form(20), delay_s: int = Form(30)):
+    doc = new_runner(pipeline_id, f"Refiner run - {pipeline_id}", max_runs, delay_s, request.state.user.username)
+    save_runner(doc); return JSONResponse(doc)
+
+@router.post("/refiner/{rid}/start")
+async def refiner_start(rid: str): start_runner(rid); return JSONResponse(load_runner(rid))
+
+@router.post("/refiner/{rid}/stop")
+async def refiner_stop(rid: str): stop_runner(rid); return JSONResponse(load_runner(rid))
 
 # -- Simple Chat (working demonstration: chat with an optional attached knowledge base) --
 # This is intentionally minimal - a 1-or-2-node inline Flow, not a saved pipeline, not routed through Tessa/Kimi UI.
