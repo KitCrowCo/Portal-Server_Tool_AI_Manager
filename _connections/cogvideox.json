@@ -1,0 +1,16 @@
+{
+  "_meta": {"display_name": "CogVideoX", "icon": "&#x1F3A5;", "connection_type": "cogvideox", "description": "Text-to-video and start-frame image-to-video (CogVideoX-2b/5b/1.5 family). Does not support end-frame conditioning - a future connection profile with that capability (e.g. a CogVideoX-Fun-based node) slots in with zero changes to the pipeline that calls it."},
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1", "required": true},
+    "port": {"type": "integer", "label": "Port", "default": 8002, "required": true},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": ""},
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 3600}
+  },
+  "capabilities": {"text_to_video": true, "image_to_video": true, "start_end_to_video": false},
+  "endpoints": {
+    "health": {"method": "GET", "path": "/system/status"},
+    "text_to_video": {"method": "POST", "path": "/generate", "body": {"prompt": "{prompt}", "num_frames": "{num_frames}", "steps": "{steps}", "guidance_scale": "{guidance_scale}", "seed": "{seed}", "fps": "{fps}"}},
+    "image_to_video": {"method": "POST", "path": "/generate", "body": {"prompt": "{prompt}", "start_image": "{start_image}", "num_frames": "{num_frames}", "steps": "{steps}", "guidance_scale": "{guidance_scale}", "seed": "{seed}", "fps": "{fps}"}}
+  }
+}

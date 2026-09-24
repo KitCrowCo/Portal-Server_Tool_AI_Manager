@@ -96,6 +96,7 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     priority = config.get("priority") or ctx.pool_cfg.get("priority", "balanced")
     tags = [t.strip() for t in str(config.get("cnode_tags","")).split(",") if t.strip()]
     t0 = time.time()
+
     if modality == "image":
         enc_conn, cnode = (get_conn(config.get("conn_id","")), None) if config.get("conn_id") else (None, None)
         if not enc_conn:
@@ -113,6 +114,27 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
         if gen.get("error"): raise RuntimeError(f"generate(image): {gen['error']}")
         if cnode: resources.log_usage(cnode["id"], "generate:image", time.time()-t0)
         return {"file_name": gen["file_name"]}
+
+    if modality == "video":
+        start_img, end_img = ctx.get("start_image"), ctx.get("end_image")
+        wanted = "start_end_to_video" if (start_img and end_img) else ("image_to_video" if start_img else "text_to_video")
+        conn = connections.get_conn(config.get("conn_id","")) if config.get("conn_id") else None
+        if conn and not connections.connection_capabilities(conn).get(wanted):
+            raise RuntimeError(f"generate(video): pinned connection '{conn.get('_id')}' does not declare '{wanted}' - pick one that does, or unpin to let the pool choose")
+        cnode = None
+        if not conn:
+            for candidate_cap in (wanted, "image_to_video", "text_to_video"):
+                picked = resources.pick_conn(resources.resolve_candidates(ctx.pool_cfg, tags, capability=candidate_cap), candidate_cap, priority)
+                if picked: cnode, conn = picked; wanted = candidate_cap; break
+            if not conn: raise RuntimeError(f"generate(video): no connection in this node's resource pool declares '{wanted}' or a lesser video capability - add one, or point a connection profile's capabilities at what you need")
+        payload = {"prompt": ctx.resolve(config.get("user_template") or "{input}"), "num_frames": config.get("num_frames", 49), "steps": config.get("steps", 50), "guidance_scale": config.get("cfg", 6.0), "seed": config.get("seed", -1), "fps": config.get("fps", 8)}
+        if wanted in ("image_to_video", "start_end_to_video"): payload["start_image"] = start_img
+        if wanted == "start_end_to_video": payload["end_image"] = end_img
+        gen = await connections.generate_visual(conn, wanted, payload)
+        if gen.get("error"): raise RuntimeError(f"generate(video): {gen['error']}")
+        if cnode: resources.log_usage(cnode["id"], f"generate:{wanted}", time.time()-t0)
+        return {"file_name": gen["file_name"], "capability_used": wanted}
+
     conn, cnode = (get_conn(config.get("conn_id","")), None) if config.get("conn_id") else (None, None)
     if not conn:
         picked = resources.pick_conn(resources.resolve_candidates(ctx.pool_cfg, tags, "ollama"), "ollama", priority)

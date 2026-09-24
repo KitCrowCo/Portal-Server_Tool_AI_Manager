@@ -35,7 +35,7 @@ def delete_cnode(cid: str): _cp(cid).unlink(missing_ok=True)
 # --- Pool Resolution ---
 # Pure successive set-filtering: Network (all CNodes) -> Pipeline pool (whitelist/blacklist tags+ids) -> Node's own cnode_tags (further intersected). Each level can only narrow, never widen, the level above it.
 
-def resolve_candidates(pool_cfg: dict, node_tags: list = None, conn_type: str = "") -> list:
+def resolve_candidates(pool_cfg: dict, node_tags: list = None, conn_type: str = "", capability: str = "") -> list:
     wl_tags, bl_tags = set(pool_cfg.get("whitelist_tags", [])), set(pool_cfg.get("blacklist_tags", []))
     wl_ids, bl_ids = set(pool_cfg.get("whitelist_cnodes", [])), set(pool_cfg.get("blacklist_cnodes", []))
     ntags = set(node_tags or [])
@@ -47,8 +47,25 @@ def resolve_candidates(pool_cfg: dict, node_tags: list = None, conn_type: str = 
         if wl_tags and not (ctags & wl_tags): continue
         if ntags and not (ctags & ntags): continue
         if conn_type and not any((connections.load_conn_raw(cid) or {}).get("connection_type") == conn_type for cid in c.get("conn_ids", [])): continue
+        if capability and not any(connections.connection_capabilities(connections.load_conn_raw(cid) or {}).get(capability) for cid in c.get("conn_ids", [])): continue
         out.append(c)
     return out
+
+def pick_conn_for_capability(candidates: list, capability: str, priority: str = "balanced") -> Optional[tuple]:
+    """Same scoring as pick_conn, but the qualifying test is 'does this connection's profile declare this capability', not 'does its connection_type string match one specific name' 
+    - the whole point being that two completely different tools can both qualify for the same capability without either one knowing the other exists."""
+    scored = []
+    for c in candidates:
+        for cid in c.get("conn_ids", []):
+            conn = connections.load_conn_raw(cid)
+            if not conn or not connections.connection_capabilities(conn).get(capability): continue
+            score = {"speed": c.get("compute_score", 1.0), "quality": c.get("quality_score", 1.0)}.get(priority, (c.get("compute_score", 1.0) + c.get("quality_score", 1.0)) / 2)
+            scored.append((score, c, cid, conn))
+    if not scored: return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    _, cnode, cid, conn = scored[0]
+    conn = dict(conn); conn["_id"] = cid
+    return cnode, conn
 
 def pick_conn(candidates: list, conn_type: str, priority: str = "balanced") -> Optional[tuple]:
     """Returns (cnode, conn_dict_with_id) for the best-scoring candidate's first matching connection, or None if nothing qualifies.

@@ -130,6 +130,10 @@ def _get_nested_value(data, path: str):
         if data is None: return ""
     return data
 
+def connection_capabilities(conn: dict) -> dict:
+    """What this connection's own profile declares it can do - checked before ever routing a request to it. A missing/false key always means 'not supported', never assumed true."""
+    return _conn_profile(conn).get("capabilities", {})
+
 async def stream_llm(conn: dict, messages: list, model: str, think = False, **kwargs):
     """Agnostic chat stream. Yields (text, thinking) tuples per chunk - thinking is "" for providers/calls that don't produce it.
     think=True is honored only if the connection's profile declares supports_thinking;
@@ -165,6 +169,23 @@ async def stream_llm(conn: dict, messages: list, model: str, think = False, **kw
                 thinking = _get_nested_value(chunk, parser.get("thinking_path","")) if supports_thinking else ""
                 if text or thinking: yield text, thinking
                 if done_sentinel and chunk.get(done_sentinel.get("key","done")) == done_sentinel.get("value", True): break
+
+async def generate_visual(conn: dict, capability: str, payload: dict) -> dict:
+    """Provider-agnostic call for any non-text generation capability - image, video, inpainting, whatever comes next.
+    Mirrors stream_llm's config-over-code shape instead of a hand-written per-provider function: the connection's own JSON profile declares which capabilities it has and each one's wire shape under endpoints[capability].
+    This function never hardcodes a provider OR a capability name - adding a backend that supports something no current backend does is a JSON profile drop, and every caller of this function is unchanged when that happens."""
+    profile = _conn_profile(conn)
+    if not profile.get("capabilities", {}).get(capability):
+        return {"error": f"connection '{conn.get('_id','?')}' ({conn.get('connection_type','?')}) does not declare capability '{capability}'"}
+    ep = profile.get("endpoints", {}).get(capability, {})
+    if not ep: return {"error": f"profile declares capability '{capability}' but has no matching endpoints.{capability} - profile is misconfigured"}
+    body = _render_template(ep.get("body", {}), payload)
+    timeout_s = float(conn.get("values", {}).get("timeout_s", 3600))
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=30.0, pool=10.0)) as c:
+            r = await c.request(ep.get("method", "POST"), _base(conn) + ep.get("path", "/generate"), json=body)
+            return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
+    except Exception as e: return {"error": str(e)}
 
 # --- LightRAG (config-driven - see tools/ai_manager/_connections/lightrag.json) ---
 # No LightRAG-version-specific shape lives in this file. Every operation reads its method/path/body template from the connection's own JSON profile and renders it generically, exactly like stream_llm does for chat completions.
