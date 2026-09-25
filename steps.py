@@ -130,7 +130,7 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
         payload = {"prompt": ctx.resolve(config.get("user_template") or "{input}"), "num_frames": config.get("num_frames", 49), "steps": config.get("steps", 50), "guidance_scale": config.get("cfg", 6.0), "seed": config.get("seed", -1), "fps": config.get("fps", 8)}
         if wanted in ("image_to_video", "start_end_to_video"): payload["start_image"] = start_img
         if wanted == "start_end_to_video": payload["end_image"] = end_img
-        gen = await connections.generate_visual(conn, wanted, payload)
+        gen = await connections.call_capability(conn, wanted, payload)
         if gen.get("error"): raise RuntimeError(f"generate(video): {gen['error']}")
         if cnode: resources.log_usage(cnode["id"], f"generate:{wanted}", time.time()-t0)
         return {"file_name": gen["file_name"], "capability_used": wanted}
