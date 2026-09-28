@@ -2,7 +2,7 @@
 Shared utilities for all ai tools conenctions.
 Not a sub-module (no subdirectory/router) - import directly.
 """
-import json, httpx, time
+import json, httpx, time, re
 from pathlib import Path
 
 _QUERY_CACHE: dict = {}

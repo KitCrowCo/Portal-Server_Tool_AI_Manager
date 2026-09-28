@@ -8,6 +8,7 @@
     "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 2400, "hint": "Max seconds to wait for query/insert - raise on slow indexing"}
   },
   "domain_notes": {"type": "string", "label": "Domain Notes", "default": "", "hint": "What kind of knowledge lives here - shown under the selector in Kimi."},
+  "capabilities": {"knowledge_query": true, "knowledge_insert": true, "knowledge_entities": true},
   "endpoints": {
     "health":         {"method": "GET",    "path": "/health"},
     "query":          {"method": "POST",   "path": "/query", "body": {"query": "{query}", "mode": "{mode}"}, "response_parser": {"content_path": "response"}},

@@ -30,6 +30,14 @@ _NAMED_ROOTS = {"common": "./data/_common"}
 RUNNER_DIR = Path("./data/ai_manager/_runners")
 _RUNNER_TASKS: dict = {}
 
+# --- Node -> required capability, single source of truth ---
+# Every place that used to check a literal connection_type string ("ollama", "lightrag", "flux2_text") reads from here instead.
+# Adding a node type that needs a new capability means adding one line here, never adding a new hardcoded string anywhere else in this file or steps.py.
+CAP_CHAT = "chat"
+CAP_KNOWLEDGE = "knowledge_query"
+CAP_IMAGE_ENCODE = "flux2_text"   # transitional name - flux2_text.json has no "capabilities" block yet, so this still matches by connection_type until it does
+CAP_IMAGE_GEN = "flux2_image"     # same
+
 def register_root(name: str, path: str): _NAMED_ROOTS[name] = path
 def resolve_root(name: str) -> str: return _NAMED_ROOTS.get(name, name)
 def list_roots() -> list: return list(_NAMED_ROOTS.items())
@@ -105,7 +113,7 @@ class PipelineBuilderUI:
         p = self.intent_prefix
         IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change], f"{p}_node_pool_preview": [self._im_node_pool_preview], f"{p}_preflight": [self._im_preflight], f"{p}_view_subjob": [self._im_view_subjob]})
 
-    _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") == "image" else ["chat"], "knowledge": lambda cfg: ["lightrag"], "branch": lambda cfg: ["chat"] if cfg.get("decide_mode") == "llm" else []}
+    _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") in ("image", "video") else [CAP_CHAT], "knowledge": lambda cfg: [CAP_KNOWLEDGE], "branch": lambda cfg: [CAP_CHAT] if cfg.get("decide_mode") == "llm" else []}
     _NODE_RECURSES = {"pipeline", "pipeline_foreach", "branch"}
     _NODE_CALLS = {"pipeline": lambda cfg: [cfg["pipeline_id"]] if cfg.get("pipeline_id") else [], "pipeline_foreach": lambda cfg: [cfg["pipeline_id"]] if cfg.get("pipeline_id") else [], "branch": lambda cfg: list({v for v in cfg.get("routes_json",{}).values() if v} | ({cfg["default_pipeline_id"]} if cfg.get("default_pipeline_id") else set()))}
 
@@ -415,11 +423,10 @@ class PipelineBuilderUI:
         return imr.oob(f'<label id="cfg_model_wrap" class="dim">Model<select name="cfg_model" class="module-select"><option value="">(auto)</option>{opts}</select></label>', "cfg_model_wrap")
 
     def _node_conn_types(self, node) -> list:
-        """Which connection_type(s) this node needs, if any. Not exhaustive of every node type - branch/pipeline/pipeline_foreach recurse into sub-pipelines and aren't validated here (that would require walking the whole call graph); flagged as a known gap, not silently assumed fine."""
         t, cfg = node.get("type",""), node.get("config",{})
-        if t == "generate": return ["flux2_text", "flux2_image"] if cfg.get("modality")=="image" else ["chat"]
-        if t == "knowledge": return ["lightrag"]
-        if t == "branch" and cfg.get("decide_mode") == "llm": return ["chat"]
+        if t == "generate": return [] if cfg.get("modality") in ("image","video") else [CAP_CHAT]
+        if t == "knowledge": return [CAP_KNOWLEDGE]
+        if t == "branch" and cfg.get("decide_mode") == "llm": return [CAP_CHAT]
         return []
 
     def _node_conn_ok(self, pl, node) -> tuple:
@@ -447,7 +454,7 @@ class PipelineBuilderUI:
             pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
             tags = [t.strip() for t in str(cfg.get("cnode_tags","")).split(",") if t.strip()]
             candidates = self.AIM.resources.resolve_candidates(pool, tags, conn_type)
-            picked = self.AIM.resources.pick_conn(candidates, conn_type, pool.get("priority","balanced"))
+            picked = self.AIM.resources.pick_conn(candidates, conn_type, pool.get("priority", "balanced"))
             out[conn_type] = ("pool_ok", picked[1].get("display_name", picked[1].get("_id",""))) if picked else ("pool_empty", f"{len(candidates)} CNode(s) matched tags/pool, none carry a {conn_type} connection" if candidates else "no CNode matches this pool's whitelist/blacklist + node tags")
         return out
 
@@ -580,7 +587,7 @@ async def chat_page(request: Request):
     Real chat surfaces (Athena, Tessa) use ChatManager."""
     conns = connections.list_conns()
     conn_opts = "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in conns)
-    kg_opts = '<option value="">(no knowledge base)</option>' + "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in connections.list_conns(conn_type="lightrag"))
+    kg_opts = '<option value="">(no knowledge base)</option>' + "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in connections.list_conns(conn_type=CAP_KNOWLEDGE))
     return HTMLResponse(f"""<div style="max-width:60rem; margin:0 auto; padding:1.5rem; display:flex; flex-direction:column; gap:.6rem; height:100%; box-sizing:border-box">
                                 <div style="display:flex;justify-content:flex-end">
                                     <button class="ui-btn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"resources_open","lvl":1})}'>Resource Pool (CNodes)</button>

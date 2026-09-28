@@ -257,7 +257,7 @@ async def node_knowledge(config: dict, data: dict, ctx: NodeContext) -> dict:
     tags = [t.strip() for t in str(config.get("cnode_tags","")).split(",") if t.strip()]
     conn, cnode = (get_conn(config.get("conn_id",""), conn_type="lightrag"), None) if config.get("conn_id") else (None, None)
     if not conn:
-        picked = resources.pick_conn(resources.resolve_candidates(ctx.pool_cfg, tags, "lightrag"), "lightrag", priority)
+        picked = resources.pick_conn_for_capability(resources.resolve_candidates(ctx.pool_cfg, tags, capability="knowledge_query"), "knowledge_query", priority)
         if not picked: raise RuntimeError("knowledge: no lightrag connection matches this node's resource pool")
         cnode, conn = picked
     t0 = time.time()
@@ -460,7 +460,7 @@ def register_builtins():
         BI.SettingField("text_template","Insert Text Template","textarea",advanced=True),
         BI.SettingField("source_label","Insert Source Label","text",advanced=True),
         BI.SettingField("limit","Entity Limit","number", default=500,step=1,advanced=True),
-        *_pool_fields(include_model=False, conn_type="lightrag"), _key_map_field()], guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.")
+        *_pool_fields(include_model=False, conn_type="knowledge_query". _conn_options_for_type), _key_map_field()], guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.")
 
     register_node_type("pipeline", node_pipeline, "Call Pipeline", in_keys=[], out_keys=[], config_schema=[
         BI.SettingField("pipeline_id","Pipeline","select", options=_pipeline_options),
