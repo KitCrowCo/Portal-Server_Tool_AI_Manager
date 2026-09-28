@@ -1,20 +1,50 @@
 {
-  "_meta": {"schema_version": "1.0", "connection_type": "llamacpp_direct", "display_name": "llama.cpp (direct, no vendor ceilings)",
-            "description": "Ollama-wire-compatible llama.cpp supervisor. No hardcoded iGPU/context-size cutoffs, native KV-cache persistence, native LoRA hot-swap. Distinct from ollama.json because the wire protocol is shared but the actual capability surface is not."},
-  "prefix_breaking_fields": ["model", "system_prompt", "num_ctx"],
-  "connection": {"host": {"type":"string","default":"127.0.0.1","required":true}, "port": {"type":"integer","default":11434,"required":true},
-                 "tls": {"type":"boolean","default":false}, "base_path": {"type":"string","default":""}, "timeout_s": {"type":"integer","default":3600}},
-  "capabilities": {"list_models": true, "chat": true, "generate": true, "streaming": true,
-                    "context_cache_save": true, "context_cache_load": true, "lora_adapters": true},
-  "endpoints": {
-    "health":        {"method": "GET",  "path": "/api/tags"},
-    "list_models":   {"method": "GET",  "path": "/api/tags"},
-    "chat":          {"method": "POST", "path": "/api/chat", "body": {"model": "{model}", "messages": "{messages}", "stream": true, "options": "{options}"}},
-    "context_cache_save": {"method": "POST", "path": "/api/cache/save", "body": {"model": "{model}", "cache_id": "{cache_id}"}},
-    "context_cache_load": {"method": "POST", "path": "/api/cache/load", "body": {"model": "{model}", "cache_id": "{cache_id}"}},
-    "lora_list": {"method": "GET",  "path": "/api/lora/list"},
-    "lora_set":  {"method": "POST", "path": "/api/lora/set", "body": {"adapters": "{adapters}"}}
+  "_meta": {"schema_version": "1.0", "connection_type": "llamacpp_direct", "display_name": "llama.cpp supervisor (direct)", "icon": "&#x25CF;",
+            "description": "Ollama-wire-compatible llama.cpp supervisor. No vendor ceilings, KV-context ring, LoRA scale control, model pull/delete."},
+  "prefix_breaking_fields": ["model", "system_prompt", "num_ctx", "kv_cache_type"],
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1", "required": true},
+    "port": {"type": "integer", "label": "Port", "default": 11434, "required": true},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": ""},
+    "api_key": {"type": "secret", "label": "API Key", "default": ""},
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 3600}
   },
-  "options_schema": {"temperature": {"type":"float","default":0.8}, "top_p": {"type":"float","default":0.9}, "num_predict": {"type":"integer","default":-1}},
-  "response_parser": {"stream_format": "jsonl", "content_path": "message.content"}
+  "capabilities": {"list_models": true, "chat": true, "generate": true, "streaming": true, "model_list": true, "model_info": true, "model_delete": true, "model_pull_hf": true,
+                   "context_cache_save": {"models": {}}, "context_cache_restore": {"models": {}}, "context_cache_list": true, "context_cache_purge": true,
+                   "lora_adapters": true, "tool_calling": false},
+  "endpoints": {
+    "health": {"method": "GET", "path": "/api/tags"},
+    "list_models": {"method": "GET", "path": "/api/tags"},
+    "chat": {"method": "POST", "path": "/api/chat", "body": {"model": "{model}", "messages": "{messages}", "stream": true, "think": "{think}", "options": "{options}"}},
+    "model_list": {"method": "GET", "path": "/api/tags"},
+    "model_info": {"method": "POST", "path": "/api/show", "body": {"name": "{name}"}},
+    "model_delete": {"method": "DELETE", "path": "/api/delete", "body": {"name": "{name}", "confirm": "{confirm}"}},
+    "model_pull_hf": {"method": "POST", "path": "/api/pull", "body": {"repo": "{repo}", "quant": "{quant}", "filenames": "{filenames}"}},
+    "context_cache_save": {"method": "POST", "path": "/api/cache/save", "body": {"cache_session": "{session}"}},
+    "context_cache_restore": {"method": "POST", "path": "/api/cache/restore", "body": {"cache_session": "{session}"}},
+    "context_cache_list": {"method": "GET", "path": "/api/cache/list"},
+    "context_cache_purge": {"method": "DELETE", "path": "/api/cache", "body": {"file": "{file}"}},
+    "lora_available": {"method": "GET", "path": "/api/lora/available"},
+    "lora_list": {"method": "GET", "path": "/api/lora/list"},
+    "lora_set": {"method": "POST", "path": "/api/lora/set", "body": {"adapters": "{adapters}"}}
+  },
+  "model_list_parser": {"root_key": "models", "name_field": "name", "size_field": "size", "modified_field": "modified_at", "details_field": "details"},
+  "options_schema": {
+    "temperature": {"type": "float", "default": 0.8, "min": 0.0, "max": 2.0},
+    "top_p": {"type": "float", "default": 0.9, "min": 0.0, "max": 1.0},
+    "top_k": {"type": "integer", "default": 40, "min": 1, "max": 200},
+    "min_p": {"type": "float", "default": null},
+    "repeat_penalty": {"type": "float", "default": 1.1, "min": 0.5, "max": 2.0},
+    "num_ctx": {"type": "integer", "default": 16384, "min": 1, "max": 13107200, "hint": "Context window in tokens"},
+    "num_predict": {"type": "integer", "default": -1, "min": -1, "max": 1000000, "hint": "-1 = unlimited"},
+    "seed": {"type": "integer", "default": -1, "hint": "-1 = random (llama.cpp convention)"},
+    "stop": {"type": "list", "default": []},
+    "kv_cache_type": {"type": "string", "default": "q8_0", "hint": "f16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl"},
+    "cache_session": {"type": "string", "default": "", "hint": "Saved-context key (ring). Blank = shared 'default'"},
+    "lora_paths": {"type": "list", "default": [], "hint": "File names in the supervisor's loras folder"}
+  },
+  "supports_thinking": true,
+  "response_parser": {"stream_format": "jsonl", "content_path": "message.content", "thinking_path": "message.thinking"},
+  "status_map": {"success_codes": [200], "error_key": "error", "stream_done_sentinel": {"key": "done", "value": true}}
 }

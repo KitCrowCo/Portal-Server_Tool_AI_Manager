@@ -113,11 +113,16 @@ def _resolved_options(profile: dict, kwargs: dict) -> dict:
     return out
 
 def _render_template(node, params: dict):
-    """Recursively substitutes '{param}' placeholders against params - only keys present in params are filled in;
-    a placeholder with no matching param is dropped from the payload rather than sent literally, so provider templates can offer optional fields (max_tokens, top_p, ...) without every caller needing to supply them."""
+    """Recursively substitutes placeholders against params. A string that is exactly one '{key}' returns the raw value (lists/dicts/numbers stay typed); a string with embedded '{key}' parts is formatted in place.
+    Any placeholder with no matching param drops the whole field, so profiles can declare optional fields without every caller supplying them."""
     if isinstance(node, dict): return {k: v for k, v in ((k, _render_template(v, params)) for k, v in node.items()) if v is not _MISSING}
     if isinstance(node, list): return [_render_template(v, params) for v in node]
-    if isinstance(node, str) and node.startswith("{") and node.endswith("}"): return params[node[1:-1]] if node[1:-1] in params else _MISSING
+    if isinstance(node, str):
+        keys = re.findall(r"\{(\w+)\}", node)
+        if not keys: return node
+        if any(k not in params for k in keys): return _MISSING
+        if re.fullmatch(r"\{\w+\}", node): return params[keys[0]]
+        return re.sub(r"\{(\w+)\}", lambda m: str(params[m.group(1)]), node)
     return node
 
 def _get_nested_value(data, path: str):
@@ -170,13 +175,20 @@ async def stream_llm(conn: dict, messages: list, model: str, think = False, **kw
                 if text or thinking: yield text, thinking
                 if done_sentinel and chunk.get(done_sentinel.get("key","done")) == done_sentinel.get("value", True): break
 
+def has_capability(conn: dict, capability: str, model: str = "") -> bool:
+    """True/False capabilities are static. A dict capability checks its 'models' sublayer -
+    absent model or empty sublayer defaults to capable, so declaring the sublayer costs nothing until you actually start populating per-model exceptions."""
+    cap = _conn_profile(conn).get("capabilities", {}).get(capability)
+    if isinstance(cap, dict):
+        models = cap.get("models", {})
+        return models.get(model, True) if model else True
+    return bool(cap)
+
 async def call_capability(conn: dict, capability: str, payload: dict, timeout_s: float = None) -> dict:
-    """Generic dispatcher for any non-streaming capability a connection's profile declares -
-    image/video generation, context-cache save/load, LoRA management, or anything not yet
-    imagined. Same config-over-code shape as stream_llm; never named after a capability or backend."""
+    """Generic dispatcher for any non-streaming capability a connection's profile declares - image/video generation, context-cache save/load, LoRA management, or anything not yet imagined.
+    Same config-over-code shape as stream_llm; never named after a capability or backend."""
     profile = _conn_profile(conn)
-    if not profile.get("capabilities", {}).get(capability):
-        return {"error": f"connection '{conn.get('_id','?')}' ({conn.get('connection_type','?')}) does not declare capability '{capability}'"}
+    if not has_capability(conn, capability): return {"error": f"connection '{conn.get('_id','?')}' ({conn.get('connection_type','?')}) does not declare capability '{capability}'"}
     ep = profile.get("endpoints", {}).get(capability, {})
     if not ep: return {"error": f"profile declares '{capability}' but has no endpoints.{capability} - profile misconfigured"}
     body = _render_template(ep.get("body", {}), payload)
@@ -186,6 +198,25 @@ async def call_capability(conn: dict, capability: str, payload: dict, timeout_s:
             r = await c.request(ep.get("method", "POST"), _base(conn) + ep.get("path", "/"), json=body)
             return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
     except Exception as e: return {"error": str(e)}
+
+def conns_matching(kind: str) -> list: return [c for c in list_conns(get_all=True) if c.get("connection_type") == kind or has_capability(c, kind)] #kind is a connection_type OR a capability name - callers that only care what a connection can DO should pass the capability.
+
+async def stream_capability(conn: dict, capability: str, payload: dict):
+    """Streaming sibling of call_capability for endpoints that answer with NDJSON progress lines (model pulls, long jobs). Yields one parsed dict per line; a failure yields a single {"error": ...} dict instead of raising."""
+    profile = _conn_profile(conn)
+    if not has_capability(conn, capability): yield {"error": f"connection '{conn.get('_id','?')}' does not declare capability '{capability}'"}; return
+    ep = profile.get("endpoints", {}).get(capability, {})
+    if not ep: yield {"error": f"profile declares '{capability}' but has no endpoints.{capability}"}; return
+    body = _render_template(ep.get("body", {}), payload)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=float(conn.get("values", {}).get("timeout_s", 3600)), write=30.0, pool=10.0)) as c:
+            async with c.stream(ep.get("method", "POST"), _base(conn) + ep.get("path", "/"), json=body) as r:
+                if r.status_code != 200: yield {"error": f"HTTP {r.status_code}: {(await r.aread()).decode(errors='replace')[:300]}"}; return
+                async for line in r.aiter_lines():
+                    if not line.strip(): continue
+                    try: yield json.loads(line)
+                    except json.JSONDecodeError: continue
+    except Exception as e: yield {"error": str(e)}
 
 # --- LightRAG (config-driven - see tools/ai_manager/_connections/lightrag.json) ---
 # No LightRAG-version-specific shape lives in this file. Every operation reads its method/path/body template from the connection's own JSON profile and renders it generically, exactly like stream_llm does for chat completions.

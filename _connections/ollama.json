@@ -59,7 +59,9 @@
     "embeddings":    true,
     "streaming":     true,
     "model_info":    true,
-    "health_check":  true
+    "health_check":  true,
+    "context_cache_save": {"models": {}},
+    "model_list": true, "model_delete": true, "model_pull": true, "model_pull_hf": true
   },
 
   "endpoints": {
@@ -70,6 +72,10 @@
     "delete":      { "method": "DELETE", "path": "/api/delete",     "body": { "name":  "{model}" } },
     "generate":    { "method": "POST",   "path": "/api/generate",   "body": { "model": "{model}", "prompt":   "{prompt}", "stream": true, "options": "{options}" } },
     "chat":        { "method": "POST",   "path": "/api/chat",       "body": { "model": "{model}", "messages": "{messages}", "stream": true, "think": "{think}", "keep_alive": "{keep_alive}", "options": "{options}" } },
+    "model_list": {"method": "GET", "path": "/api/tags"},
+    "model_delete": {"method": "DELETE", "path": "/api/delete", "body": {"name": "{name}"}},
+    "model_pull": {"method": "POST", "path": "/api/pull", "body": {"name": "{name}", "stream": true}},
+    "model_pull_hf": {"method": "POST", "path": "/api/pull", "body": {"name": "hf.co/{repo}:{quant}", "stream": true}},
     "embeddings":  { "method": "POST",   "path": "/api/embeddings", "body": { "model": "{model}", "prompt":   "{text}" } }
   },
 

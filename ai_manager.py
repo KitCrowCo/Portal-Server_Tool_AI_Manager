@@ -105,8 +105,8 @@ class PipelineBuilderUI:
         p = self.intent_prefix
         IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change], f"{p}_node_pool_preview": [self._im_node_pool_preview], f"{p}_preflight": [self._im_preflight], f"{p}_view_subjob": [self._im_view_subjob]})
 
-    _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") == "image" else ["ollama"], "knowledge": lambda cfg: ["lightrag"], "branch": lambda cfg: ["ollama"] if cfg.get("decide_mode") == "llm" else []}
-    _NODE_RECURSES = {"pipeline", "pipeline_foreach", "branch"}  # branch is both: may need ollama itself AND recurses into routes_json targets
+    _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") == "image" else ["chat"], "knowledge": lambda cfg: ["lightrag"], "branch": lambda cfg: ["chat"] if cfg.get("decide_mode") == "llm" else []}
+    _NODE_RECURSES = {"pipeline", "pipeline_foreach", "branch"}
     _NODE_CALLS = {"pipeline": lambda cfg: [cfg["pipeline_id"]] if cfg.get("pipeline_id") else [], "pipeline_foreach": lambda cfg: [cfg["pipeline_id"]] if cfg.get("pipeline_id") else [], "branch": lambda cfg: list({v for v in cfg.get("routes_json",{}).values() if v} | ({cfg["default_pipeline_id"]} if cfg.get("default_pipeline_id") else set()))}
 
     def _vals(self, action, **extra): return json.dumps({"type": f"{self.intent_prefix}_{action}", "branch": self.intent_prefix, "lvl": self.nesting_level, **extra})
@@ -417,9 +417,9 @@ class PipelineBuilderUI:
     def _node_conn_types(self, node) -> list:
         """Which connection_type(s) this node needs, if any. Not exhaustive of every node type - branch/pipeline/pipeline_foreach recurse into sub-pipelines and aren't validated here (that would require walking the whole call graph); flagged as a known gap, not silently assumed fine."""
         t, cfg = node.get("type",""), node.get("config",{})
-        if t == "generate": return ["flux2_text","flux2_image"] if cfg.get("modality")=="image" else ["ollama"]
+        if t == "generate": return ["flux2_text", "flux2_image"] if cfg.get("modality")=="image" else ["chat"]
         if t == "knowledge": return ["lightrag"]
-        if t == "branch" and cfg.get("decide_mode") == "llm": return ["ollama"]
+        if t == "branch" and cfg.get("decide_mode") == "llm": return ["chat"]
         return []
 
     def _node_conn_ok(self, pl, node) -> tuple:

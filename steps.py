@@ -7,7 +7,7 @@ The engine remaps those to actual pipeline keys via the node's key_map and merge
 import re, json, sys, asyncio, uuid, time
 from pathlib import Path
 from tools.ai_manager import engine, resources
-from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns
+from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
 
 _NODE_TYPES: dict = {}
 _EMBED_PATTERNS = ("embed", "minilm", "bge-", "gte-", "e5-", "nomic-embed", "arctic-embed")
@@ -137,7 +137,7 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
 
     conn, cnode = (get_conn(config.get("conn_id","")), None) if config.get("conn_id") else (None, None)
     if not conn:
-        picked = resources.pick_conn(resources.resolve_candidates(ctx.pool_cfg, tags, "ollama"), "ollama", priority)
+        picked = resources.pick_conn_for_capability(resources.resolve_candidates(ctx.pool_cfg, tags, capability="chat"), "chat", priority)
         if not picked: raise RuntimeError("generate: no connection matches this node's resource pool (check pipeline/node whitelist-blacklist tags)")
         cnode, conn = picked
     model = config.get("model","")
@@ -154,7 +154,7 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     if json_fields: sys_p = (sys_p + f"\n\nRespond ONLY with a single JSON object with exactly these keys: {json.dumps(json_fields)}. No markdown fences, no text before or after the JSON.").strip()
     messages = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": ctx.resolve(config.get("user_template") or "{input}")}]
     full, thinking_full = "", ""
-    async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.7), num_ctx = int(resources.resolve_bound(config.get("num_ctx_mode","exact"), config.get("num_ctx", 16384), config.get("num_ctx_max"), fallback=16384)), num_predict=config.get("num_predict", -1), **seed_kwargs):
+    async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.7), num_ctx = int(resources.resolve_bound(config.get("num_ctx_mode","exact"), config.get("num_ctx", 16384), config.get("num_ctx_max"), fallback=16384)), num_predict=config.get("num_predict", -1), kv_cache_type=config.get("kv_cache_type") or None, cache_session=config.get("cache_session") or None, **seed_kwargs):
         full += text; thinking_full += thinking
         await ctx.stream("text", text)
     if cnode: resources.log_usage(cnode["id"], "generate:text", time.time()-t0)
@@ -360,7 +360,7 @@ def pick_default_chat_model(models: list) -> str:
     candidates = [m for m in models if not looks_like_embedding(m)]
     return candidates[0] if candidates else ""
 
-def _llm_conn_options(values=None): return [("", "(pool-resolved by priority)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns("ollama")]
+def _llm_conn_options(values=None): return [("", "(pool-resolved by priority)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in conns_matching("chat")]
 
 def _model_options_for_pinned_conn(values=None):
     conn_id = (values or {}).get("conn_id","")
@@ -387,10 +387,10 @@ def register_builtins():
     def _key_map_field(): return BI.SettingField("key_map", "Key Map (JSON: logical -> actual pipeline key)", type="json", default={}, advanced=True, hint='Only needed to rename this node\'s in/out keys, e.g. {"input":"user_query","text":"draft"}. Unmapped logical names pass through unchanged.')
 
     def _conn_options_for_type(conn_type):
-        def _opts(values=None): return [("", "(pool-resolved by priority)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns(conn_type)]
+        def _opts(values=None): return [("", "(pool-resolved by priority)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in conns_matching(conn_type)]
         return _opts
 
-    def _pool_fields(include_model=True, conn_type="ollama"):
+    def _pool_fields(include_model=True, conn_type="chat"):
         fields = [BI.SettingField("cnode_tags", "Resource Pool Tags (comma-sep)", type="text", advanced=True, hint="Narrows the pipeline's own pool to CNodes carrying ALL these tags. Blank = use the whole pipeline pool."),
                   BI.SettingField("priority", "Priority", type="select", default="", options=[("","(inherit pipeline default)"),("speed","Speed"),("balanced","Balanced"),("quality","Quality")], advanced=True),
                   BI.SettingField("conn_id", "Connection", type="select", default="", options=_conn_options_for_type(conn_type), hint="Full pool auto-selection (multi-candidate scoring) is planned but not yet built - pin a connection here until then.")]
@@ -413,6 +413,8 @@ def register_builtins():
         BI.SettingField("height","Height (image)","number",default=1024,step=1,advanced=True),
         BI.SettingField("steps","Steps (image)","number",default=4,step=1,advanced=True),
         BI.SettingField("cfg","Guidance Scale (image)","number",default=1.0,advanced=True),
+        BI.SettingField("kv_cache_type","KV Cache Type (llama.cpp connections)","select",default="",options=[("","(connection default)")]+[(k,k) for k in ("f16","q8_0","q5_1","q5_0","q4_1","q4_0","iq4_nl")],advanced=True),
+        BI.SettingField("cache_session","Saved-Context Session","text",advanced=True,hint="Nodes sharing a session reuse each other's prefilled context. Blank = shared default."),
         *_pool_fields(), _key_map_field()], guide="One universal generation node - text or image, picked by Modality. With no connection pinned, resolves one from this node's resource pool (pipeline pool intersected with this node's own tags) using Priority.")
 
     register_node_type("transform", node_transform, "Transform (deterministic)", in_keys=["input"], out_keys=["value"], config_schema=[

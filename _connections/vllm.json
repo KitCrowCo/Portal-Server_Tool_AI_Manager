@@ -8,6 +8,7 @@
     "api_key": {"type": "secret", "label": "API Key", "default": "", "hint": "Sent as Authorization: Bearer"},
     "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 600}
   },
+  "capabilities": {"chat": true},
   "endpoints": {
     "health": {"method": "GET", "path": "/v1/models"},
     "chat": {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "{model}", "messages": "{messages}", "stream": true, "temperature": "{temperature}", "top_p": "{top_p}", "max_tokens": "{num_predict}"}}
