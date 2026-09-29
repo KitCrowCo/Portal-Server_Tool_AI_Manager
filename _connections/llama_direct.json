@@ -12,7 +12,7 @@
   },
   "capabilities": {"list_models": true, "chat": true, "generate": true, "streaming": true, "model_list": true, "model_info": true, "model_delete": true, "model_pull_hf": true,
                    "context_cache_save": {"models": {}}, "context_cache_restore": {"models": {}}, "context_cache_list": true, "context_cache_purge": true,
-                   "lora_adapters": true, "tool_calling": false},
+                   "lora_adapters": true, "tool_calling": false, "context_cache_last_restore": true},
   "endpoints": {
     "health": {"method": "GET", "path": "/api/tags"},
     "list_models": {"method": "GET", "path": "/api/tags"},
@@ -25,6 +25,7 @@
     "context_cache_restore": {"method": "POST", "path": "/api/cache/restore", "body": {"cache_session": "{session}"}},
     "context_cache_list": {"method": "GET", "path": "/api/cache/list"},
     "context_cache_purge": {"method": "DELETE", "path": "/api/cache", "body": {"file": "{file}"}},
+    "context_cache_last_restore": {"method": "GET", "path": "/api/cache/last_restore"},
     "lora_available": {"method": "GET", "path": "/api/lora/available"},
     "lora_list": {"method": "GET", "path": "/api/lora/list"},
     "lora_set": {"method": "POST", "path": "/api/lora/set", "body": {"adapters": "{adapters}"}}

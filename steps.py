@@ -460,7 +460,7 @@ def register_builtins():
         BI.SettingField("text_template","Insert Text Template","textarea",advanced=True),
         BI.SettingField("source_label","Insert Source Label","text",advanced=True),
         BI.SettingField("limit","Entity Limit","number", default=500,step=1,advanced=True),
-        *_pool_fields(include_model=False, conn_type="knowledge_query". _conn_options_for_type), _key_map_field()], guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.")
+        *_pool_fields(include_model=False, conn_type="knowledge_query"), _key_map_field()], guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.")
 
     register_node_type("pipeline", node_pipeline, "Call Pipeline", in_keys=[], out_keys=[], config_schema=[
         BI.SettingField("pipeline_id","Pipeline","select", options=_pipeline_options),
