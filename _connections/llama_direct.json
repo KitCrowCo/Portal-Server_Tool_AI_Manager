@@ -43,6 +43,11 @@
     "stop": {"type": "list", "default": []},
     "kv_cache_type": {"type": "string", "default": "q8_0", "hint": "f16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl"},
     "cache_session": {"type": "string", "default": "", "hint": "Saved-context key (ring). Blank = shared 'default'"},
+    "ubatch_size": {"type": "integer", "default": null},
+    "batch_size": {"type": "integer", "default": null},
+    "num_gpu": {"type": "integer", "default": null, "hint": "Layers offloaded to GPU (llama.cpp -ngl)"},
+    "flash_attn": {"type": "string", "default": null},
+    "optimize": {"type": "string", "default": null, "hint": "ON | SET | UPPER | LOWER | OFF"},
     "lora_paths": {"type": "list", "default": [], "hint": "File names in the supervisor's loras folder"}
   },
   "supports_thinking": true,
