@@ -585,9 +585,9 @@ async def chat_page(request: Request):
     """Raw engine + WS wire-level debug harness - not a chat UI.
     Deliberately bypasses IM/im-in and ChatManager so failures are visible at the protocol level (raw POST payload, raw job_id, raw WS event stream) instead of hidden behind abstraction.
     Real chat surfaces (Athena, Tessa) use ChatManager."""
-    conns = connections.list_conns()
+    conns = connections.conns_matching("chat")
     conn_opts = "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in conns)
-    kg_opts = '<option value="">(no knowledge base)</option>' + "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in connections.list_conns(conn_type=CAP_KNOWLEDGE))
+    kg_opts = '<option value="">(no knowledge base)</option>' + "".join(f'<option value="{c["_id"]}">{_esc(c.get("display_name",c["_id"]))}</option>' for c in connections.conns_matching(CAP_KNOWLEDGE))
     return HTMLResponse(f"""<div style="max-width:60rem; margin:0 auto; padding:1.5rem; display:flex; flex-direction:column; gap:.6rem; height:100%; box-sizing:border-box">
                                 <div style="display:flex;justify-content:flex-end">
                                     <button class="ui-btn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"resources_open","lvl":1})}'>Resource Pool (CNodes)</button>

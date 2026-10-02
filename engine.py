@@ -4,7 +4,7 @@ Every currently-ready node runs together in one concurrent wave.
 The job reaches a fixed point (no more nodes ready) either because everything ran, or because some nodes never got their keys - those are left status="unreached", which is the entire mechanism for conditional branches (see steps.py's branch/pipeline node types): nothing here ever 'decides' to skip anything.
 """
 
-import json, uuid, asyncio, traceback, time
+import json, uuid, asyncio, traceback, time,re
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -115,25 +115,22 @@ async def _run_flow(flow: dict, data: dict, job_id: str, username: str, pool_cfg
         if not ready: break
         wave_num += 1
         job = load_job(job_id); _log(job, f"wave {wave_num}: starting {len(ready)} node(s): {[n.id for n,_ in ready]}"); _save_job(job)
-
+        
         async def run_one(n: FlowNode, spec: dict):
             await _set_node_status(job_id, username, n.id, "running", {"type": n.type, "name": n.name})
             t0 = time.time()
             try:
-                ctx = NodeContext(n, data, job_id, username, pool_cfg, depth)
-                result = await spec["fn"](n.config, data, ctx)
-                # for logical, val in (result or {}).items(): data[n.out_key(logical)] = val
-                # preview = {k: str(v)[:500] for k, v in (result or {}).items()}
-                # await _set_node_status(job_id, username, n.id, "done", {"preview": preview, "elapsed_s": round(time.time()-t0, 2)})
-                # return n.id
+                result = await spec["fn"](n.config, data, NodeContext(n, data, job_id, username, pool_cfg, depth))
             except Exception as e:
-                if n.config.get("on_error") == "escalate": result = await _attempt_self_heal(n, spec, data, job_id, username, pool_cfg, depth, e)
-                else: result = None
+                result = await _attempt_self_heal(n, spec, data, job_id, username, pool_cfg, depth, e) if n.config.get("on_error") == "escalate" else None
                 if result is None:
                     traceback.print_exc()
                     await _set_node_status(job_id, username, n.id, "error", {"message": str(e)})
                     raise
-
+            for logical, val in (result or {}).items(): data[n.out_key(logical)] = val
+            await _set_node_status(job_id, username, n.id, "done", {"preview": {k: str(v)[:500] for k, v in (result or {}).items()}, "elapsed_s": round(time.time() - t0, 2)})
+            return n.id
+     
         try:
             finished = await asyncio.gather(*[run_one(n, spec) for n, spec in ready])
         except Exception as e:

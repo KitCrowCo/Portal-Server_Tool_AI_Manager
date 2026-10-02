@@ -138,8 +138,9 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     conn, cnode = (get_conn(config.get("conn_id","")), None) if config.get("conn_id") else (None, None)
     if not conn:
         picked = resources.pick_conn_for_capability(resources.resolve_candidates(ctx.pool_cfg, tags, capability="chat"), "chat", priority)
-        if not picked: raise RuntimeError("generate: no connection matches this node's resource pool (check pipeline/node whitelist-blacklist tags)")
-        cnode, conn = picked
+        if picked: cnode, conn = picked
+        elif not (ctx.pool_cfg.get("whitelist_tags") or ctx.pool_cfg.get("whitelist_cnodes") or tags) and conns_matching("chat"): conn = conns_matching("chat")[0]
+        else: raise RuntimeError("generate: no connection matches this node's resource pool (check pipeline/node whitelist-blacklist tags)")
     model = config.get("model","")
     if not model:
         models = list_models_sync(conn)
