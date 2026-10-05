@@ -6,8 +6,8 @@ The engine remaps those to actual pipeline keys via the node's key_map and merge
 """
 import re, json, sys, asyncio, uuid, time
 from pathlib import Path
-from tools.ai_manager import engine, resources
 from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
+from tools.ai_manager import engine, resources, connections
 
 _NODE_TYPES: dict = {}
 _EMBED_PATTERNS = ("embed", "minilm", "bge-", "gte-", "e5-", "nomic-embed", "arctic-embed")
@@ -353,6 +353,155 @@ async def node_branch(config: dict, data: dict, ctx: NodeContext) -> dict:
     sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1, job_id=sub_job_id)
     return {**{k: sub_data.get(k, "") for k in export_keys}, "decision": decision, "_sub_job_id": sub_job_id}
 
+# --- capability connection resolution (shared by the speech and agent node types) ---
+
+def _node_tags(config: dict, field: str = "cnode_tags") -> list: return [t.strip() for t in str(config.get(field) or "").split(",") if t.strip()]
+
+def _pick_capability_conn(config: dict, ctx: NodeContext, capability: str, label: str, pin_field: str = "conn_id", tags_field: str = "cnode_tags") -> tuple:
+    """Returns (cnode or None, conn) for one capability. A pinned connection wins and must declare the capability; otherwise the node's pool (pipeline pool narrowed by this node's tags) picks by Priority.
+    With no pool restrictions at all and no CNode carrying the capability, falls back to the first connection declaring it - the same fallback generate uses for chat."""
+    if config.get(pin_field):
+        conn = get_conn(config[pin_field])
+        if not conn: raise RuntimeError(f"""{label}: pinned connection '{config[pin_field]}' no longer exists""")
+        if not connections.has_capability(conn, capability): raise RuntimeError(f"""{label}: pinned connection '{config[pin_field]}' ({conn.get('connection_type')}) does not declare '{capability}'""")
+        return None, conn
+    tags = _node_tags(config, tags_field)
+    picked = resources.pick_conn_for_capability(resources.resolve_candidates(ctx.pool_cfg, tags, capability=capability), capability, config.get("priority") or ctx.pool_cfg.get("priority", "balanced"))
+    if picked: return picked
+    if not (ctx.pool_cfg.get("whitelist_tags") or ctx.pool_cfg.get("whitelist_cnodes") or tags) and conns_matching(capability): return None, conns_matching(capability)[0]
+    raise RuntimeError(f"""{label}: no connection in this node's resource pool declares '{capability}' (check pool tags, or pin a connection)""")
+
+def _pick_chat_model(conn: dict, model: str, label: str) -> str:
+    if model: return model
+    models = list_models_sync(conn)
+    picked = pick_default_chat_model(models)
+    if not picked: raise RuntimeError(f"""{label}: connection {conn.get('_id','?')} has no non-embedding models available - pin one via the Model field. Available: {models}""")
+    return picked
+
+# --- speech: transcribe / speak through whichever connection declares speech_to_text / text_to_speech ---
+
+async def node_transcribe(config: dict, data: dict, ctx: NodeContext) -> dict:
+    audio = ctx.get("audio_b64")
+    if not audio: raise RuntimeError("transcribe: audio_b64 in-key is empty")
+    cnode, conn = _pick_capability_conn(config, ctx, "speech_to_text", "transcribe")
+    t0 = time.time()
+    r = await connections.call_capability(conn, "speech_to_text", {"audio_b64": audio, "language": config.get("language") or None, "model": config.get("stt_model") or None, "vad_filter": bool(config.get("vad_filter", True)), "initial_prompt": ctx.resolve(config.get("initial_prompt") or "") or None})
+    if r.get("error"): raise RuntimeError(f"""transcribe: {r['error']}""")
+    if cnode: resources.log_usage(cnode["id"], "transcribe", time.time()-t0, {"audio_s": r.get("duration_s")})
+    return {"text": r.get("text", ""), "segments": r.get("segments", []), "language": r.get("language", "")}
+
+async def node_speak(config: dict, data: dict, ctx: NodeContext) -> dict:
+    text = str(ctx.get("text"))
+    if not text.strip(): raise RuntimeError("speak: text in-key is empty")
+    cnode, conn = _pick_capability_conn(config, ctx, "text_to_speech", "speak")
+    t0 = time.time()
+    r = await connections.call_capability(conn, "text_to_speech", {"text": text, "voice": config.get("voice") or None, "length_scale": None if config.get("length_scale") in (None, "") else float(config["length_scale"])})
+    if r.get("error"): raise RuntimeError(f"""speak: {r['error']}""")
+    if cnode: resources.log_usage(cnode["id"], "speak", time.time()-t0, {"audio_s": r.get("duration_s")})
+    return {"audio_b64": r["audio_b64"], "format": r.get("format", "wav"), "duration_s": r.get("duration_s")}
+
+# --- agent_loop: one LLM working through a toolset connection's tools until it calls the finish tool ---
+# The toolset (agent_tools_list / agent_tools_call, optionally agent_session_open / agent_session_close) is any connection declaring those capabilities - a code workspace today, anything else later.
+# The loop itself never touches files: every effect goes through the toolset, which owns its own shadow stage (the code workspace commits to an ai/<id> branch and never merges).
+
+_TEXT_TOOL_RE = re.compile(r"```tool\s*(\{.*?\})\s*```", re.S)
+_FINISH_TOOL = {"name": "finish", "description": "Call exactly once when the task is complete or cannot be completed. summary: which files and functions changed and why, what was verified, and what was not.", "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}
+
+def _text_tool_protocol(tools: list) -> str:
+    """Tool instructions for a chat connection that declares no native tool_calling - works with any instruction-following model, less reliably than native calls."""
+    listing = "\n".join(f"""- {t['name']}: {t.get('description','')}\n  arguments: {json.dumps(t.get('parameters', {}))}""" for t in tools)
+    return f"""You act only through tools. To call a tool, end your reply with one or more blocks of exactly this form:
+```tool
+{{"name": "<tool name>", "arguments": {{...}}}}
+```
+Each result comes back in the next message. Available tools:
+{listing}"""
+
+def _parse_text_tool_calls(text: str) -> list:
+    out = []
+    for blob in _TEXT_TOOL_RE.findall(text):
+        try: obj = json.loads(blob)
+        except json.JSONDecodeError: out.append({"id": "", "name": "_invalid", "arguments": {"_raw": blob}}); continue
+        out.append({"id": "", "name": str(obj.get("name", "")), "arguments": obj["arguments"] if isinstance(obj.get("arguments"), dict) else {}})
+    return out
+
+def _trim_transcript(messages: list, budget_chars: int, keep_head: int = 2) -> int:
+    """Drops whole oldest turns (an assistant message plus everything answering it) until the transcript fits, always keeping the system prompt and task. Returns the number of turns dropped.
+    Trimming changes the prompt prefix, so the next model call re-processes the whole transcript instead of reusing its KV cache."""
+    head, tail, dropped = messages[:keep_head], messages[keep_head:], 0
+    while tail and sum(len(json.dumps(m)) for m in head + tail) > budget_chars:
+        tail = tail[next((i for i, m in enumerate(tail[1:], 1) if m["role"] == "assistant"), len(tail)):]
+        dropped += 1
+    messages[:] = head + tail
+    return dropped
+
+async def _agent_tool_call(tconn: dict, session: str, call: dict, tools: list) -> str:
+    """A tool-level failure (bad path, no unique match) goes back to the model as text so it can correct itself; a transport failure (toolset node down) raises and fails the node."""
+    if call["name"] == "_invalid": return f"""ERROR: the tool block was not valid JSON: {call['arguments'].get('_raw', '')[:500]}"""
+    if not any(t["name"] == call["name"] for t in tools): return f"""ERROR: unknown tool '{call['name']}'. Available: {', '.join(t['name'] for t in tools)}"""
+    r = await connections.call_capability(tconn, "agent_tools_call", {"session": session, "name": call["name"], "arguments": call["arguments"]})
+    if r.get("error"): raise RuntimeError(f"""agent_loop: toolset call failed: {r['error']}""")
+    return r.get("output", "") if r.get("ok") else f"""ERROR: {r.get('output', '')}"""
+
+async def node_agent_loop(config: dict, data: dict, ctx: NodeContext) -> dict:
+    tcnode, tconn = _pick_capability_conn(config, ctx, "agent_tools_call", "agent_loop(tools)", pin_field="tools_conn_id", tags_field="tools_cnode_tags")
+    cnode, conn = _pick_capability_conn(config, ctx, "chat", "agent_loop(chat)")
+    model = _pick_chat_model(conn, config.get("model", ""), "agent_loop")
+    listed = await connections.call_capability(tconn, "agent_tools_list", {})
+    if listed.get("error"): raise RuntimeError(f"""agent_loop: tool list failed: {listed['error']}""")
+    allow = set(_node_tags(config, "allow_tools"))
+    finish_name = config.get("finish_tool") or "finish"
+    tools = [t for t in listed.get("tools", []) if not allow or t["name"] in allow]
+    if not any(t["name"] == finish_name for t in tools): tools.append({**_FINISH_TOOL, "name": finish_name})
+    protocol = config.get("tool_protocol") or "auto"
+    native = protocol == "native" or (protocol == "auto" and connections.has_capability(conn, "tool_calling", model))
+    if protocol == "auto" and not native: await ctx.progress(f"""connection {conn.get('_id')} declares no tool_calling - using the text tool protocol""")
+    session, extra_ctx, close = "", "", {}
+    if connections.has_capability(tconn, "agent_session_open"):
+        opened = await connections.call_capability(tconn, "agent_session_open", {"label": f"{ctx.job_id}:{ctx.node.id}", **_parse_json_config(config.get("session_args_json"), {})})
+        if opened.get("error"): raise RuntimeError(f"""agent_loop: session open failed: {opened['error']}""")
+        session, extra_ctx = opened["session"], opened.get("context", "")
+        await ctx.progress(f"""session {session} on {opened.get('branch', '')}""")
+    task = ctx.resolve(config.get("user_template") or "{input}")
+    messages = [{"role": "system", "content": "\n\n".join(p for p in (ctx.resolve(config.get("system_prompt") or ""), extra_ctx, "" if native else _text_tool_protocol(tools)) if p)}, {"role": "user", "content": task}]
+    native_tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters") or {"type": "object", "properties": {}}}} for t in tools] if native else None
+    num_ctx = int(config.get("num_ctx", 32768))
+    budget = num_ctx * 3 if config.get("ctx_chars") in (None, "", 0) else int(config["ctx_chars"])
+    status, summary, steps_done, trimmed, nudged, t0 = "max_steps", "", 0, 0, False, time.time()
+    try:
+        for _ in range(int(config.get("max_steps", 60))):
+            if (engine.load_job(ctx.job_id) or {}).get("status") == "stopping": status = "stopped"; break
+            trimmed += _trim_transcript(messages, budget)
+            if trimmed: messages[1] = {"role": "user", "content": f"{task}\n\n({trimmed} earlier step(s) were trimmed from this transcript to fit the context budget - re-read files instead of relying on memory of them.)"}
+            text, calls = "", []
+            async for ev in connections.stream_llm_events(conn, messages, model, think=config.get("think") or False, tools=native_tools, temperature=config.get("temperature", 0.2), num_ctx=num_ctx, num_predict=config.get("num_predict", -1), kv_cache_type=config.get("kv_cache_type") or None, cache_session=config.get("cache_session") or None):
+                text += ev["text"]; calls += ev["tool_calls"]
+                if ev["text"]: await ctx.stream("text", ev["text"])
+            if not native: calls = _parse_text_tool_calls(text)
+            steps_done += 1
+            messages.append({"role": "assistant", "content": text, **({"tool_calls": [{**({"id": c["id"]} if c["id"] else {}), "type": "function", "function": {"name": c["name"], "arguments": c["arguments"]}} for c in calls]} if native and calls else {})})
+            if not calls:
+                if nudged: status = "no_tool_call"; break
+                nudged = True
+                messages.append({"role": "user", "content": f"No tool call was found in your reply. Act through a tool, or call {finish_name} if the task is done."})
+                continue
+            nudged = False
+            for c in calls:
+                await ctx.stream("text", f"""\n[tool] {c['name']} {json.dumps(c['arguments'])[:300]}\n""")
+                if c["name"] == finish_name: status, summary = "finished", str(c["arguments"].get("summary") or text); break
+                out = await _agent_tool_call(tconn, session, c, tools)
+                await ctx.stream("text", f"[result] {out[:500]}\n")
+                messages.append({"role": "tool", "content": out, "tool_name": c["name"], **({"tool_call_id": c["id"]} if c["id"] else {})} if native else {"role": "user", "content": f"""Result of {c['name']}:\n{out}"""})
+            if status == "finished": break
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        if session: close = await connections.call_capability(tconn, "agent_session_close", {"session": session, "message": f"{(summary or task)[:2000]}\n\n[agent_loop {ctx.job_id} - {status} after {steps_done} step(s)]"})
+        if cnode: resources.log_usage(cnode["id"], "agent_loop", time.time()-t0, {"steps": steps_done, "status": status})
+    if close.get("error"): raise RuntimeError(f"""agent_loop: session close failed - the worktree is still open on the node: {close['error']}""")
+    return {"summary": summary, "agent_status": status, "steps": steps_done, "branch": close.get("branch", ""), "workspace": {**close, "conn_id": tconn.get("_id", "")}, "transcript": messages}
+
 def looks_like_embedding(model_name: str) -> bool: return any(p in model_name.lower() for p in _EMBED_PATTERNS)
 
 def pick_default_chat_model(models: list) -> str:
@@ -495,3 +644,35 @@ def register_builtins():
         BI.SettingField("export_keys","Export Keys (comma-sep)","text"),
         BI.SettingField("vars_json","Variables (JSON: name -> template)","json",default={},advanced=True),
         *_pool_fields(), _key_map_field()], guide="Decides a value, looks it up in Routes, calls whichever sub-pipeline matches (falling back to Default Pipeline ID). Only the chosen path actually runs.")
+    
+    register_node_type("transcribe", node_transcribe, "Transcribe (speech to text)", in_keys=["audio_b64"], out_keys=["text","segments","language"], config_schema=[
+        BI.SettingField("language","Language (ISO code, blank = auto-detect)","text"),
+        BI.SettingField("vad_filter","Skip silence (VAD)","checkbox",default=True),
+        BI.SettingField("initial_prompt","Vocabulary Prompt","textarea",advanced=True,hint="Names and jargon the recognizer should expect. Supports {key}."),
+        BI.SettingField("stt_model","Recognizer Model Override","text",advanced=True,hint="Blank = the node's default (e.g. small, medium, large-v3)."),
+        *_pool_fields(include_model=False, conn_type="speech_to_text"), _key_map_field()], guide="Sends base64 audio (webm/ogg/mp4/wav/mp3) in 'audio_b64' to any connection declaring speech_to_text and returns the text. Pair with Speak and Generate for a voice conversation.")
+
+    register_node_type("speak", node_speak, "Speak (text to speech)", in_keys=["text"], out_keys=["audio_b64","format","duration_s"], config_schema=[
+        BI.SettingField("voice","Voice","text",hint="Voice id on the speech node (e.g. en_US-lessac-medium). Blank = the node's default."),
+        BI.SettingField("length_scale","Speaking Pace (length scale)","number",default=None,hint=">1 slower, <1 faster. Blank = the voice's own pace."),
+        *_pool_fields(include_model=False, conn_type="text_to_speech"), _key_map_field()], guide="Synthesizes 'text' through any connection declaring text_to_speech and returns base64 audio. The speech node strips thinking blocks, code and markdown before speaking.")
+
+    register_node_type("agent_loop", node_agent_loop, "Agent Loop (LLM + toolset)", in_keys=["input"], out_keys=["summary","agent_status","steps","branch","workspace","transcript"], config_schema=[
+        BI.SettingField("system_prompt","System Prompt","textarea",default="You are a careful coding agent. Read the code you change and its callers first, keep edits small, check your work, then finish with an exact summary."),
+        BI.SettingField("user_template","Task Template","textarea",default="{input}",hint="{key} substitutes real pipeline keys."),
+        BI.SettingField("tools_conn_id","Toolset Connection","select",default="",options=lambda values=None: [("", "(pool-resolved by priority)")] + [(c["_id"], c.get("display_name", c["_id"])) for c in conns_matching("agent_tools_call")]),
+        BI.SettingField("tools_cnode_tags","Toolset Pool Tags (comma-sep)","text",advanced=True),
+        BI.SettingField("allow_tools","Allowed Tools (comma-sep, blank = all)","text",advanced=True,hint="Narrows what the model may call, e.g. read-only review: list_files,read_file,grep,outline"),
+        BI.SettingField("session_args_json","Session Arguments (JSON)","json",default={},advanced=True,hint='Passed to the toolset when the run opens, e.g. {"base": "main"}.'),
+        BI.SettingField("max_steps","Max Steps","number",default=60,step=1),
+        BI.SettingField("tool_protocol","Tool Protocol","select",default="auto",options=[("auto","Auto (native when the connection declares tool_calling)"),("native","Native tool calls"),("text","Text blocks (any model)")],advanced=True),
+        BI.SettingField("finish_tool","Finish Tool Name","text",default="finish",advanced=True),
+        BI.SettingField("temperature","Temperature","number",default=0.2),
+        BI.SettingField("num_ctx","Context Window Tokens","number",default=32768,step=1),
+        BI.SettingField("ctx_chars","Transcript Budget (chars, blank = 3 x context tokens)","number",default=None,step=1,advanced=True),
+        BI.SettingField("num_predict","Max Output Tokens per Step","number",default=-1,step=1,advanced=True),
+        BI.SettingField("think","Thinking Effort","select",default="",options=[("","Off"),("low","Low"),("medium","Medium"),("high","High")],advanced=True),
+        BI.SettingField("kv_cache_type","KV Cache Type (llama.cpp connections)","select",default="",options=[("","(connection default)")]+[(k,k) for k in ("f16","q8_0","q5_1","q5_0","q4_1","q4_0","iq4_nl")],advanced=True),
+        BI.SettingField("cache_session","Saved-Context Session","text",advanced=True),
+        *_pool_fields(), _key_map_field()], guide="Runs one model against a toolset connection until it calls the finish tool, hits Max Steps, or the job is stopped. Opens a toolset session first when the toolset supports one (the code workspace gives each run its own ai/<id> branch) and always closes it, committing whatever was done. Native tool calls when the chat connection declares tool_calling, otherwise a text-block protocol with a progress warning.")
+

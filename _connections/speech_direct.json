@@ -1,0 +1,20 @@
+{
+  "_meta": {"schema_version": "1.0", "connection_type": "speech_direct", "display_name": "Speech node (STT + TTS)", "icon": "&#x1F3A4;",
+            "description": "speech_direct node: faster-whisper transcription plus Piper, Kokoro and F5-TTS clone voices, JSON in/out with base64 audio. FOSS, offline after the one-off model/voice downloads (HF_HUB_OFFLINE=1 on the node)."},
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1", "required": true},
+    "port": {"type": "integer", "label": "Port", "default": 8795, "required": true},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": ""},
+    "api_key": {"type": "secret", "label": "API Key", "default": "", "hint": "Only if the node sits behind an auth proxy - sent as Authorization: Bearer"},
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 900}
+  },
+  "capabilities": {"speech_to_text": true, "text_to_speech": true, "voice_list": true, "stt_languages": true},
+  "endpoints": {
+    "health": {"method": "GET", "path": "/health"},
+    "speech_to_text": {"method": "POST", "path": "/api/transcribe", "body": {"audio_b64": "{audio_b64}", "language": "{language}", "model": "{model}", "vad_filter": "{vad_filter}", "initial_prompt": "{initial_prompt}"}},
+    "text_to_speech": {"method": "POST", "path": "/api/speak", "body": {"text": "{text}", "voice": "{voice}", "length_scale": "{length_scale}"}},
+    "voice_list": {"method": "GET", "path": "/api/voices"},
+    "stt_languages": {"method": "GET", "path": "/api/languages"}
+  }
+}

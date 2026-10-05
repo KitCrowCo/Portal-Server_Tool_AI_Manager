@@ -17,6 +17,7 @@ ENV: dict = {}
 PIPE_DIR = Path("./data/ai_manager/pipelines")
 JOB_DIR = Path("./data/ai_manager/jobs")
 _ACTIVE: dict = {}
+_LANES: dict = {}
 logger = logging.getLogger("ai_manager.engine")
 
 DEFAULT_POOL = {"whitelist_tags": [], "blacklist_tags": [], "whitelist_cnodes": [], "blacklist_cnodes": [], "priority": "balanced"}
@@ -28,15 +29,18 @@ Return config_patch: null if no config value can fix this - e.g. the step's own 
 async def _attempt_self_heal(n, spec, data, job_id, username, pool_cfg, depth, exc):
     if n.config.get("_heal_attempted"): return None
     from tools.ai_manager import resources, connections
-    picked = resources.pick_conn(resources.resolve_candidates(pool_cfg, [], "ollama"), "ollama", pool_cfg.get("priority", "balanced"))
-    if not picked: return None
-    _, conn = picked
+    from tools.ai_manager.steps import pick_default_chat_model
+    picked = resources.pick_conn_for_capability(resources.resolve_candidates(pool_cfg, [], capability="chat"), "chat", pool_cfg.get("priority", "balanced"))
+    conn = picked[1] if picked else None if (pool_cfg.get("whitelist_tags") or pool_cfg.get("whitelist_cnodes")) else next(iter(connections.conns_matching("chat")), None)   # same unrestricted-pool fallback the generate node uses
+    if not conn: return None
+    model = pick_default_chat_model(connections.list_models_sync(conn))
+    if not model: return None
     keys_seen = spec.get("in_keys", []) + n.extra_in_keys
     snapshot = {k: str(data.get(k, ""))[:800] for k in keys_seen}
     prompt = json.dumps({"node_type": n.type, "config": n.config, "error": str(exc), "input_snapshot": snapshot}, indent=2)
     full = ""
     try:
-        async for text, _think in connections.stream_llm(conn, [{"role":"system","content":_SELF_HEAL_SYSTEM}, {"role":"user","content":prompt}], "", temperature=0.1, num_predict=500):
+        async for text, _think in connections.stream_llm(conn, [{"role":"system","content":_SELF_HEAL_SYSTEM}, {"role":"user","content":prompt}], model, temperature=0.1, num_predict=500):
             full += text
     except Exception: return None
 
@@ -81,7 +85,7 @@ def _reconcile_stale_jobs():
     for f in JOB_DIR.glob("*.json"):
         try:
             job = json.loads(f.read_text())
-            if job.get("status") == "running": job["status"] = "interrupted"; f.write_text(json.dumps(job, indent=2))
+            if job.get("status") in ("running", "queued"): job["status"] = "interrupted"; f.write_text(json.dumps(job, indent=2))  # a restart re-confirms rather than assumes continuation - resume() is the explicit restart
         except Exception: continue
 
 def _log(job: dict, msg: str): job.setdefault("log", []).append(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}")
@@ -140,9 +144,21 @@ async def _run_flow(flow: dict, data: dict, job_id: str, username: str, pool_cfg
         job = load_job(job_id); job["data"] = data; _log(job, f"wave {wave_num}: complete"); _save_job(job)
     return data
 
+# --- Lanes ---
+# A lane serializes jobs that share one scarce resource (one model on one node, one repo): jobs submitted with the same lane name run strictly one at a time, in submission order, staying "queued" until their turn.
+# Jobs without a lane run immediately and concurrently, exactly as before. Lane names are free-form - the caller decides what resource it is protecting.
+
+def _lane(name: str) -> asyncio.Lock: return _LANES.setdefault(name, asyncio.Lock())
+
 async def _run(job_id: str):
     job = load_job(job_id)
     if not job: return
+    if not job.get("lane"): return await _run_job(job_id)
+    async with _lane(job["lane"]): await _run_job(job_id)
+
+async def _run_job(job_id: str):
+    job = load_job(job_id)
+    if job["status"] in ("stopping", "stopped"): job["status"] = "stopped"; _log(job, "stopped before it started"); _save_job(job); _ACTIVE.pop(job_id, None); return
     job["status"] = "running"; _log(job, "job started"); _save_job(job)
     try:
         data = await _run_flow(job["flow"], dict(job["data"]), job_id, job["username"], job.get("pool", DEFAULT_POOL))
@@ -169,7 +185,7 @@ def _task_exception_logger(task: asyncio.Task):
     exc = task.exception()
     if exc: logger.error("Unhandled exception in pipeline job task", exc_info=exc)
 
-def submit(username, kind="id", pipeline_id="", inline_flow=None, inputs=None, allowed_tags=None, allowed_ids=None, pool_cfg=None) -> tuple:
+def submit(username, kind="id", pipeline_id="", inline_flow=None, inputs=None, allowed_tags=None, allowed_ids=None, pool_cfg=None, lane: str = "") -> tuple:
     if kind == "id":
         pdef = load_pipeline(pipeline_id)
         if not pdef: return None, "pipeline not found"
@@ -183,7 +199,7 @@ def submit(username, kind="id", pipeline_id="", inline_flow=None, inputs=None, a
         pool = pool_cfg or DEFAULT_POOL
     for n in flow_data.get("nodes", []): n["status"] = "idle"; n.pop("ts", None); n.pop("preview", None); n.pop("message", None)
     job_id = f"job_{uuid.uuid4().hex[:10]}"
-    job = {"id": job_id, "username": username, "flow": flow_data, "pool": pool, "status": "queued", "data": dict(inputs or {}), "log": [], "heartbeat": time.time(), "created": datetime.utcnow().isoformat()}
+    job = {"id": job_id, "username": username, "flow": flow_data, "pool": pool, "status": "queued", "lane": lane, "data": dict(inputs or {}), "log": [], "heartbeat": time.time(), "created": datetime.utcnow().isoformat()}
     _save_job(job)
     task = asyncio.create_task(_run(job_id))
     task.add_done_callback(_task_exception_logger)
@@ -193,8 +209,8 @@ def submit(username, kind="id", pipeline_id="", inline_flow=None, inputs=None, a
 def resume(job_id: str) -> tuple:
     job = load_job(job_id)
     if not job: return None, "job not found"
-    if job["status"] == "running": return job_id, ""
-    job["status"] = "running"; _save_job(job)
+    if job["status"] in ("running", "queued") and job_id in _ACTIVE: return job_id, ""
+    job["status"] = "queued"; _save_job(job)
     task = asyncio.create_task(_run(job_id))
     task.add_done_callback(_task_exception_logger)
     _ACTIVE[job_id] = task
@@ -202,7 +218,7 @@ def resume(job_id: str) -> tuple:
 
 def stop(job_id: str):
     job = load_job(job_id)
-    if job: job["status"] = "stopping"; _save_job(job)
+    if job: job["status"] = "stopped" if job["status"] == "queued" else "stopping"; _save_job(job)
 
 async def run_inline(username: str, pipeline_id: str, inputs: dict = None, pool_cfg: dict = None, depth: int = 0, max_depth = 100, job_id: str = None) -> dict:
     """Runs a saved pipeline to completion and returns its final data object - used by the pipeline/pipeline_foreach/branch node types to compose pipelines together. Depth guards against runaway self-referential recursion.

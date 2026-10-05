@@ -139,29 +139,38 @@ def connection_capabilities(conn: dict) -> dict:
     """What this connection's own profile declares it can do - checked before ever routing a request to it. A missing/false key always means 'not supported', never assumed true."""
     return _conn_profile(conn).get("capabilities", {})
 
-async def stream_llm(conn: dict, messages: list, model: str, think = False, **kwargs):
-    """Agnostic chat stream. Yields (text, thinking) tuples per chunk - thinking is "" for providers/calls that don't produce it.
-    think=True is honored only if the connection's profile declares supports_thinking;
-    otherwise it's silently dropped with a console warning, never an error - a provider lacking a capability is a gap in that provider, not a reason to remove the capability for providers that have it."""
+def _auth_headers(conn: dict) -> dict: return {"Authorization": f"""Bearer {conn['values']['api_key']}"""} if conn.get("values", {}).get("api_key") else {}
+
+def _norm_tool_call(tc: dict) -> dict:
+    """Ollama sends function.arguments as a dict, OpenAI-shaped providers as a JSON string - every caller gets {id, name, arguments: dict}."""
+    fn = tc.get("function", tc)
+    args = fn.get("arguments", {})
+    if isinstance(args, str):
+        try: args = json.loads(args) if args.strip() else {}
+        except json.JSONDecodeError: args = {"_raw": args}
+    return {"id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": args if isinstance(args, dict) else {"_raw": args}}
+
+async def stream_llm_events(conn: dict, messages: list, model: str, think = False, tools: list = None, **kwargs):
+    """Agnostic chat stream. Yields {"text", "thinking", "tool_calls"} per chunk - empty values for whatever a chunk doesn't carry.
+    think=True is honored only if the connection's profile declares supports_thinking; otherwise it's dropped with a console warning, never an error - a provider lacking a capability is a gap in that provider, not a reason to remove the capability for providers that have it.
+    tools (OpenAI/Ollama function list) is sent only when given AND the profile's chat body declares a {tools} placeholder; returned calls are read from response_parser.tool_calls_path and normalized by _norm_tool_call."""
     profile = _conn_profile(conn)
     chat_ep = profile.get("endpoints", {}).get("chat", {})
-    if not chat_ep: raise RuntimeError(f"stream_llm: connection_type '{conn.get('connection_type')}' has no endpoints.chat")
+    if not chat_ep: raise RuntimeError(f"""stream_llm: connection_type '{conn.get('connection_type')}' has no endpoints.chat""")
     supports_thinking = profile.get("supports_thinking", False)
-    if think and not supports_thinking: print(f"[stream_llm] '{conn.get('connection_type')}' has no supports_thinking - think={think!r} ignored for this call")
+    if think and not supports_thinking: print(f"""[stream_llm] '{conn.get('connection_type')}' has no supports_thinking - think={think!r} ignored for this call""")
     options = _resolved_options(profile, kwargs)
-    payload = _render_template(chat_ep.get("body", {}), {"model": model, "messages": messages, "think": (think if supports_thinking else False), "options": options, **options})
+    payload = _render_template(chat_ep.get("body", {}), {"model": model, "messages": messages, "think": (think if supports_thinking else False), "options": options, **options, **({"tools": tools} if tools else {})})
+    if tools and "tools" not in payload: print(f"""[stream_llm] '{conn.get('connection_type')}' chat body has no {{tools}} placeholder - tools not sent for this call""")
     url = _base(conn) + chat_ep.get("path", "/api/chat")
-    headers = {}
-    api_key = conn.get("values", {}).get("api_key", "")
-    if api_key: headers["Authorization"] = f"Bearer {api_key}"
     parser = profile.get("response_parser", {"stream_format": "jsonl", "content_path": "message.content"})
     done_sentinel = profile.get("status_map", {}).get("stream_done_sentinel", {})
     timeout_s = float(conn.get("values", {}).get("timeout_s", 3000))
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=10.0, pool=10.0)) as c:
-        async with c.stream(chat_ep.get("method","POST"), url, json=payload, headers=headers) as resp:
+        async with c.stream(chat_ep.get("method","POST"), url, json=payload, headers=_auth_headers(conn)) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
-                raise RuntimeError(f"connection error {resp.status_code} calling {conn.get('_id','?')} model '{model}': {body.decode(errors='replace')[:500]}")
+                raise RuntimeError(f"""connection error {resp.status_code} calling {conn.get('_id','?')} model '{model}': {body.decode(errors='replace')[:500]}""")
             async for line in resp.aiter_lines():
                 if not line: continue
                 if parser.get("stream_format") == "sse":
@@ -172,8 +181,14 @@ async def stream_llm(conn: dict, messages: list, model: str, think = False, **kw
                 except json.JSONDecodeError: continue
                 text = _get_nested_value(chunk, parser.get("content_path",""))
                 thinking = _get_nested_value(chunk, parser.get("thinking_path","")) if supports_thinking else ""
-                if text or thinking: yield text, thinking
+                calls = _get_nested_value(chunk, parser.get("tool_calls_path","")) if tools else ""
+                if text or thinking or calls: yield {"text": text or "", "thinking": thinking or "", "tool_calls": [_norm_tool_call(tc) for tc in calls] if isinstance(calls, list) else []}
                 if done_sentinel and chunk.get(done_sentinel.get("key","done")) == done_sentinel.get("value", True): break
+
+async def stream_llm(conn: dict, messages: list, model: str, think = False, **kwargs):
+    """(text, thinking) tuple view over stream_llm_events, for every caller that doesn't use tool calls."""
+    async for ev in stream_llm_events(conn, messages, model, think, **kwargs):
+        if ev["text"] or ev["thinking"]: yield ev["text"], ev["thinking"]
 
 def has_capability(conn: dict, capability: str, model: str = "") -> bool:
     """True/False capabilities are static. A dict capability checks its 'models' sublayer -
@@ -184,18 +199,32 @@ def has_capability(conn: dict, capability: str, model: str = "") -> bool:
         return models.get(model, True) if model else True
     return bool(cap)
 
+def _capability_request(conn: dict, capability: str, payload: dict) -> tuple:
+    """(method, url, body) for one capability from the connection's profile, or (None, None, error text) - shared by call_capability and call_capability_sync."""
+    if not has_capability(conn, capability): return None, None, f"""connection '{conn.get('_id','?')}' ({conn.get('connection_type','?')}) does not declare capability '{capability}'"""
+    ep = _conn_profile(conn).get("endpoints", {}).get(capability, {})
+    if not ep: return None, None, f"""profile declares '{capability}' but has no endpoints.{capability} - profile misconfigured"""
+    return ep.get("method", "POST"), _base(conn) + ep.get("path", "/"), _render_template(ep.get("body", {}), payload)
+
 async def call_capability(conn: dict, capability: str, payload: dict, timeout_s: float = None) -> dict:
     """Generic dispatcher for any non-streaming capability a connection's profile declares - image/video generation, context-cache save/load, LoRA management, or anything not yet imagined.
     Same config-over-code shape as stream_llm; never named after a capability or backend."""
-    profile = _conn_profile(conn)
-    if not has_capability(conn, capability): return {"error": f"connection '{conn.get('_id','?')}' ({conn.get('connection_type','?')}) does not declare capability '{capability}'"}
-    ep = profile.get("endpoints", {}).get(capability, {})
-    if not ep: return {"error": f"profile declares '{capability}' but has no endpoints.{capability} - profile misconfigured"}
-    body = _render_template(ep.get("body", {}), payload)
+    method, url, body = _capability_request(conn, capability, payload)
+    if not method: return {"error": body}
     read_timeout = timeout_s if timeout_s is not None else float(conn.get("values", {}).get("timeout_s", 3600))
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=10.0)) as c:
-            r = await c.request(ep.get("method", "POST"), _base(conn) + ep.get("path", "/"), json=body)
+            r = await c.request(method, url, json=body, headers=_auth_headers(conn))
+            return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
+    except Exception as e: return {"error": str(e)}
+
+def call_capability_sync(conn: dict, capability: str, payload: dict = None, timeout_s: float = 10.0) -> dict:
+    """Blocking sibling of call_capability for quick lookups made while rendering (option lists such as a node's voices or languages). Short default timeout - never use it for generation."""
+    method, url, body = _capability_request(conn, capability, payload or {})
+    if not method: return {"error": body}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(connect=3.0, read=timeout_s, write=5.0, pool=3.0)) as c:
+            r = c.request(method, url, json=body, headers=_auth_headers(conn))
             return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
     except Exception as e: return {"error": str(e)}
 
@@ -210,7 +239,7 @@ async def stream_capability(conn: dict, capability: str, payload: dict):
     body = _render_template(ep.get("body", {}), payload)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=float(conn.get("values", {}).get("timeout_s", 3600)), write=30.0, pool=10.0)) as c:
-            async with c.stream(ep.get("method", "POST"), _base(conn) + ep.get("path", "/"), json=body) as r:
+            async with c.stream(ep.get("method", "POST"), _base(conn) + ep.get("path", "/"), json=body, headers=_auth_headers(conn)) as r:
                 if r.status_code != 200: yield {"error": f"HTTP {r.status_code}: {(await r.aread()).decode(errors='replace')[:300]}"}; return
                 async for line in r.aiter_lines():
                     if not line.strip(): continue

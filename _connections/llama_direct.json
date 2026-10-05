@@ -12,11 +12,11 @@
   },
   "capabilities": {"list_models": true, "chat": true, "generate": true, "streaming": true, "model_list": true, "model_info": true, "model_delete": true, "model_pull_hf": true,
                    "context_cache_save": {"models": {}}, "context_cache_restore": {"models": {}}, "context_cache_list": true, "context_cache_purge": true,
-                   "lora_adapters": true, "tool_calling": false, "context_cache_last_restore": true},
+                   "lora_adapters": true, "tool_calling": {"models": {}}, "context_cache_last_restore": true},
   "endpoints": {
     "health": {"method": "GET", "path": "/api/tags"},
     "list_models": {"method": "GET", "path": "/api/tags"},
-    "chat": {"method": "POST", "path": "/api/chat", "body": {"model": "{model}", "messages": "{messages}", "stream": true, "think": "{think}", "options": "{options}"}},
+    "chat": {"method": "POST", "path": "/api/chat", "body": {"model": "{model}", "messages": "{messages}", "stream": true, "think": "{think}", "options": "{options}", "tools": "{tools}"}},
     "model_list": {"method": "GET", "path": "/api/tags"},
     "model_info": {"method": "POST", "path": "/api/show", "body": {"name": "{name}"}},
     "model_delete": {"method": "DELETE", "path": "/api/delete", "body": {"name": "{name}", "confirm": "{confirm}"}},
@@ -51,6 +51,6 @@
     "lora_paths": {"type": "list", "default": [], "hint": "File names in the supervisor's loras folder"}
   },
   "supports_thinking": true,
-  "response_parser": {"stream_format": "jsonl", "content_path": "message.content", "thinking_path": "message.thinking"},
+  "response_parser": {"stream_format": "jsonl", "content_path": "message.content", "thinking_path": "message.thinking", "tool_calls_path": "message.tool_calls"},
   "status_map": {"success_codes": [200], "error_key": "error", "stream_done_sentinel": {"key": "done", "value": true}}
 }

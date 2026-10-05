@@ -4,7 +4,7 @@ ai_manager — sole centralized tool for AI operations. Owns connections, the st
 modules/ai_tools/* (Athena, Kimi, Tessa, Image) are UI surfaces that call into this tool directly (ENV["tools"]["ai_manager"]);
 they never hold their own connections or execution loops - avoids the race conditions of tools calling other tools.
 """
-import sys, os, json, re, uuid, copy
+import sys, os, json, re, uuid, copy, asyncio
 from pathlib import Path
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -37,6 +37,9 @@ CAP_CHAT = "chat"
 CAP_KNOWLEDGE = "knowledge_query"
 CAP_IMAGE_ENCODE = "flux2_text"   # transitional name - flux2_text.json has no "capabilities" block yet, so this still matches by connection_type until it does
 CAP_IMAGE_GEN = "flux2_image"     # same
+CAP_STT = "speech_to_text"
+CAP_TTS = "text_to_speech"
+CAP_AGENT_TOOLS = "agent_tools_call"
 
 def register_root(name: str, path: str): _NAMED_ROOTS[name] = path
 def resolve_root(name: str) -> str: return _NAMED_ROOTS.get(name, name)
@@ -113,7 +116,9 @@ class PipelineBuilderUI:
         p = self.intent_prefix
         IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change], f"{p}_node_pool_preview": [self._im_node_pool_preview], f"{p}_preflight": [self._im_preflight], f"{p}_view_subjob": [self._im_view_subjob]})
 
-    _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") in ("image", "video") else [CAP_CHAT], "knowledge": lambda cfg: [CAP_KNOWLEDGE], "branch": lambda cfg: [CAP_CHAT] if cfg.get("decide_mode") == "llm" else []}
+    # Each need is a capability string (pinned via config conn_id, narrowed by cnode_tags) or a (capability, pin_field, tags_field) tuple for nodes that resolve more than one connection.
+    _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") in ("image", "video") else [CAP_CHAT], "knowledge": lambda cfg: [CAP_KNOWLEDGE], "branch": lambda cfg: [CAP_CHAT] if cfg.get("decide_mode") == "llm" else [], "transcribe": lambda cfg: [CAP_STT], "speak": lambda cfg: [CAP_TTS], "agent_loop": lambda cfg: [CAP_CHAT, (CAP_AGENT_TOOLS, "tools_conn_id", "tools_cnode_tags")]}
+    _NO_POOL_FALLBACK = {CAP_KNOWLEDGE}  # node_knowledge raises when the pool is empty instead of falling back to the first matching connection
     _NODE_RECURSES = {"pipeline", "pipeline_foreach", "branch"}
     _NODE_CALLS = {"pipeline": lambda cfg: [cfg["pipeline_id"]] if cfg.get("pipeline_id") else [], "pipeline_foreach": lambda cfg: [cfg["pipeline_id"]] if cfg.get("pipeline_id") else [], "branch": lambda cfg: list({v for v in cfg.get("routes_json",{}).values() if v} | ({cfg["default_pipeline_id"]} if cfg.get("default_pipeline_id") else set()))}
 
@@ -446,16 +451,18 @@ class PipelineBuilderUI:
         cfg = node.get("config", {})
         needs = self._NODE_CONN_NEEDS.get(node.get("type",""), lambda c: [])(cfg)
         out = {}
-        for conn_type in needs:
-            if cfg.get("conn_id"):
-                conn = self.AIM.connections.get_conn(cfg["conn_id"])
-                out[conn_type] = ("pinned_ok", conn.get("display_name", cfg["conn_id"])) if conn else ("pinned_missing", cfg["conn_id"])
+        for need in needs:
+            cap, pin_field, tags_field = need if isinstance(need, tuple) else (need, "conn_id", "cnode_tags")
+            if cfg.get(pin_field):
+                conn = self.AIM.connections.get_conn(cfg[pin_field])
+                out[cap] = ("pinned_ok", conn.get("display_name", cfg[pin_field])) if conn and self.AIM.connections.has_capability(conn, cap) else ("pinned_missing", f"{cfg[pin_field]} (missing, or does not declare {cap})")
                 continue
             pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
-            tags = [t.strip() for t in str(cfg.get("cnode_tags","")).split(",") if t.strip()]
-            candidates = self.AIM.resources.resolve_candidates(pool, tags, conn_type)
-            picked = self.AIM.resources.pick_conn(candidates, conn_type, pool.get("priority", "balanced"))
-            out[conn_type] = ("pool_ok", picked[1].get("display_name", picked[1].get("_id",""))) if picked else ("pool_empty", f"{len(candidates)} CNode(s) matched tags/pool, none carry a {conn_type} connection" if candidates else "no CNode matches this pool's whitelist/blacklist + node tags")
+            tags = [t.strip() for t in str(cfg.get(tags_field) or "").split(",") if t.strip()]
+            candidates = self.AIM.resources.resolve_candidates(pool, tags, capability=cap)
+            picked = self.AIM.resources.pick_conn_for_capability(candidates, cap, pool.get("priority", "balanced"))
+            fallback = None if (picked or cap in self._NO_POOL_FALLBACK or pool.get("whitelist_tags") or pool.get("whitelist_cnodes") or tags) else next(iter(self.AIM.connections.conns_matching(cap)), None)  # mirrors the unrestricted-pool fallback in steps (_pick_capability_conn, generate)
+            out[cap] = ("pool_ok", picked[1].get("display_name", picked[1].get("_id",""))) if picked else ("pool_ok", f"""{fallback.get('display_name', fallback['_id'])} (no CNode carries it - first connection declaring {cap})""") if fallback else ("pool_empty", f"{len(candidates)} CNode(s) matched tags/pool, none carry a {cap} connection" if candidates else "no CNode matches this pool's whitelist/blacklist + node tags")
         return out
 
     def _preflight_pipeline(self, pl, _visited=None) -> list:
@@ -529,7 +536,7 @@ async def api_save_pipeline(pid: str, request: Request):
     return JSONResponse({"status": "ok"})
 
 @router.get("/step_types", response_class=JSONResponse)
-async def api_step_types(): return JSONResponse(steps.list_step_types())
+async def api_step_types(): return JSONResponse(steps.list_node_types())
 
 @router.get("/job/{job_id}", response_class=JSONResponse)
 async def api_job_status(job_id: str): return JSONResponse(engine.load_job(job_id) or {"error": "not found"})
@@ -693,7 +700,7 @@ async def shadow_selftest(request: Request):
     entry = shadow.stage("note.txt", "original line one\nCHANGED line two\nnew line three\n", author="selftest")
     diff_before_accept = shadow.diff("note.txt")
     accepted = shadow.accept("note.txt")
-    final_content = fm.read("note.txt")
+    final_content = FM.read("note.txt")
     history = shadow.history("note.txt")
     return JSONResponse({"staged_status": entry["status"], "diff": diff_before_accept, "accepted": accepted, "final_file_content": final_content, "history_timestamps": history})
 
