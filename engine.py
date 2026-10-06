@@ -18,6 +18,7 @@ PIPE_DIR = Path("./data/ai_manager/pipelines")
 JOB_DIR = Path("./data/ai_manager/jobs")
 _ACTIVE: dict = {}
 _LANES: dict = {}
+_NODE_TASKS: dict = {}   # job id -> {node id: asyncio task} for the nodes running right now, so stop(now=True) can cancel them mid-run
 logger = logging.getLogger("ai_manager.engine")
 
 DEFAULT_POOL = {"whitelist_tags": [], "blacklist_tags": [], "whitelist_cnodes": [], "blacklist_cnodes": [], "priority": "balanced"}
@@ -122,15 +123,22 @@ async def _run_flow(flow: dict, data: dict, job_id: str, username: str, pool_cfg
         
         async def run_one(n: FlowNode, spec: dict):
             await _set_node_status(job_id, username, n.id, "running", {"type": n.type, "name": n.name})
-            t0 = time.time()
+            t0, ctx = time.time(), NodeContext(n, data, job_id, username, pool_cfg, depth)
+            task = asyncio.ensure_future(spec["fn"](n.config, data, ctx)); _NODE_TASKS.setdefault(job_id, {})[n.id] = task
             try:
-                result = await spec["fn"](n.config, data, NodeContext(n, data, job_id, username, pool_cfg, depth))
+                result = await task
+            except asyncio.CancelledError:
+                if not task.cancelled() or load_job(job_id)["status"] != "stopping": raise   # the job itself was cancelled (shutdown), not this node by stop(now=True)
+                for logical, val in (getattr(ctx, "partial", None) or {}).items(): data[n.out_key(logical)] = val   # a node may leave ctx.partial - what it had produced when it was stopped
+                await _set_node_status(job_id, username, n.id, "stopped", {"preview": {k: str(v)[:500] for k, v in (getattr(ctx, "partial", None) or {}).items()}, "elapsed_s": round(time.time() - t0, 2)})
+                return n.id
             except Exception as e:
                 result = await _attempt_self_heal(n, spec, data, job_id, username, pool_cfg, depth, e) if n.config.get("on_error") == "escalate" else None
                 if result is None:
                     traceback.print_exc()
                     await _set_node_status(job_id, username, n.id, "error", {"message": str(e)})
                     raise
+            finally: _NODE_TASKS.get(job_id, {}).pop(n.id, None)
             for logical, val in (result or {}).items(): data[n.out_key(logical)] = val
             await _set_node_status(job_id, username, n.id, "done", {"preview": {k: str(v)[:500] for k, v in (result or {}).items()}, "elapsed_s": round(time.time() - t0, 2)})
             return n.id
@@ -178,7 +186,7 @@ async def _run_job(job_id: str):
     job["data"] = data
     _log(job, f"job finished with status: {job['status']}")
     _save_job(job)
-    _ACTIVE.pop(job_id, None)
+    _ACTIVE.pop(job_id, None); _NODE_TASKS.pop(job_id, None)
 
 def _task_exception_logger(task: asyncio.Task):
     if task.cancelled(): return
@@ -216,9 +224,12 @@ def resume(job_id: str) -> tuple:
     _ACTIVE[job_id] = task
     return job_id, ""
 
-def stop(job_id: str):
+def stop(job_id: str, now: bool = False):
+    """Halts a job before its next wave. now=True also cancels the nodes running at this moment (a streaming generate ends at once); each is marked 'stopped' and keeps whatever it left in ctx.partial."""
     job = load_job(job_id)
     if job: job["status"] = "stopped" if job["status"] == "queued" else "stopping"; _save_job(job)
+    if now:
+        for t in list(_NODE_TASKS.get(job_id, {}).values()): t.cancel()
 
 async def run_inline(username: str, pipeline_id: str, inputs: dict = None, pool_cfg: dict = None, depth: int = 0, max_depth = 100, job_id: str = None) -> dict:
     """Runs a saved pipeline to completion and returns its final data object - used by the pipeline/pipeline_foreach/branch node types to compose pipelines together. Depth guards against runaway self-referential recursion.
@@ -235,6 +246,6 @@ async def run_inline(username: str, pipeline_id: str, inputs: dict = None, pool_
     data = await _run_flow(flow_data, dict(job["data"]), job_id, username, pool, depth=depth)
     job = load_job(job_id)
     job["data"] = data
-    job["status"] = "error" if any(n.get("status") == "error" for n in flow_data["nodes"]) else "done"
+    job["status"] = "error" if job["status"] == "error" or any(n.get("status") == "error" for n in job["flow"]["nodes"]) else "done"   # node statuses live in the saved job record (_set_node_status), not in the local flow_data copy
     _save_job(job)
     return data

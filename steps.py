@@ -4,7 +4,7 @@ It reads whatever it needs from the shared pipeline `data` object - ctx.get()/ct
 the in_keys/out_keys a type declares are a scheduling contract, not a firewall - and returns a dict of LOGICAL output names -> values.
 The engine remaps those to actual pipeline keys via the node's key_map and merges them into `data`.
 """
-import re, json, sys, asyncio, uuid, time
+import re, json, sys, asyncio, uuid, time, io, wave, base64
 from pathlib import Path
 from tools.ai_manager import engine, resources, connections
 from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
@@ -156,11 +156,19 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     if json_fields: sys_p = (sys_p + f"\n\nRespond ONLY with a single JSON object with exactly these keys: {json.dumps(json_fields)}. No markdown fences, no text before or after the JSON.").strip()
     messages = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": ctx.resolve(config.get("user_template") or "{input}")}]
     full, thinking_full = "", ""
-    async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.7), num_ctx = int(resources.resolve_bound(config.get("num_ctx_mode","exact"), config.get("num_ctx", 16384), config.get("num_ctx_max"), fallback=16384)), num_predict=config.get("num_predict", -1), kv_cache_type=config.get("kv_cache_type") or None, cache_session=config.get("cache_session") or None, **seed_kwargs):
-        full += text; thinking_full += thinking
-        await ctx.stream("text", text)
+    speaker = _SentenceSpeaker(ctx, config) if config.get("speak_while_writing") else None
+    try:
+        async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.7), num_ctx = int(resources.resolve_bound(config.get("num_ctx_mode","exact"), config.get("num_ctx", 16384), config.get("num_ctx_max"), fallback=16384)), num_predict=config.get("num_predict", -1), kv_cache_type=config.get("kv_cache_type") or None, cache_session=config.get("cache_session") or None, **seed_kwargs):
+            full += text; thinking_full += thinking
+            await ctx.stream("text", text)
+            if speaker and text: speaker.feed(text)
+    except BaseException:
+        if speaker: speaker.cancel()
+        ctx.partial = {"text": full, "thinking": thinking_full, **({"spoken_segments": speaker.seq, "audio_b64": speaker.joined()} if speaker else {})}   # kept by the engine when the node is stopped mid-reply
+        raise
+    if speaker: await speaker.close(cut=int(config.get("num_predict") or -1) > 0 and len(full) >= int(config["num_predict"]) * 3.6)   # about 3.6 characters per token: a reply this long most likely stopped at the token cap
     if cnode: resources.log_usage(cnode["id"], "generate:text", time.time()-t0)
-    result = {"text": full, "thinking": thinking_full}
+    result = {"text": full, "thinking": thinking_full, **({"spoken_segments": speaker.seq, "audio_b64": speaker.joined()} if speaker else {})}
     if json_fields:
         parsed = _extract_json_fields(full, json_fields)
         if parsed: result.update(parsed)
@@ -408,6 +416,58 @@ def _pick_chat_model(conn: dict, model: str, label: str) -> str:
 
 # --- speech: transcribe / speak through whichever connection declares speech_to_text / text_to_speech ---
 
+_SENT_END = re.compile(r"\n+|(?<=[.!?\u2026])[\"')\]]*[ \t]+")   # a line break, or sentence punctuation (plus closing quotes/brackets) followed by a space
+
+class _SentenceSpeaker:
+    """Speaks a reply while it is still being written. Text is buffered until a sentence ends (a line break, or . ! ? and a space); each finished
+    sentence goes to text-to-speech at once, one request at a time and in order, and its audio is pushed to the browser as a `cm-voice-audio`
+    trigger {sid, turn, seq, audio_b64, format, text, last}. The browser queues the segments by seq and plays them back to back, so the first words
+    are heard after one sentence instead of after the whole reply. A failed segment is pushed with empty audio so playback order never stalls.
+    The spoken wav segments are also kept and joined into one wav (joined()), returned as the generate node's audio_b64 so the reply can be replayed."""
+    def __init__(self, ctx: NodeContext, config: dict):
+        self.ctx, self.sid, self.buf, self.seq, self.q, self.audio = ctx, ctx.resolve(str(config.get("speak_sid") or "")), "", 0, asyncio.Queue(), []
+        self.min_chars, self.drop_tail = int(_opt(config, "speak_min_chars", 12)), bool(config.get("speak_drop_unfinished", True))
+        self.payload = {"voice": config.get("speak_voice") or None, "length_scale": None if config.get("speak_length_scale") in (None, "") else float(config["speak_length_scale"])}
+        _, self.conn = _pick_capability_conn({**config, "conn_id": config.get("speak_conn_id") or ""}, ctx, "text_to_speech", "generate(speak while writing)")
+        self.worker = asyncio.create_task(self._work())
+
+    def feed(self, text: str):
+        self.buf += text
+        while (m := _SENT_END.search(self.buf, self.min_chars if len(self.buf) > self.min_chars else len(self.buf))):   # very short pieces ("Yes." "Hi!") wait for the next sentence instead of costing a request each
+            self.q.put_nowait(self.buf[:m.end()].strip()); self.buf = self.buf[m.end():]
+
+    async def close(self, cut: bool = False):
+        """Speaks what is left - unless the reply was cut at the token cap mid-sentence and drop_tail is set - then waits for every segment to be sent."""
+        tail = self.buf.strip()
+        if tail and not (cut and self.drop_tail and tail[-1] not in ".!?\u2026\"')]"): self.q.put_nowait(tail)
+        self.q.put_nowait(None)
+        await self.worker
+        await self._push({"seq": self.seq, "last": True})
+
+    def cancel(self): self.worker.cancel()
+
+    def joined(self) -> str:
+        """Every spoken segment so far as one wav (base64), for replay. Segments whose wav parameters differ from the first are left out."""
+        if not self.audio: return ""
+        out, first = io.BytesIO(), None
+        with wave.open(out, "wb") as w:
+            for b in self.audio:
+                with wave.open(io.BytesIO(base64.b64decode(b.split(",", 1)[-1]))) as r:
+                    if first is None: first = r.getparams(); w.setparams(first)
+                    if r.getparams()[:3] == first[:3]: w.writeframes(r.readframes(r.getnframes()))
+        return base64.b64encode(out.getvalue()).decode()
+
+    async def _push(self, detail: dict): await ENV["push_to_client"](self.ctx.username, {"t": "trigger", "event": "cm-voice-audio", "detail": {"sid": self.sid, "turn": self.ctx.job_id, **detail}})
+
+    async def _work(self):
+        while (text := await self.q.get()) is not None:
+            if not _words(text): continue   # punctuation-only pieces have nothing to say
+            r = await connections.call_capability(self.conn, "text_to_speech", {"text": text, **self.payload})
+            if r.get("error"): await self.ctx.progress(f"""speak while writing: segment {self.seq} failed - {r['error']}""")
+            elif r.get("format", "wav") == "wav" and r.get("audio_b64"): self.audio.append(r["audio_b64"])
+            await self._push({"seq": self.seq, "audio_b64": "" if r.get("error") else r.get("audio_b64", ""), "format": r.get("format", "wav"), "text": text, "last": False})
+            self.seq += 1
+
 def _words(text: str) -> str: return re.sub(r"[^\w']+", " ", str(text).lower()).strip()   # lowercase words only: punctuation and spacing never decide whether something was said
 
 async def node_transcribe(config: dict, data: dict, ctx: NodeContext) -> dict:
@@ -436,6 +496,23 @@ async def node_speak(config: dict, data: dict, ctx: NodeContext) -> dict:
     if r.get("error"): raise RuntimeError(f"""speak: {r['error']}""")
     if cnode: resources.log_usage(cnode["id"], "speak", time.time()-t0, {"audio_s": r.get("duration_s")})
     return {"audio_b64": r["audio_b64"], "format": r.get("format", "wav"), "duration_s": r.get("duration_s")}
+
+async def node_identify_speaker(config: dict, data: dict, ctx: NodeContext) -> dict:
+    """Who said it. The audio is embedded by a connection declaring speaker_embed and compared (cosine) with each enrolled profile in the 'profiles'
+    in-key: [{name, code, role, embedding (unit length)}]. At or above match_threshold the best profile is the speaker; between guess_threshold and
+    match_threshold it is a likely match (guess mark); below, or with no profiles, the speaker is other_name. speaker_tag is tag_format filled with
+    {name} {code} {role} {guess}, ready to prefix the transcript. A failed embedding leaves everything blank and the turn goes on unlabeled."""
+    profiles, blank = ctx.get("profiles") or [], {"speaker": "", "speaker_code": "", "speaker_role": "", "speaker_score": 0.0, "speaker_tag": ""}
+    cnode, conn = _pick_capability_conn(config, ctx, "speaker_embed", "identify_speaker")
+    t0 = time.time()
+    r = await connections.call_capability(conn, "speaker_embed", {"audio_b64": ctx.get("audio_b64")})
+    if r.get("error"): await ctx.progress(f"""identify_speaker: {r['error']} - turn left unlabeled"""); return blank
+    if cnode: resources.log_usage(cnode["id"], "identify_speaker", time.time()-t0, {"audio_s": r.get("duration_s")})
+    v = r["embedding"]
+    best, score = max(((p, sum(a * b for a, b in zip(v, p["embedding"]))) for p in profiles if p.get("embedding")), key=lambda t: t[1], default=(None, 0.0))
+    p = best if best and score >= float(_opt(config, "guess_threshold", 0.35)) else {"name": config.get("other_name") or "Other", "code": config.get("other_code") or "0000", "role": "unknown"}
+    guess = config.get("guess_mark", "?") if best is p and score < float(_opt(config, "match_threshold", 0.5)) else ""
+    return {"speaker": p["name"], "speaker_code": p.get("code", ""), "speaker_role": p.get("role", ""), "speaker_score": round(score, 3), "speaker_tag": (config.get("tag_format") or "({name}{guess}): ").format(name=p["name"], code=p.get("code", ""), role=p.get("role", ""), guess=guess)}
 
 # --- call_capability: any capability a connection's profile declares (video_join, model_list, voice_list, ...) ---
 
@@ -475,6 +552,7 @@ def _generate_conn_options(values=None):
     conns = list_conns("flux2_text") if m == "image" else [c for c in list_conns(get_all=True) if any(connections.has_capability(c, k) for k in _VIDEO_CAPS)] if m == "video" else conns_matching("chat")
     return [("", "(pool-resolved by priority)")] + [_conn_label(c) for c in conns]
 
+def _tts_conn_options(values=None): return [("", "(pool-resolved by capability)")] + [_conn_label(c) for c in conns_matching("text_to_speech")]
 def _image_node_options(values=None): return [("", "(pool-resolved by priority)")] + [_conn_label(c) for c in list_conns("flux2_image")]
 def _all_conn_options(values=None): return [("", "(pool-resolved by capability)")] + [_conn_label(c) for c in list_conns(get_all=True)]
 
@@ -556,6 +634,13 @@ def register_builtins():
         BI.SettingField("formats","Formats (video, comma-sep)","text",default="",advanced=True,hint="gif, webp, mp4. Blank = gif. Joining clips works from the frames every clip keeps."),
         BI.SettingField("offload_mode","Memory Offload (video)","select",default="",options=[("","(none)"),("sequential","Sequential blocks (slowest, least memory)")],advanced=True),
         BI.SettingField("name_template","Output Name (video)","text",default="",advanced=True,hint="File name prefix; supports {key}."),
+        BI.SettingField("speak_while_writing","Speak While Writing (text)","checkbox",default=False,advanced=True,hint="Each finished sentence is spoken while the rest is still being written; the audio goes to the chat named below as cm-voice-audio segments. Tell the model to end sentences with a line break for the earliest start."),
+        BI.SettingField("speak_conn_id","Speech Connection (speak while writing)","select",default="",options=_tts_conn_options,advanced=True),
+        BI.SettingField("speak_voice","Voice (speak while writing)","text",advanced=True,hint="Blank = the speech node's default."),
+        BI.SettingField("speak_length_scale","Speaking Pace (speak while writing)","number",default=None,advanced=True),
+        BI.SettingField("speak_sid","Chat Id to Play In (speak while writing)","text",advanced=True,hint="The browser chat that plays the segments; supports {key}."),
+        BI.SettingField("speak_min_chars","Shortest Spoken Piece (chars)","number",default=12,step=1,advanced=True,hint="Shorter sentences are joined to the next one."),
+        BI.SettingField("speak_drop_unfinished","Drop an Unfinished Last Sentence (speak while writing)","checkbox",default=True,advanced=True),
         BI.SettingField("kv_cache_type","KV Cache Type (llama.cpp connections)","select",default="",options=[("","(connection default)")]+[(k,k) for k in ("f16","q8_0","q5_1","q5_0","q4_1","q4_0","iq4_nl")],advanced=True),
         BI.SettingField("cache_session","Saved-Context Session","text",advanced=True,hint="Nodes sharing a session reuse each other's prefilled context. Blank = shared default."),
         *_pool_fields()[:2], BI.SettingField("conn_id", "Connection", type="select", default="", options=_generate_conn_options, hint="Follows Modality: the chat model's connection (text), the text encoder (image), the video node (video). Blank = pool-resolved."), _pool_fields()[3], _key_map_field()], guide="One universal generation node - text, image or video, picked by Modality. With no connection pinned, resolves one from this node's resource pool (pipeline pool intersected with this node's own tags) using Priority. Video picks by capability from the frames given (start + end, start, none); the pool may fall back to a lesser capability, a pinned connection may not.")
@@ -648,6 +733,15 @@ def register_builtins():
         BI.SettingField("initial_prompt","Vocabulary Prompt","textarea",advanced=True,hint="Names and jargon the recognizer should expect. Supports {key}."),
         BI.SettingField("stt_model","Recognizer Model Override","text",advanced=True,hint="Blank = the node's default (e.g. small, medium, large-v3)."),
         *_pool_fields(include_model=False, conn_type="speech_to_text"), _key_map_field()], guide="Sends base64 audio (webm/ogg/mp4/wav/mp3) in 'audio_b64' to any connection declaring speech_to_text and returns the text. Pair with Speak and Generate for a voice conversation.")
+
+    register_node_type("identify_speaker", node_identify_speaker, "Identify Speaker (voiceprint)", in_keys=["audio_b64", "profiles"], out_keys=["speaker", "speaker_code", "speaker_role", "speaker_score", "speaker_tag"], config_schema=[
+        BI.SettingField("match_threshold","Same Person At Or Above (cosine 0-1)","number",default=0.5,hint="WeSpeaker ResNet34: the same voice usually scores 0.6-0.8, different voices under 0.3. Raise if people get mixed up."),
+        BI.SettingField("guess_threshold","Likely Match At Or Above","number",default=0.35,hint="Between this and the match threshold the best profile is used with the guess mark. Below it the speaker is the Other name."),
+        BI.SettingField("tag_format","Tag Format","text",default="({name}{guess}): ",hint="Fields: {name} {code} {role} {guess}. '({code}): ' gives number signatures instead of names."),
+        BI.SettingField("guess_mark","Guess Mark","text",default="?",advanced=True),
+        BI.SettingField("other_name","Name for Unknown Voices","text",default="Other",advanced=True),
+        BI.SettingField("other_code","Code for Unknown Voices","text",default="0000",advanced=True),
+        *_pool_fields(include_model=False, conn_type="speaker_embed"), _key_map_field()], guide="Tells enrolled voices apart: 'profiles' is a list of {name, code, role, embedding}; the result labels the utterance and carries the profile's role (e.g. owner / trusted / guest) for later permission checks.")
 
     register_node_type("call_capability", node_call_capability, "Call Capability (any connection)", in_keys=[], out_keys=["result"], config_schema=[
         BI.SettingField("capability","Capability","text",hint="One the connection's profile declares, e.g. video_join, model_list, voice_list."),
