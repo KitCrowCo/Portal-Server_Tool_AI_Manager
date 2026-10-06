@@ -1,11 +1,19 @@
 {
-  "_meta": {"display_name": "Flux2 Image Generator", "icon": "&#x1F5BC;", "connection_type": "flux2_image", "description": "Flux.2 Klein image generation node (txt2img/inpaint/sequence) - single GPU, one request at a time."},
+  "_meta": {"display_name": "Flux2 Image + CogVideoX Video Node", "icon": "&#x1F5BC;", "connection_type": "flux2_image", "description": "Image node: Flux.2 Klein images (txt2img / img2img / inpaint / sequence) and CogVideoX-family clips (text, start frame, start + end frame) on one GPU, one model in memory, one request at a time. GET /models says what the node holds and what each model can do."},
   "connection": {
     "host": {"type": "string", "label": "Host", "default": "127.0.0.1", "hint": "Docker service name if on the same compose network", "required": true},
     "port": {"type": "integer", "label": "Port", "default": 8000, "required": true},
     "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
-    "base_path": {"type": "string", "label": "Base Path", "default": ""}
+    "base_path": {"type": "string", "label": "Base Path", "default": ""},
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 14400, "hint": "A video clip on an iGPU can take hours; 14400 = 4 h"}
   },
-  "endpoints": {"health": {"path": "/system/status", "method": "GET"}}
+  "capabilities": {"model_list": true, "text_to_video": true, "image_to_video": true, "start_end_to_video": true, "video_join": true},
+  "endpoints": {
+    "health": {"path": "/system/status", "method": "GET"},
+    "model_list": {"method": "GET", "path": "/models"},
+    "text_to_video": {"method": "POST", "path": "/video", "body": {"mode": "text_to_video", "model": "{model}", "prompt": "{prompt}", "negative_prompt": "{negative_prompt}", "width": "{width}", "height": "{height}", "num_frames": "{num_frames}", "fps": "{fps}", "steps": "{steps}", "guidance_scale": "{guidance_scale}", "scheduler": "{scheduler}", "dynamic_cfg": "{dynamic_cfg}", "seed": "{seed}", "formats": "{formats}", "keep_frames": "{keep_frames}", "offload_mode": "{offload_mode}", "name": "{name}"}},
+    "image_to_video": {"method": "POST", "path": "/video", "body": {"mode": "image_to_video", "model": "{model}", "prompt": "{prompt}", "negative_prompt": "{negative_prompt}", "start_image": "{start_image}", "width": "{width}", "height": "{height}", "num_frames": "{num_frames}", "fps": "{fps}", "steps": "{steps}", "guidance_scale": "{guidance_scale}", "scheduler": "{scheduler}", "dynamic_cfg": "{dynamic_cfg}", "noise_aug_strength": "{noise_aug_strength}", "seed": "{seed}", "formats": "{formats}", "keep_frames": "{keep_frames}", "offload_mode": "{offload_mode}", "name": "{name}"}},
+    "start_end_to_video": {"method": "POST", "path": "/video", "body": {"mode": "start_end_to_video", "model": "{model}", "prompt": "{prompt}", "negative_prompt": "{negative_prompt}", "start_image": "{start_image}", "end_image": "{end_image}", "width": "{width}", "height": "{height}", "num_frames": "{num_frames}", "fps": "{fps}", "steps": "{steps}", "guidance_scale": "{guidance_scale}", "scheduler": "{scheduler}", "dynamic_cfg": "{dynamic_cfg}", "noise_aug_strength": "{noise_aug_strength}", "seed": "{seed}", "formats": "{formats}", "keep_frames": "{keep_frames}", "offload_mode": "{offload_mode}", "name": "{name}"}},
+    "video_join": {"method": "POST", "path": "/video/join", "body": {"clips": "{clips}", "fps": "{fps}", "formats": "{formats}", "drop_shared": "{drop_shared}", "name": "{name}"}}
+  }
 }
-

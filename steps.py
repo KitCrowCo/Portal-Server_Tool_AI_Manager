@@ -6,8 +6,8 @@ The engine remaps those to actual pipeline keys via the node's key_map and merge
 """
 import re, json, sys, asyncio, uuid, time
 from pathlib import Path
-from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
 from tools.ai_manager import engine, resources, connections
+from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
 
 _NODE_TYPES: dict = {}
 _EMBED_PATTERNS = ("embed", "minilm", "bge-", "gte-", "e5-", "nomic-embed", "arctic-embed")
@@ -98,42 +98,43 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     t0 = time.time()
 
     if modality == "image":
-        enc_conn, cnode = (get_conn(config.get("conn_id","")), None) if config.get("conn_id") else (None, None)
-        if not enc_conn:
-            picked = resources.pick_conn(resources.resolve_candidates(ctx.pool_cfg, tags, "flux2_text"), "flux2_text", priority)
-            if not picked: raise RuntimeError("generate(image): no flux2_text connection matches this node's resource pool")
-            cnode, enc_conn = picked
-        picked2 = resources.pick_conn(resources.resolve_candidates(ctx.pool_cfg, tags, "flux2_image"), "flux2_image", priority)
-        if not picked2: raise RuntimeError("generate(image): no flux2_image connection matches this node's resource pool")
-        _, img_conn = picked2
+        _, enc_conn = _pick_typed_conn(config, ctx, "flux2_text", "generate(image) encoder")
+        cnode, img_conn = _pick_typed_conn(config, ctx, "flux2_image", "generate(image)", pin_field="image_conn_id")
         prompt = ctx.resolve(config.get("user_template") or "{input}")
         job_tag = f"{ctx.job_id}_{uuid.uuid4().hex[:6]}"
-        enc = await flux2_encode(enc_conn, prompt, job_id=job_tag, max_sequence_length=config.get("max_sequence_length", 512))
-        if enc.get("error"): raise RuntimeError(f"generate(image) encode: {enc['error']}")
-        gen = await flux2_generate(img_conn, {"prompt": prompt, "embed_job_id": job_tag, "width": config.get("width",1024), "height": config.get("height",1024), "steps": config.get("steps",4), "guidance_scale": config.get("cfg",1.0), "shift": config.get("shift",1.0), "seed": config.get("seed",-1)})
-        if gen.get("error"): raise RuntimeError(f"generate(image): {gen['error']}")
+        enc = await flux2_encode(enc_conn, prompt, job_id=job_tag, max_sequence_length=int(_opt(config, "max_sequence_length", 512)))
+        if enc.get("error"): raise RuntimeError(f"""generate(image) encode: {enc['error']}""")
+        init, mask, ref = (_blank_none(ctx.get(k, None)) for k in ("init_image", "mask_image", "reference_image"))   # optional in-keys: wire them through Extra In Keys / Key Map when a pipeline supplies them
+        payload = {"prompt": prompt, "embed_job_id": job_tag, "width": int(_opt(config, "width", 0 if init else 1024)), "height": int(_opt(config, "height", 0 if init else 1024)), "steps": int(_opt(config, "steps", 4)), "guidance_scale": float(_opt(config, "cfg", 1.0)), "shift": float(_opt(config, "shift", 1.0)), "seed": int(_opt(config, "seed", -1))}   # with an init image a blank size is sent as 0 = the init image's own size
+        if _opt(config, "image_model"): payload["model_path"] = config["image_model"]
+        if init: payload.update({"image" if str(init).startswith("data:") else "image_path": init, "mask_image": mask or "", "strength": float(_opt(config, "strength", 0.75))})
+        if ref: payload["reference_image"] = ref
+        gen = await flux2_generate(img_conn, payload)
+        if gen.get("error"): raise RuntimeError(f"""generate(image): {gen['error']}""")
         if cnode: resources.log_usage(cnode["id"], "generate:image", time.time()-t0)
-        return {"file_name": gen["file_name"]}
+        return {"file_name": gen["file_name"], "seed": gen.get("seed")}
 
     if modality == "video":
-        start_img, end_img = ctx.get("start_image"), ctx.get("end_image")
-        wanted = "start_end_to_video" if (start_img and end_img) else ("image_to_video" if start_img else "text_to_video")
-        conn = connections.get_conn(config.get("conn_id","")) if config.get("conn_id") else None
-        if conn and not connections.connection_capabilities(conn).get(wanted):
-            raise RuntimeError(f"generate(video): pinned connection '{conn.get('_id')}' does not declare '{wanted}' - pick one that does, or unpin to let the pool choose")
-        cnode = None
-        if not conn:
-            for candidate_cap in (wanted, "image_to_video", "text_to_video"):
-                picked = resources.pick_conn(resources.resolve_candidates(ctx.pool_cfg, tags, capability=candidate_cap), candidate_cap, priority)
-                if picked: cnode, conn = picked; wanted = candidate_cap; break
-            if not conn: raise RuntimeError(f"generate(video): no connection in this node's resource pool declares '{wanted}' or a lesser video capability - add one, or point a connection profile's capabilities at what you need")
-        payload = {"prompt": ctx.resolve(config.get("user_template") or "{input}"), "num_frames": config.get("num_frames", 49), "steps": config.get("steps", 50), "guidance_scale": config.get("cfg", 6.0), "seed": config.get("seed", -1), "fps": config.get("fps", 8)}
-        if wanted in ("image_to_video", "start_end_to_video"): payload["start_image"] = start_img
-        if wanted == "start_end_to_video": payload["end_image"] = end_img
-        gen = await connections.call_capability(conn, wanted, payload)
-        if gen.get("error"): raise RuntimeError(f"generate(video): {gen['error']}")
+        start, end = _blank_none(ctx.get("start_image", None)), _blank_none(ctx.get("end_image", None))
+        wanted = "start_end_to_video" if (start and end) else "image_to_video" if start else "text_to_video"
+        if config.get("conn_id"): cnode, conn = _pick_capability_conn(config, ctx, wanted, "generate(video)")   # a pinned connection must declare exactly what the given frames ask for
+        else:
+            cnode = conn = None
+            for cap in _VIDEO_CAPS[_VIDEO_CAPS.index(wanted):]:   # the pool may fall back to a lesser capability only: start + end -> start -> text
+                try: cnode, conn = _pick_capability_conn(config, ctx, cap, "generate(video)"); break
+                except RuntimeError: continue
+            if not conn: raise RuntimeError(f"""generate(video): no connection in this node's resource pool declares '{wanted}' or a lesser video capability (check pool tags, or pin a connection)""")
+            if cap != wanted: await ctx.progress(f"""no connection in the pool declares {wanted} - using {cap}, so the {"end frame" if wanted == "start_end_to_video" else "start frame"} is not used""")
+            wanted = cap
+        payload = {"prompt": ctx.resolve(config.get("user_template") or "{input}"), **{k: v for k, v in {"model": _opt(config, "video_model"), "negative_prompt": _opt(config, "negative_prompt"), "width": _opt(config, "video_width"), "height": _opt(config, "video_height"), "num_frames": _opt(config, "num_frames"), "fps": _opt(config, "fps"), "steps": _opt(config, "video_steps"), "guidance_scale": _opt(config, "video_cfg"), "scheduler": _opt(config, "scheduler"), "seed": _opt(config, "seed"), "offload_mode": _opt(config, "offload_mode"), "name": ctx.resolve(config["name_template"]) if _opt(config, "name_template") else None}.items() if v is not None}}   # unset values are left out, so the node applies the model's own defaults
+        formats = [f.strip() for f in str(_opt(config, "formats", "")).split(",") if f.strip()]
+        if formats: payload["formats"] = formats
+        if wanted != "text_to_video": payload["start_image"] = start
+        if wanted == "start_end_to_video": payload["end_image"] = end
+        gen = await connections.call_capability(conn, wanted, payload, timeout_s=float(conn.get("values", {}).get("timeout_s") or 14400))   # clips take minutes to hours; a connection saved before its profile had timeout_s still gets 4 h
+        if gen.get("error"): raise RuntimeError(f"""generate(video): {gen['error']}""")
         if cnode: resources.log_usage(cnode["id"], f"generate:{wanted}", time.time()-t0)
-        return {"file_name": gen["file_name"], "capability_used": wanted}
+        return {"file_name": gen["file_name"], "frames_dir": gen.get("frames_dir", ""), "files": gen.get("files", {}), "frame_count": gen.get("frame_count"), "seed": gen.get("seed"), "capability_used": wanted}
 
     conn, cnode = (get_conn(config.get("conn_id","")), None) if config.get("conn_id") else (None, None)
     if not conn:
@@ -169,14 +170,14 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
 
 # --- transform: deterministic data shaping, no AI call, no resource pool ---
 
+_SAFE_BUILTINS = {"len": len, "str": str, "int": int, "float": float, "bool": bool, "min": min, "max": max, "abs": abs, "sum": sum, "any": any, "all": all, "sorted": sorted, "round": round, "list": list, "dict": dict, "tuple": tuple, "zip": zip, "range": range, "enumerate": enumerate, "reversed": reversed, "isinstance": isinstance}
+
 async def node_transform(config: dict, data: dict, ctx: NodeContext) -> dict:
     mode = config.get("mode", "template")
     if mode == "template": return {"value": ctx.resolve(config.get("template", "{input}"))}
     if mode == "expr":
-        var_templates = _parse_json_config(config.get("vars_json"), {})
-        local_vars = {name: ctx.resolve_value(tpl) for name, tpl in var_templates.items()}
-        safe_builtins = {"len":len,"str":str,"int":int,"float":float,"min":min,"max":max,"sorted":sorted,"round":round}
-        try: value = eval(config.get("expr","input"), {"__builtins__": safe_builtins}, {**local_vars, "input": ctx.get("input")})
+        variables = {name: ctx.resolve_value(tpl) for name, tpl in _parse_json_config(config.get("vars_json"), {}).items()}
+        try: value = eval(config.get("expr","input"), {"__builtins__": _SAFE_BUILTINS, **variables, "input": ctx.get("input")})   # variables as globals: comprehensions cannot see eval locals before Python 3.12
         except Exception as e: raise RuntimeError(f"transform(expr): {e}")
         return {"value": value}
     if mode == "regex_find":
@@ -288,6 +289,11 @@ async def node_pipeline(config: dict, data: dict, ctx: NodeContext) -> dict:
     sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1, job_id=sub_job_id)
     return {**{k: sub_data.get(k, "") for k in export_keys}, "_sub_job_id": sub_job_id}
 
+def _sub_run_error(job_id: str) -> str:
+    """The first failed node's message of a finished sub-run, or "" when it succeeded."""
+    job = engine.load_job(job_id) or {}
+    return next((n.get("message") or f"""node {n.get('name') or n.get('id')} failed""" for n in job.get("flow", {}).get("nodes", []) if n.get("status") == "error"), "job failed" if job.get("status") == "error" else "")
+
 async def node_pipeline_foreach(config: dict, data: dict, ctx: NodeContext) -> dict:
     items = ctx.get("items")
     if isinstance(items, str):
@@ -305,8 +311,10 @@ async def node_pipeline_foreach(config: dict, data: dict, ctx: NodeContext) -> d
         sub_inputs = {item_key: item, **{k: data.get(k, "") for k in import_keys}}
         sub_job_id = f"job_{uuid.uuid4().hex[:10]}"
         sub_data = await engine.run_inline(ctx.username, pid, inputs=sub_inputs, pool_cfg=ctx.pool_cfg, depth=ctx.depth+1, job_id=sub_job_id)
-        results.append({k: sub_data.get(k, "") for k in export_keys})
         sub_job_ids.append(sub_job_id)
+        err = _sub_run_error(sub_job_id)
+        if err and config.get("on_item_error") == "stop": raise RuntimeError(f"pipeline_foreach: item {i+1}/{len(items)} failed - {err}")
+        results.append({**{k: sub_data.get(k, "") for k in export_keys}, **({"_error": err} if err else {})})
     return {"results": results, "count": len(results), "_sub_job_ids": sub_job_ids}
 
 async def node_pipeline_reduce(config: dict, data: dict, ctx: NodeContext) -> dict:
@@ -371,6 +379,26 @@ def _pick_capability_conn(config: dict, ctx: NodeContext, capability: str, label
     if not (ctx.pool_cfg.get("whitelist_tags") or ctx.pool_cfg.get("whitelist_cnodes") or tags) and conns_matching(capability): return None, conns_matching(capability)[0]
     raise RuntimeError(f"""{label}: no connection in this node's resource pool declares '{capability}' (check pool tags, or pin a connection)""")
 
+def _pick_typed_conn(config: dict, ctx: NodeContext, conn_type: str, label: str, pin_field: str = "conn_id") -> tuple:
+    """(cnode or None, conn) for one connection TYPE (flux2_text, flux2_image): a pinned connection wins; otherwise the node's pool picks by Priority;
+    with no pool restrictions at all and no CNode carrying that type, the first saved connection of the type - the fallback chat and speech use."""
+    if config.get(pin_field):
+        conn = get_conn(config[pin_field])
+        if not conn: raise RuntimeError(f"""{label}: pinned connection '{config[pin_field]}' no longer exists""")
+        return None, conn
+    tags = _node_tags(config)
+    picked = resources.pick_conn(resources.resolve_candidates(ctx.pool_cfg, tags, conn_type), conn_type, config.get("priority") or ctx.pool_cfg.get("priority", "balanced"))
+    if picked: return picked
+    if not (ctx.pool_cfg.get("whitelist_tags") or ctx.pool_cfg.get("whitelist_cnodes") or tags) and list_conns(conn_type): return None, list_conns(conn_type)[0]
+    raise RuntimeError(f"""{label}: no {conn_type} connection in this node's resource pool (check pool tags, or pin a connection)""")
+
+def _blank_none(v): return None if v in (None, "") else v   # an unset data key or blank form value means "not given"
+
+def _opt(config: dict, key: str, default=None):
+    """A config value, or default when the field was left blank - a blank number must fall back, never reach a node as "" or null."""
+    v = config.get(key)
+    return default if v in (None, "") else v
+
 def _pick_chat_model(conn: dict, model: str, label: str) -> str:
     if model: return model
     models = list_models_sync(conn)
@@ -380,7 +408,10 @@ def _pick_chat_model(conn: dict, model: str, label: str) -> str:
 
 # --- speech: transcribe / speak through whichever connection declares speech_to_text / text_to_speech ---
 
+def _words(text: str) -> str: return re.sub(r"[^\w']+", " ", str(text).lower()).strip()   # lowercase words only: punctuation and spacing never decide whether something was said
+
 async def node_transcribe(config: dict, data: dict, ctx: NodeContext) -> dict:
+    """Nothing said (an empty or punctuation-only transcript, an ignored phrase, or only segments the recognizer rates as non-speech) returns no 'text' key, so every node waiting on it ends unreached; the raw transcript goes to 'dropped_text'."""
     audio = ctx.get("audio_b64")
     if not audio: raise RuntimeError("transcribe: audio_b64 in-key is empty")
     cnode, conn = _pick_capability_conn(config, ctx, "speech_to_text", "transcribe")
@@ -388,7 +419,13 @@ async def node_transcribe(config: dict, data: dict, ctx: NodeContext) -> dict:
     r = await connections.call_capability(conn, "speech_to_text", {"audio_b64": audio, "language": config.get("language") or None, "model": config.get("stt_model") or None, "vad_filter": bool(config.get("vad_filter", True)), "initial_prompt": ctx.resolve(config.get("initial_prompt") or "") or None})
     if r.get("error"): raise RuntimeError(f"""transcribe: {r['error']}""")
     if cnode: resources.log_usage(cnode["id"], "transcribe", time.time()-t0, {"audio_s": r.get("duration_s")})
-    return {"text": r.get("text", ""), "segments": r.get("segments", []), "language": r.get("language", "")}
+    segs, cut = r.get("segments", []), _opt(config, "max_no_speech_prob")
+    if cut is not None: segs = [s for s in segs if float(s.get("no_speech_prob") or 0) <= float(cut)]
+    text = " ".join(str(s.get("text", "")).strip() for s in segs).strip() if cut is not None else r.get("text", "")
+    heard = _words(text)
+    out = {"segments": segs, "language": r.get("language", "")}
+    if (config.get("skip_empty", True) and not heard) or heard in {_words(p) for p in str(config.get("ignore_phrases") or "").splitlines() if _words(p)}: return {**out, "dropped_text": r.get("text", "")}
+    return {**out, "text": text}
 
 async def node_speak(config: dict, data: dict, ctx: NodeContext) -> dict:
     text = str(ctx.get("text"))
@@ -400,107 +437,23 @@ async def node_speak(config: dict, data: dict, ctx: NodeContext) -> dict:
     if cnode: resources.log_usage(cnode["id"], "speak", time.time()-t0, {"audio_s": r.get("duration_s")})
     return {"audio_b64": r["audio_b64"], "format": r.get("format", "wav"), "duration_s": r.get("duration_s")}
 
-# --- agent_loop: one LLM working through a toolset connection's tools until it calls the finish tool ---
-# The toolset (agent_tools_list / agent_tools_call, optionally agent_session_open / agent_session_close) is any connection declaring those capabilities - a code workspace today, anything else later.
-# The loop itself never touches files: every effect goes through the toolset, which owns its own shadow stage (the code workspace commits to an ai/<id> branch and never merges).
+# --- call_capability: any capability a connection's profile declares (video_join, model_list, voice_list, ...) ---
 
-_TEXT_TOOL_RE = re.compile(r"```tool\s*(\{.*?\})\s*```", re.S)
-_FINISH_TOOL = {"name": "finish", "description": "Call exactly once when the task is complete or cannot be completed. summary: which files and functions changed and why, what was verified, and what was not.", "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}
+def _resolve_deep(v, ctx: NodeContext):
+    if isinstance(v, dict): return {k: _resolve_deep(x, ctx) for k, x in v.items()}
+    if isinstance(v, list): return [_resolve_deep(x, ctx) for x in v]
+    return ctx.resolve_value(v) if isinstance(v, str) else v
 
-def _text_tool_protocol(tools: list) -> str:
-    """Tool instructions for a chat connection that declares no native tool_calling - works with any instruction-following model, less reliably than native calls."""
-    listing = "\n".join(f"""- {t['name']}: {t.get('description','')}\n  arguments: {json.dumps(t.get('parameters', {}))}""" for t in tools)
-    return f"""You act only through tools. To call a tool, end your reply with one or more blocks of exactly this form:
-```tool
-{{"name": "<tool name>", "arguments": {{...}}}}
-```
-Each result comes back in the next message. Available tools:
-{listing}"""
-
-def _parse_text_tool_calls(text: str) -> list:
-    out = []
-    for blob in _TEXT_TOOL_RE.findall(text):
-        try: obj = json.loads(blob)
-        except json.JSONDecodeError: out.append({"id": "", "name": "_invalid", "arguments": {"_raw": blob}}); continue
-        out.append({"id": "", "name": str(obj.get("name", "")), "arguments": obj["arguments"] if isinstance(obj.get("arguments"), dict) else {}})
-    return out
-
-def _trim_transcript(messages: list, budget_chars: int, keep_head: int = 2) -> int:
-    """Drops whole oldest turns (an assistant message plus everything answering it) until the transcript fits, always keeping the system prompt and task. Returns the number of turns dropped.
-    Trimming changes the prompt prefix, so the next model call re-processes the whole transcript instead of reusing its KV cache."""
-    head, tail, dropped = messages[:keep_head], messages[keep_head:], 0
-    while tail and sum(len(json.dumps(m)) for m in head + tail) > budget_chars:
-        tail = tail[next((i for i, m in enumerate(tail[1:], 1) if m["role"] == "assistant"), len(tail)):]
-        dropped += 1
-    messages[:] = head + tail
-    return dropped
-
-async def _agent_tool_call(tconn: dict, session: str, call: dict, tools: list) -> str:
-    """A tool-level failure (bad path, no unique match) goes back to the model as text so it can correct itself; a transport failure (toolset node down) raises and fails the node."""
-    if call["name"] == "_invalid": return f"""ERROR: the tool block was not valid JSON: {call['arguments'].get('_raw', '')[:500]}"""
-    if not any(t["name"] == call["name"] for t in tools): return f"""ERROR: unknown tool '{call['name']}'. Available: {', '.join(t['name'] for t in tools)}"""
-    r = await connections.call_capability(tconn, "agent_tools_call", {"session": session, "name": call["name"], "arguments": call["arguments"]})
-    if r.get("error"): raise RuntimeError(f"""agent_loop: toolset call failed: {r['error']}""")
-    return r.get("output", "") if r.get("ok") else f"""ERROR: {r.get('output', '')}"""
-
-async def node_agent_loop(config: dict, data: dict, ctx: NodeContext) -> dict:
-    tcnode, tconn = _pick_capability_conn(config, ctx, "agent_tools_call", "agent_loop(tools)", pin_field="tools_conn_id", tags_field="tools_cnode_tags")
-    cnode, conn = _pick_capability_conn(config, ctx, "chat", "agent_loop(chat)")
-    model = _pick_chat_model(conn, config.get("model", ""), "agent_loop")
-    listed = await connections.call_capability(tconn, "agent_tools_list", {})
-    if listed.get("error"): raise RuntimeError(f"""agent_loop: tool list failed: {listed['error']}""")
-    allow = set(_node_tags(config, "allow_tools"))
-    finish_name = config.get("finish_tool") or "finish"
-    tools = [t for t in listed.get("tools", []) if not allow or t["name"] in allow]
-    if not any(t["name"] == finish_name for t in tools): tools.append({**_FINISH_TOOL, "name": finish_name})
-    protocol = config.get("tool_protocol") or "auto"
-    native = protocol == "native" or (protocol == "auto" and connections.has_capability(conn, "tool_calling", model))
-    if protocol == "auto" and not native: await ctx.progress(f"""connection {conn.get('_id')} declares no tool_calling - using the text tool protocol""")
-    session, extra_ctx, close = "", "", {}
-    if connections.has_capability(tconn, "agent_session_open"):
-        opened = await connections.call_capability(tconn, "agent_session_open", {"label": f"{ctx.job_id}:{ctx.node.id}", **_parse_json_config(config.get("session_args_json"), {})})
-        if opened.get("error"): raise RuntimeError(f"""agent_loop: session open failed: {opened['error']}""")
-        session, extra_ctx = opened["session"], opened.get("context", "")
-        await ctx.progress(f"""session {session} on {opened.get('branch', '')}""")
-    task = ctx.resolve(config.get("user_template") or "{input}")
-    messages = [{"role": "system", "content": "\n\n".join(p for p in (ctx.resolve(config.get("system_prompt") or ""), extra_ctx, "" if native else _text_tool_protocol(tools)) if p)}, {"role": "user", "content": task}]
-    native_tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters") or {"type": "object", "properties": {}}}} for t in tools] if native else None
-    num_ctx = int(config.get("num_ctx", 32768))
-    budget = num_ctx * 3 if config.get("ctx_chars") in (None, "", 0) else int(config["ctx_chars"])
-    status, summary, steps_done, trimmed, nudged, t0 = "max_steps", "", 0, 0, False, time.time()
-    try:
-        for _ in range(int(config.get("max_steps", 60))):
-            if (engine.load_job(ctx.job_id) or {}).get("status") == "stopping": status = "stopped"; break
-            trimmed += _trim_transcript(messages, budget)
-            if trimmed: messages[1] = {"role": "user", "content": f"{task}\n\n({trimmed} earlier step(s) were trimmed from this transcript to fit the context budget - re-read files instead of relying on memory of them.)"}
-            text, calls = "", []
-            async for ev in connections.stream_llm_events(conn, messages, model, think=config.get("think") or False, tools=native_tools, temperature=config.get("temperature", 0.2), num_ctx=num_ctx, num_predict=config.get("num_predict", -1), kv_cache_type=config.get("kv_cache_type") or None, cache_session=config.get("cache_session") or None):
-                text += ev["text"]; calls += ev["tool_calls"]
-                if ev["text"]: await ctx.stream("text", ev["text"])
-            if not native: calls = _parse_text_tool_calls(text)
-            steps_done += 1
-            messages.append({"role": "assistant", "content": text, **({"tool_calls": [{**({"id": c["id"]} if c["id"] else {}), "type": "function", "function": {"name": c["name"], "arguments": c["arguments"]}} for c in calls]} if native and calls else {})})
-            if not calls:
-                if nudged: status = "no_tool_call"; break
-                nudged = True
-                messages.append({"role": "user", "content": f"No tool call was found in your reply. Act through a tool, or call {finish_name} if the task is done."})
-                continue
-            nudged = False
-            for c in calls:
-                await ctx.stream("text", f"""\n[tool] {c['name']} {json.dumps(c['arguments'])[:300]}\n""")
-                if c["name"] == finish_name: status, summary = "finished", str(c["arguments"].get("summary") or text); break
-                out = await _agent_tool_call(tconn, session, c, tools)
-                await ctx.stream("text", f"[result] {out[:500]}\n")
-                messages.append({"role": "tool", "content": out, "tool_name": c["name"], **({"tool_call_id": c["id"]} if c["id"] else {})} if native else {"role": "user", "content": f"""Result of {c['name']}:\n{out}"""})
-            if status == "finished": break
-    except Exception:
-        status = "error"
-        raise
-    finally:
-        if session: close = await connections.call_capability(tconn, "agent_session_close", {"session": session, "message": f"{(summary or task)[:2000]}\n\n[agent_loop {ctx.job_id} - {status} after {steps_done} step(s)]"})
-        if cnode: resources.log_usage(cnode["id"], "agent_loop", time.time()-t0, {"steps": steps_done, "status": status})
-    if close.get("error"): raise RuntimeError(f"""agent_loop: session close failed - the worktree is still open on the node: {close['error']}""")
-    return {"summary": summary, "agent_status": status, "steps": steps_done, "branch": close.get("branch", ""), "workspace": {**close, "conn_id": tconn.get("_id", "")}, "transcript": messages}
+async def node_call_capability(config: dict, data: dict, ctx: NodeContext) -> dict:
+    cap = str(config.get("capability") or "").strip()
+    if not cap: raise RuntimeError("call_capability: no capability set")
+    cnode, conn = _pick_capability_conn(config, ctx, cap, f"call_capability({cap})")
+    payload = _resolve_deep(_parse_json_config(config.get("payload_json"), {}), ctx)
+    t0 = time.time()
+    r = await connections.call_capability(conn, cap, payload, timeout_s=float(_opt(config, "timeout_s", 0) or conn.get("values", {}).get("timeout_s") or 3600))
+    if r.get("error"): raise RuntimeError(f"""call_capability({cap}): {r['error']}""")
+    if cnode: resources.log_usage(cnode["id"], f"call_capability:{cap}", time.time()-t0)
+    return {"result": r, **{f: r[f] for f in (x.strip() for x in str(config.get("out_fields") or "").split(",")) if f and f in r}}
 
 def looks_like_embedding(model_name: str) -> bool: return any(p in model_name.lower() for p in _EMBED_PATTERNS)
 
@@ -511,6 +464,31 @@ def pick_default_chat_model(models: list) -> str:
     return candidates[0] if candidates else ""
 
 def _llm_conn_options(values=None): return [("", "(pool-resolved by priority)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in conns_matching("chat")]
+
+_VIDEO_CAPS = ["start_end_to_video", "image_to_video", "text_to_video"]   # richest first; a pool pick may fall back rightward only
+
+def _conn_label(c: dict) -> tuple: return (c["_id"], f"""{c.get("display_name", c["_id"])} [{c.get("connection_type", "?")}]""")
+
+def _generate_conn_options(values=None):
+    """Generate's Connection select follows Modality: chat connections for text, text encoders for image, video-capable connections for video."""
+    m = (values or {}).get("modality") or "text"
+    conns = list_conns("flux2_text") if m == "image" else [c for c in list_conns(get_all=True) if any(connections.has_capability(c, k) for k in _VIDEO_CAPS)] if m == "video" else conns_matching("chat")
+    return [("", "(pool-resolved by priority)")] + [_conn_label(c) for c in conns]
+
+def _image_node_options(values=None): return [("", "(pool-resolved by priority)")] + [_conn_label(c) for c in list_conns("flux2_image")]
+def _all_conn_options(values=None): return [("", "(pool-resolved by capability)")] + [_conn_label(c) for c in list_conns(get_all=True)]
+
+def _node_model_options(kind: str):
+    """Options for image_model / video_model from the node's own model_list (blank = the node's default / loaded model). The saved value stays selectable when the node is unreachable."""
+    def _opts(values=None):
+        values = values or {}
+        pin = values.get("image_conn_id" if kind == "image" else "conn_id")
+        conn = get_conn(pin) if pin else next(iter(list_conns("flux2_image")), None)
+        r = connections.call_capability_sync(conn, "model_list", {}, timeout_s=3.0) if conn else {}
+        names = [m["name"] for m in r.get(kind, []) if m.get("modes")] if isinstance(r.get(kind), list) else []
+        cur = values.get(f"{kind}_model") or ""
+        return [("", "(node default)")] + [(n, n) for n in names] + ([(cur, f"{cur} (saved, not listed by the node)")] if cur and cur not in names else [])
+    return _opts
 
 def _model_options_for_pinned_conn(values=None):
     conn_id = (values or {}).get("conn_id","")
@@ -547,8 +525,8 @@ def register_builtins():
         if include_model: fields.append(BI.SettingField("model", "Model", type="select", default="", options=_model_options_for_pinned_conn, hint="Populates once a connection is pinned above. Leave blank to auto-pick the first non-embedding model."))
         return fields
 
-    register_node_type("generate", node_generate, "Generate (text or image)", in_keys=["input"], out_keys=["text","thinking"], config_schema=[
-        BI.SettingField("modality","Modality","select",default="text", options=[("text","Text"),("image","Image")]),
+    register_node_type("generate", node_generate, "Generate (text, image or video)", in_keys=["input"], out_keys=["text","thinking"], config_schema=[
+        BI.SettingField("modality","Modality","select",default="text", options=[("text","Text"),("image","Image"),("video","Video")], hint="Image reads optional init_image / mask_image / reference_image keys; video reads optional start_image / end_image keys (add them to Extra In Keys when a pipeline supplies them)."),
         BI.SettingField("system_prompt","System Prompt","textarea",default="You are a helpful AI assistant."),
         BI.SettingField("user_template","User/Prompt Template","textarea",default="{input}", hint="{key} substitutes real pipeline keys directly."),
         BI.SettingField("temperature","Temperature","number",default=0.7),
@@ -563,9 +541,24 @@ def register_builtins():
         BI.SettingField("height","Height (image)","number",default=1024,step=1,advanced=True),
         BI.SettingField("steps","Steps (image)","number",default=4,step=1,advanced=True),
         BI.SettingField("cfg","Guidance Scale (image)","number",default=1.0,advanced=True),
+        BI.SettingField("strength","Init Image Strength (image)","number",default=0.75,advanced=True,hint="With an init image: 1 repaints fully, lower keeps more of it. Width/height blank = the init image's own size."),
+        BI.SettingField("image_model","Image Model (image)","select",default="",options=_node_model_options("image"),advanced=True),
+        BI.SettingField("image_conn_id","Image Node Connection (image)","select",default="",options=_image_node_options,advanced=True,hint="For image modality the Connection field above is the text encoder; this is the node that renders."),
+        BI.SettingField("video_model","Video Model (video)","select",default="",options=_node_model_options("video"),advanced=True,hint="Blank = the loaded video model when it can do the job, else the first that can."),
+        BI.SettingField("negative_prompt","Negative Prompt (video)","textarea",advanced=True,hint="Blank = the node's default."),
+        BI.SettingField("video_width","Width (video)","number",default=None,step=1,advanced=True,hint="Blank = the model's default; a Fun InP model with a start frame keeps that frame's shape."),
+        BI.SettingField("video_height","Height (video)","number",default=None,step=1,advanced=True),
+        BI.SettingField("num_frames","Frames (video)","number",default=None,step=1,advanced=True,hint="Rounded up to what the model can make (4k+1)."),
+        BI.SettingField("fps","Frames per Second (video)","number",default=None,advanced=True),
+        BI.SettingField("video_steps","Steps (video)","number",default=None,step=1,advanced=True),
+        BI.SettingField("video_cfg","Guidance Scale (video)","number",default=None,advanced=True),
+        BI.SettingField("scheduler","Sampler (video)","select",default="",options=[("","(model default)"),("ddim","DDIM"),("cog_ddim","CogVideoX DDIM"),("cog_dpm","CogVideoX DPM")],advanced=True),
+        BI.SettingField("formats","Formats (video, comma-sep)","text",default="",advanced=True,hint="gif, webp, mp4. Blank = gif. Joining clips works from the frames every clip keeps."),
+        BI.SettingField("offload_mode","Memory Offload (video)","select",default="",options=[("","(none)"),("sequential","Sequential blocks (slowest, least memory)")],advanced=True),
+        BI.SettingField("name_template","Output Name (video)","text",default="",advanced=True,hint="File name prefix; supports {key}."),
         BI.SettingField("kv_cache_type","KV Cache Type (llama.cpp connections)","select",default="",options=[("","(connection default)")]+[(k,k) for k in ("f16","q8_0","q5_1","q5_0","q4_1","q4_0","iq4_nl")],advanced=True),
         BI.SettingField("cache_session","Saved-Context Session","text",advanced=True,hint="Nodes sharing a session reuse each other's prefilled context. Blank = shared default."),
-        *_pool_fields(), _key_map_field()], guide="One universal generation node - text or image, picked by Modality. With no connection pinned, resolves one from this node's resource pool (pipeline pool intersected with this node's own tags) using Priority.")
+        *_pool_fields()[:2], BI.SettingField("conn_id", "Connection", type="select", default="", options=_generate_conn_options, hint="Follows Modality: the chat model's connection (text), the text encoder (image), the video node (video). Blank = pool-resolved."), _pool_fields()[3], _key_map_field()], guide="One universal generation node - text, image or video, picked by Modality. With no connection pinned, resolves one from this node's resource pool (pipeline pool intersected with this node's own tags) using Priority. Video picks by capability from the frames given (start + end, start, none); the pool may fall back to a lesser capability, a pinned connection may not.")
 
     register_node_type("transform", node_transform, "Transform (deterministic)", in_keys=["input"], out_keys=["value"], config_schema=[
         BI.SettingField("mode", "Mode", "select", default="template", options=[("template","Template fill"), ("expr","Python expression"), ("chunk","Chunk (paragraph-safe split)"), ("regex_find","Regex find"), ("regex_replace","Regex replace"),("python","Inline script")]),
@@ -623,7 +616,8 @@ def register_builtins():
         BI.SettingField("item_key","Item Key (sub-pipeline name for one item)","text",default="item"),
         BI.SettingField("import_keys","Import Keys (comma-sep, actual names)","text",advanced=True),
         BI.SettingField("export_keys","Export Keys (comma-sep, actual names)","text"),
-        _key_map_field()], guide="Runs the sub-pipeline once per item in 'items', sequentially, collecting each run's export_keys into 'results'.")
+        BI.SettingField("on_item_error","When an Item's Run Fails","select",default="continue",options=[("continue","Continue (its result carries _error)"),("stop","Stop (this node fails)")],advanced=True),
+        _key_map_field()], guide="Runs the sub-pipeline once per item in 'items', sequentially, collecting each run's export_keys into 'results'. A failed item's result carries '_error'.")
 
     register_node_type("pipeline_reduce", node_pipeline_reduce, "For Each Item, Call Pipeline (Sequential Fold)", in_keys=["items","accumulator"], out_keys=["accumulator"], config_schema=[
         BI.SettingField("pipeline_id","Pipeline","select", options=_pipeline_options),
@@ -644,35 +638,25 @@ def register_builtins():
         BI.SettingField("export_keys","Export Keys (comma-sep)","text"),
         BI.SettingField("vars_json","Variables (JSON: name -> template)","json",default={},advanced=True),
         *_pool_fields(), _key_map_field()], guide="Decides a value, looks it up in Routes, calls whichever sub-pipeline matches (falling back to Default Pipeline ID). Only the chosen path actually runs.")
-    
-    register_node_type("transcribe", node_transcribe, "Transcribe (speech to text)", in_keys=["audio_b64"], out_keys=["text","segments","language"], config_schema=[
+
+    register_node_type("transcribe", node_transcribe, "Transcribe (speech to text)", in_keys=["audio_b64"], out_keys=["text","segments","language","dropped_text"], config_schema=[
         BI.SettingField("language","Language (ISO code, blank = auto-detect)","text"),
         BI.SettingField("vad_filter","Skip silence (VAD)","checkbox",default=True),
+        BI.SettingField("skip_empty","Drop Nothing-Said Audio","checkbox",default=True,hint="An empty or punctuation-only transcript gives no 'text' (only 'dropped_text'), so the nodes waiting on 'text' never run."),
+        BI.SettingField("ignore_phrases","Ignore These Transcripts (one per line)","textarea",advanced=True,hint="Whole transcripts treated as nothing said - the recognizer's noise inventions, e.g. Thank you. / Thanks for watching!"),
+        BI.SettingField("max_no_speech_prob","Drop Segments Rated Not-Speech Above","number",default=None,advanced=True,hint="0-1, the recognizer's own per-segment no_speech_prob (speech_direct reports it). Blank = keep every segment; 0.6 is a reasonable start."),
         BI.SettingField("initial_prompt","Vocabulary Prompt","textarea",advanced=True,hint="Names and jargon the recognizer should expect. Supports {key}."),
         BI.SettingField("stt_model","Recognizer Model Override","text",advanced=True,hint="Blank = the node's default (e.g. small, medium, large-v3)."),
         *_pool_fields(include_model=False, conn_type="speech_to_text"), _key_map_field()], guide="Sends base64 audio (webm/ogg/mp4/wav/mp3) in 'audio_b64' to any connection declaring speech_to_text and returns the text. Pair with Speak and Generate for a voice conversation.")
+
+    register_node_type("call_capability", node_call_capability, "Call Capability (any connection)", in_keys=[], out_keys=["result"], config_schema=[
+        BI.SettingField("capability","Capability","text",hint="One the connection's profile declares, e.g. video_join, model_list, voice_list."),
+        BI.SettingField("payload_json","Payload (JSON; values may be {key} templates)","json",default={},hint="A value that is exactly one {key} passes that key's raw value (a list stays a list). Add the keys it uses to Extra In Keys so the node waits for them."),
+        BI.SettingField("out_fields","Response Fields to Output (comma-sep)","text",hint="Each becomes an output key of the same name (declare them in Extra Out Keys for the builder view); the whole response is always in 'result'."),
+        BI.SettingField("timeout_s","Timeout (s, blank = the connection's)","number",default=None,step=1,advanced=True),
+        *_pool_fields(include_model=False)[:2], BI.SettingField("conn_id","Connection","select",default="",options=_all_conn_options,hint="Blank = the pool picks a connection declaring the capability."), _key_map_field()], guide="Calls one capability any connection declares and returns its JSON answer. New node features become usable in pipelines without a dedicated node type.")
 
     register_node_type("speak", node_speak, "Speak (text to speech)", in_keys=["text"], out_keys=["audio_b64","format","duration_s"], config_schema=[
         BI.SettingField("voice","Voice","text",hint="Voice id on the speech node (e.g. en_US-lessac-medium). Blank = the node's default."),
         BI.SettingField("length_scale","Speaking Pace (length scale)","number",default=None,hint=">1 slower, <1 faster. Blank = the voice's own pace."),
         *_pool_fields(include_model=False, conn_type="text_to_speech"), _key_map_field()], guide="Synthesizes 'text' through any connection declaring text_to_speech and returns base64 audio. The speech node strips thinking blocks, code and markdown before speaking.")
-
-    register_node_type("agent_loop", node_agent_loop, "Agent Loop (LLM + toolset)", in_keys=["input"], out_keys=["summary","agent_status","steps","branch","workspace","transcript"], config_schema=[
-        BI.SettingField("system_prompt","System Prompt","textarea",default="You are a careful coding agent. Read the code you change and its callers first, keep edits small, check your work, then finish with an exact summary."),
-        BI.SettingField("user_template","Task Template","textarea",default="{input}",hint="{key} substitutes real pipeline keys."),
-        BI.SettingField("tools_conn_id","Toolset Connection","select",default="",options=lambda values=None: [("", "(pool-resolved by priority)")] + [(c["_id"], c.get("display_name", c["_id"])) for c in conns_matching("agent_tools_call")]),
-        BI.SettingField("tools_cnode_tags","Toolset Pool Tags (comma-sep)","text",advanced=True),
-        BI.SettingField("allow_tools","Allowed Tools (comma-sep, blank = all)","text",advanced=True,hint="Narrows what the model may call, e.g. read-only review: list_files,read_file,grep,outline"),
-        BI.SettingField("session_args_json","Session Arguments (JSON)","json",default={},advanced=True,hint='Passed to the toolset when the run opens, e.g. {"base": "main"}.'),
-        BI.SettingField("max_steps","Max Steps","number",default=60,step=1),
-        BI.SettingField("tool_protocol","Tool Protocol","select",default="auto",options=[("auto","Auto (native when the connection declares tool_calling)"),("native","Native tool calls"),("text","Text blocks (any model)")],advanced=True),
-        BI.SettingField("finish_tool","Finish Tool Name","text",default="finish",advanced=True),
-        BI.SettingField("temperature","Temperature","number",default=0.2),
-        BI.SettingField("num_ctx","Context Window Tokens","number",default=32768,step=1),
-        BI.SettingField("ctx_chars","Transcript Budget (chars, blank = 3 x context tokens)","number",default=None,step=1,advanced=True),
-        BI.SettingField("num_predict","Max Output Tokens per Step","number",default=-1,step=1,advanced=True),
-        BI.SettingField("think","Thinking Effort","select",default="",options=[("","Off"),("low","Low"),("medium","Medium"),("high","High")],advanced=True),
-        BI.SettingField("kv_cache_type","KV Cache Type (llama.cpp connections)","select",default="",options=[("","(connection default)")]+[(k,k) for k in ("f16","q8_0","q5_1","q5_0","q4_1","q4_0","iq4_nl")],advanced=True),
-        BI.SettingField("cache_session","Saved-Context Session","text",advanced=True),
-        *_pool_fields(), _key_map_field()], guide="Runs one model against a toolset connection until it calls the finish tool, hits Max Steps, or the job is stopped. Opens a toolset session first when the toolset supports one (the code workspace gives each run its own ai/<id> branch) and always closes it, committing whatever was done. Native tool calls when the chat connection declares tool_calling, otherwise a text-block protocol with a progress warning.")
-
