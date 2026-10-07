@@ -355,9 +355,8 @@ async def node_branch(config: dict, data: dict, ctx: NodeContext) -> dict:
     if config.get("decide_mode", "expr") == "llm":
         decision = (await node_generate({**config, "enforce_options": config.get("options",""), "user_template": config.get("decide_template","{input}")}, data, ctx)).get("choice","")
     else:
-        var_templates = _parse_json_config(config.get("vars_json"), {})
-        local_vars = {name: ctx.resolve_value(tpl) for name, tpl in var_templates.items()}
-        try: decision = str(eval(config.get("decide_expr","input"), {"__builtins__": {"len":len,"str":str,"int":int}}, {**local_vars, "input": ctx.get("input")}))
+        variables = {name: ctx.resolve_value(tpl) for name, tpl in _parse_json_config(config.get("vars_json"), {}).items()}
+        try: decision = str(eval(config.get("decide_expr","input"), {"__builtins__": _SAFE_BUILTINS, **variables, "input": ctx.get("input")}))   # variables as globals, as in transform: comprehensions cannot see eval locals before Python 3.12
         except Exception as e: raise RuntimeError(f"branch: decide_expr failed: {e}")
     routes = _parse_json_config(config.get("routes_json"), {})
     pid = routes.get(decision) or config.get("default_pipeline_id","")

@@ -150,6 +150,12 @@ def _norm_tool_call(tc: dict) -> dict:
         except json.JSONDecodeError: args = {"_raw": args}
     return {"id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": args if isinstance(args, dict) else {"_raw": args}}
 
+THINK_LEVELS = ("low", "medium", "high", "max")
+
+def _think_value(v):
+    """What providers accept for think: an effort level or a bool. Settings store "Off" as "" (and older ones "true" / "false"), which Ollama rejects with 400 - anything else becomes a bool."""
+    return v if isinstance(v, bool) or v in THINK_LEVELS else str(v).strip().lower() in ("true", "1", "on", "yes")
+
 async def stream_llm_events(conn: dict, messages: list, model: str, think = False, tools: list = None, **kwargs):
     """Agnostic chat stream. Yields {"text", "thinking", "tool_calls"} per chunk - empty values for whatever a chunk doesn't carry.
     think=True is honored only if the connection's profile declares supports_thinking; otherwise it's dropped with a console warning, never an error - a provider lacking a capability is a gap in that provider, not a reason to remove the capability for providers that have it.
@@ -157,7 +163,7 @@ async def stream_llm_events(conn: dict, messages: list, model: str, think = Fals
     profile = _conn_profile(conn)
     chat_ep = profile.get("endpoints", {}).get("chat", {})
     if not chat_ep: raise RuntimeError(f"""stream_llm: connection_type '{conn.get('connection_type')}' has no endpoints.chat""")
-    supports_thinking = profile.get("supports_thinking", False)
+    supports_thinking, think = profile.get("supports_thinking", False), _think_value(think)
     if think and not supports_thinking: print(f"""[stream_llm] '{conn.get('connection_type')}' has no supports_thinking - think={think!r} ignored for this call""")
     options = _resolved_options(profile, kwargs)
     payload = _render_template(chat_ep.get("body", {}), {"model": model, "messages": messages, "think": (think if supports_thinking else False), "options": options, **options, **({"tools": tools} if tools else {})})
@@ -421,7 +427,7 @@ async def flux2_system_status(conn) -> dict:
     except Exception as e: return {"error": str(e)}
 
 async def flux2_system_load(conn, model_path: str, vae_path: str) -> dict:
-    """/system/load is a no-op if the engine already has something loaded - unload first to switch models."""
+    """/system/load switches the node to model_path (it unloads what it holds first, and keeps it when model_path does not exist); while a generation runs it answers at once with status Error."""
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)) as c:
             r = await c.post(f"{_base(conn)}/system/load", params={"model_path": model_path, "vae_path": vae_path})
