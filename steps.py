@@ -4,7 +4,7 @@ It reads whatever it needs from the shared pipeline `data` object - ctx.get()/ct
 the in_keys/out_keys a type declares are a scheduling contract, not a firewall - and returns a dict of LOGICAL output names -> values.
 The engine remaps those to actual pipeline keys via the node's key_map and merges them into `data`.
 """
-import re, json, sys, asyncio, uuid, time, io, wave, base64
+import re, json, sys, asyncio, uuid, time, io, wave, base64, array, difflib
 from pathlib import Path
 from tools.ai_manager import engine, resources, connections
 from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
@@ -160,15 +160,15 @@ async def node_generate(config: dict, data: dict, ctx: NodeContext) -> dict:
     try:
         async for text, thinking in stream_llm(conn, messages, model, think=config.get("think", False), temperature=config.get("temperature", 0.7), num_ctx = int(resources.resolve_bound(config.get("num_ctx_mode","exact"), config.get("num_ctx", 16384), config.get("num_ctx_max"), fallback=16384)), num_predict=config.get("num_predict", -1), kv_cache_type=config.get("kv_cache_type") or None, cache_session=config.get("cache_session") or None, **seed_kwargs):
             full += text; thinking_full += thinking
-            await ctx.stream("text", text)
-            if speaker and text: speaker.feed(text)
+            if speaker and text: speaker.feed(text); text = speaker.take()   # with tags in play, the live view gets the text as it will be shown
+            if text: await ctx.stream("text", text)
     except BaseException:
         if speaker: speaker.cancel()
-        ctx.partial = {"text": full, "thinking": thinking_full, **({"spoken_segments": speaker.seq, "audio_b64": speaker.joined()} if speaker else {})}   # kept by the engine when the node is stopped mid-reply
+        ctx.partial = {"text": full, "thinking": thinking_full, **({"spoken_segments": speaker.seq, "audio_b64": speaker.joined(), "actions": speaker.actions} if speaker else {})}   # kept by the engine when the node is stopped mid-reply
         raise
     if speaker: await speaker.close(cut=int(config.get("num_predict") or -1) > 0 and len(full) >= int(config["num_predict"]) * 3.6)   # about 3.6 characters per token: a reply this long most likely stopped at the token cap
     if cnode: resources.log_usage(cnode["id"], "generate:text", time.time()-t0)
-    result = {"text": full, "thinking": thinking_full, **({"spoken_segments": speaker.seq, "audio_b64": speaker.joined()} if speaker else {})}
+    result = {"text": full, "thinking": thinking_full, **({"spoken_segments": speaker.seq, "audio_b64": speaker.joined(), "actions": speaker.actions} if speaker else {})}
     if json_fields:
         parsed = _extract_json_fields(full, json_fields)
         if parsed: result.update(parsed)
@@ -417,55 +417,100 @@ def _pick_chat_model(conn: dict, model: str, label: str) -> str:
 
 _SENT_END = re.compile(r"\n+|(?<=[.!?\u2026])[\"')\]]*[ \t]+")   # a line break, or sentence punctuation (plus closing quotes/brackets) followed by a space
 
+def _tag_names(value) -> set: return {t.strip().lower() for t in str(value or "").split(",") if t.strip()}
+
+def _resample16(frames: bytes, channels: int, src: int, dst: int) -> bytes:
+    """Linear-interpolation resampling of 16-bit little-endian PCM - enough for joining speech segments for replay, not for music."""
+    a = array.array("h", frames); n = len(a) // channels; m = int(n * dst / src)
+    out = array.array("h", bytes(2 * m * channels))
+    for i in range(m):
+        x = i * src / dst; j = int(x); f = x - j; k = min(j + 1, n - 1)
+        for c in range(channels): out[i * channels + c] = int(a[j * channels + c] * (1 - f) + a[k * channels + c] * f)
+    return out.tobytes()
+
+def _join_wavs(segments: list) -> str:
+    """Base64 wav segments joined into one wav (base64), for replay. A segment at another sample rate is resampled to the first one's (16-bit only); one with different channels or sample width is left out."""
+    if not segments: return ""
+    out, first = io.BytesIO(), None
+    with wave.open(out, "wb") as w:
+        for b in segments:
+            with wave.open(io.BytesIO(base64.b64decode(b.split(",", 1)[-1]))) as r:
+                p, frames = r.getparams(), r.readframes(r.getnframes())
+                if first is None: first = p; w.setparams(first)
+                if p[:2] != first[:2] or (p[2] != first[2] and p[1] != 2): continue
+                w.writeframes(frames if p[2] == first[2] else _resample16(frames, p[0], p[2], first[2]))
+    return base64.b64encode(out.getvalue()).decode()
+
 class _SentenceSpeaker:
-    """Speaks a reply while it is still being written. Text is buffered until a sentence ends (a line break, or . ! ? and a space); each finished
-    sentence goes to text-to-speech at once, one request at a time and in order, and its audio is pushed to the browser as a `cm-voice-audio`
-    trigger {sid, turn, seq, audio_b64, format, text, last}. The browser queues the segments by seq and plays them back to back, so the first words
-    are heard after one sentence instead of after the whole reply. A failed segment is pushed with empty audio so playback order never stalls.
-    The spoken wav segments are also kept and joined into one wav (joined()), returned as the generate node's audio_b64 so the reply can be replayed."""
+    """Speaks a reply while it is still being written.
+    Text is buffered until a sentence ends (a line break, or . ! ? and a space); each finished sentence goes to text-to-speech at once, one request at a time and in order, and its audio is pushed to the browser as a `cm-voice-audio` trigger {sid, turn, seq, audio_b64, format, text, lang, last}.
+    The browser queues the segments by seq and plays them back to back.
+    Known tags are read on the way: <lang code="xx">...</lang> ends the current segment and speaks its text with that language's voice (speak_lang_voices);
+    whitelisted action tags (speak_action_tags) are collected in .actions and never spoken.
+    An unfinished tag waits for the rest; one still unfinished when the reply ends is dropped.
+    A failed segment is pushed with empty audio so playback order never stalls. The spoken segments are also joined into one wav (joined()) for replay."""
     def __init__(self, ctx: NodeContext, config: dict):
-        self.ctx, self.sid, self.buf, self.seq, self.q, self.audio = ctx, ctx.resolve(str(config.get("speak_sid") or "")), "", 0, asyncio.Queue(), []
+        self.ctx, self.sid, self.raw, self.buf, self.lang, self.seq, self.q, self.audio, self.actions = ctx, ctx.resolve(str(config.get("speak_sid") or "")), "", "", "", 0, asyncio.Queue(), [], []
         self.min_chars, self.drop_tail = int(_opt(config, "speak_min_chars", 12)), bool(config.get("speak_drop_unfinished", True))
+        self.voices, self.names = _parse_json_config(config.get("speak_lang_voices"), {}), _tag_names(config.get("speak_action_tags")) | {"lang"}
         self.payload = {"voice": config.get("speak_voice") or None, "length_scale": None if config.get("speak_length_scale") in (None, "") else float(config["speak_length_scale"])}
         _, self.conn = _pick_capability_conn({**config, "conn_id": config.get("speak_conn_id") or ""}, ctx, "text_to_speech", "generate(speak while writing)")
         self.worker = asyncio.create_task(self._work())
+        self.shown = ""
 
-    def feed(self, text: str):
-        self.buf += text
+    def feed(self, text: str): self.raw += text; self._drain()
+
+    def _drain(self, final: bool = False):
+        """Moves read text out of self.raw: ordinary text into the sentence buffer, a <lang> tag switches the voice, action tags go to .actions."""
+        while self.raw:
+            i = self.raw.find("<")
+            if i < 0: self._say(self.raw); self.raw = ""; break
+            if i > 0: self._say(self.raw[:i]); self.raw = self.raw[i:]; continue
+            tag, n = ENV["tools"]["built_ins"].tag_at(self.raw, self.names)
+            if n < 0: self._say("<"); self.raw = self.raw[1:]; continue
+            if n == 0:
+                if final: self.raw = ""   # a tag still unfinished when the reply ends is dropped, never spoken
+                break
+            self.raw = self.raw[n:]
+            if tag["name"] == "lang": self._cut(); self.lang = "" if tag["close"] else str(tag["attrs"].get("code", "")).lower()
+            elif not tag["close"]: self.actions.append({k: tag[k] for k in ("name", "attrs", "body")})
+
+    def _say(self, text: str):
+        self.shown += text; self.buf += text
         while (m := _SENT_END.search(self.buf, self.min_chars if len(self.buf) > self.min_chars else len(self.buf))):   # very short pieces ("Yes." "Hi!") wait for the next sentence instead of costing a request each
-            self.q.put_nowait(self.buf[:m.end()].strip()); self.buf = self.buf[m.end():]
+            self.q.put_nowait((self.buf[:m.end()].strip(), self.lang)); self.buf = self.buf[m.end():]            
+            
+    def _cut(self):
+        """Ends the current segment at a language switch, so each segment is spoken in one voice."""
+        if self.buf.strip(): self.q.put_nowait((self.buf.strip(), self.lang))
+        self.buf = ""
 
     async def close(self, cut: bool = False):
         """Speaks what is left - unless the reply was cut at the token cap mid-sentence and drop_tail is set - then waits for every segment to be sent."""
+        self._drain(final=True)
         tail = self.buf.strip()
-        if tail and not (cut and self.drop_tail and tail[-1] not in ".!?\u2026\"')]"): self.q.put_nowait(tail)
+        if tail and not (cut and self.drop_tail and tail[-1] not in ".!?\u2026\"')]"): self.q.put_nowait((tail, self.lang))
         self.q.put_nowait(None)
         await self.worker
         await self._push({"seq": self.seq, "last": True})
 
     def cancel(self): self.worker.cancel()
 
-    def joined(self) -> str:
-        """Every spoken segment so far as one wav (base64), for replay. Segments whose wav parameters differ from the first are left out."""
-        if not self.audio: return ""
-        out, first = io.BytesIO(), None
-        with wave.open(out, "wb") as w:
-            for b in self.audio:
-                with wave.open(io.BytesIO(base64.b64decode(b.split(",", 1)[-1]))) as r:
-                    if first is None: first = r.getparams(); w.setparams(first)
-                    if r.getparams()[:3] == first[:3]: w.writeframes(r.readframes(r.getnframes()))
-        return base64.b64encode(out.getvalue()).decode()
+    def joined(self) -> str: return _join_wavs(self.audio)
 
     async def _push(self, detail: dict): await ENV["push_to_client"](self.ctx.username, {"t": "trigger", "event": "cm-voice-audio", "detail": {"sid": self.sid, "turn": self.ctx.job_id, **detail}})
 
     async def _work(self):
-        while (text := await self.q.get()) is not None:
+        while (item := await self.q.get()) is not None:
+            text, lang = item
             if not _words(text): continue   # punctuation-only pieces have nothing to say
-            r = await connections.call_capability(self.conn, "text_to_speech", {"text": text, **self.payload})
+            r = await connections.call_capability(self.conn, "text_to_speech", {"text": text, **self.payload, "voice": self.voices.get(lang) or self.payload["voice"]})
             if r.get("error"): await self.ctx.progress(f"""speak while writing: segment {self.seq} failed - {r['error']}""")
             elif r.get("format", "wav") == "wav" and r.get("audio_b64"): self.audio.append(r["audio_b64"])
-            await self._push({"seq": self.seq, "audio_b64": "" if r.get("error") else r.get("audio_b64", ""), "format": r.get("format", "wav"), "text": text, "last": False})
+            await self._push({"seq": self.seq, "audio_b64": "" if r.get("error") else r.get("audio_b64", ""), "format": r.get("format", "wav"), "text": text, "lang": lang, "last": False})
             self.seq += 1
+     
+    def take(self) -> str: t, self.shown = self.shown, ""; return t   # text read since the last call, tags removed, for the live view
 
 def _words(text: str) -> str: return re.sub(r"[^\w']+", " ", str(text).lower()).strip()   # lowercase words only: punctuation and spacing never decide whether something was said
 
@@ -487,14 +532,19 @@ async def node_transcribe(config: dict, data: dict, ctx: NodeContext) -> dict:
     return {**out, "text": text}
 
 async def node_speak(config: dict, data: dict, ctx: NodeContext) -> dict:
+    """Speaks 'text'. Known tags are read first: text inside <lang code="xx">...</lang> uses lang_voices[xx]; action tags (action_tags) go to 'actions' and are not spoken. Runs in different voices are joined into one wav."""
     text = str(ctx.get("text"))
     if not text.strip(): raise RuntimeError("speak: text in-key is empty")
     cnode, conn = _pick_capability_conn(config, ctx, "text_to_speech", "speak")
-    t0 = time.time()
-    r = await connections.call_capability(conn, "text_to_speech", {"text": text, "voice": config.get("voice") or None, "length_scale": None if config.get("length_scale") in (None, "") else float(config["length_scale"])})
-    if r.get("error"): raise RuntimeError(f"""speak: {r['error']}""")
-    if cnode: resources.log_usage(cnode["id"], "speak", time.time()-t0, {"audio_s": r.get("duration_s")})
-    return {"audio_b64": r["audio_b64"], "format": r.get("format", "wav"), "duration_s": r.get("duration_s")}
+    parsed, voices, t0, parts = ENV["tools"]["built_ins"].parse_tagged(text, _tag_names(config.get("action_tags"))), _parse_json_config(config.get("lang_voices"), {}), time.time(), []
+    for lang, run in parsed["runs"]:
+        r = await connections.call_capability(conn, "text_to_speech", {"text": run, "voice": voices.get(lang) or config.get("voice") or None, "length_scale": None if config.get("length_scale") in (None, "") else float(config["length_scale"])})
+        if r.get("error"): raise RuntimeError(f"""speak: {r['error']}""")
+        parts.append(r)
+    duration = sum(float(p.get("duration_s") or 0) for p in parts)
+    if cnode: resources.log_usage(cnode["id"], "speak", time.time()-t0, {"audio_s": duration})
+    if len(parts) == 1: return {"audio_b64": parts[0]["audio_b64"], "format": parts[0].get("format", "wav"), "duration_s": parts[0].get("duration_s"), "actions": parsed["actions"]}
+    return {"audio_b64": _join_wavs([p["audio_b64"] for p in parts if p.get("format", "wav") == "wav"]), "format": "wav", "duration_s": duration, "actions": parsed["actions"]}   # no runs (a reply that is only actions) gives empty audio
 
 async def node_identify_speaker(config: dict, data: dict, ctx: NodeContext) -> dict:
     """Who said it. The audio is embedded by a connection declaring speaker_embed and compared (cosine) with each enrolled profile in the 'profiles'
@@ -512,6 +562,40 @@ async def node_identify_speaker(config: dict, data: dict, ctx: NodeContext) -> d
     p = best if best and score >= float(_opt(config, "guess_threshold", 0.35)) else {"name": config.get("other_name") or "Other", "code": config.get("other_code") or "0000", "role": "unknown"}
     guess = config.get("guess_mark", "?") if best is p and score < float(_opt(config, "match_threshold", 0.5)) else ""
     return {"speaker": p["name"], "speaker_code": p.get("code", ""), "speaker_role": p.get("role", ""), "speaker_score": round(score, 3), "speaker_tag": (config.get("tag_format") or "({name}{guess}): ").format(name=p["name"], code=p.get("code", ""), role=p.get("role", ""), guess=guess)}
+
+_ROLE_ORDER = ["unknown", "guest", "trusted", "owner"]
+
+def _wake_end(text: str, wake: list, fuzz: float):
+    """Where a wake word at the start of text ends (index), or None. Exact match first; then, when fuzz < 1, the first one or two words compared with each wake word by similarity (0-1), since recognizers misspell names."""
+    m = re.match(rf"""^\W*({"|".join(re.escape(w) for w in sorted(wake, key=len, reverse=True))})\b[\s,.:;!?-]*""", text, re.I)
+    if m: return m.end()
+    if fuzz >= 1: return None
+    words = list(re.finditer(r"[\w']+", text))[:2]
+    for n in (2, 1):
+        if len(words) >= n and any(difflib.SequenceMatcher(None, " ".join(w.group(0) for w in words[:n]).lower(), x.lower()).ratio() >= fuzz for x in wake): return words[n - 1].end() + re.match(r"[\s,.:;!?-]*", text[words[n - 1].end():]).end()
+    return None
+
+async def node_route_text(config: dict, data: dict, ctx: NodeContext) -> dict:
+    """Decides what a line is, by rules only - no model call. rules_json: {"wake": [aliases], "routes": [{name, match: [regex], role}], "roles": [lowest..highest]}; wake_words adds aliases.
+    Not addressed (wake words exist, the 'awake' in-key is empty and the line does not start with one): no 'text' out, so nodes waiting on it stay unreached; route 'ignored', the line in 'dropped_text'.
+    A wake word alone: command 'wake'. A route whose regex fully matches what follows the wake word: route 'command', command + args (named groups) when the 'role' in-key ranks at or above the route's role, otherwise plain conversation with a 'note'.
+    Anything else: route 'chat', 'text' = the line without its wake word."""
+    rules = _parse_json_config(config.get("rules_json"), {})
+    text, awake, role = str(ctx.get("input")).strip(), bool(ctx.get("awake")), str(ctx.get("role") or "")
+    roles = rules.get("roles") or _ROLE_ORDER
+    rank = lambda r: roles.index(r) if r in roles else 0
+    wake = [w.strip() for w in [*(rules.get("wake") or []), *str(config.get("wake_words") or "").split(",")] if w.strip()]
+    end = _wake_end(text, wake, float(_opt(config, "wake_fuzz", 0.8))) if wake else None
+    if wake and not (awake or end is not None): return {"route": "ignored", "dropped_text": text}
+    rest = (text[end:] if end is not None else text).strip()
+    said = re.sub(r"[\s.!?,;:]+$", "", rest)
+    if not said: return {"route": "wake", "command": "wake", "args": {}}
+    for r in rules.get("routes") or []:
+        hit = next((h for p in r.get("match") or [] if (h := re.fullmatch(p, said, re.I))), None)
+        if not hit: continue
+        if rank(role) >= rank(r.get("role", "owner")): return {"route": "command", "command": r["name"], "args": hit.groupdict()}
+        return {"route": "chat", "text": rest, "note": f"""'{r["name"]}' needs the {r.get("role", "owner")} role - treated as conversation"""}
+    return {"route": "chat", "text": rest}
 
 # --- call_capability: any capability a connection's profile declares (video_join, model_list, voice_list, ...) ---
 
@@ -640,6 +724,8 @@ def register_builtins():
         BI.SettingField("speak_sid","Chat Id to Play In (speak while writing)","text",advanced=True,hint="The browser chat that plays the segments; supports {key}."),
         BI.SettingField("speak_min_chars","Shortest Spoken Piece (chars)","number",default=12,step=1,advanced=True,hint="Shorter sentences are joined to the next one."),
         BI.SettingField("speak_drop_unfinished","Drop an Unfinished Last Sentence (speak while writing)","checkbox",default=True,advanced=True),
+        BI.SettingField("speak_lang_voices","Voice per Language (speak while writing)","json",default={},advanced=True,hint='{"es": "es_MX-...", "zh": "zh_CN-..."}: text inside <lang code="xx">...</lang> is spoken with that voice.'),
+        BI.SettingField("speak_action_tags","Action Tags (speak while writing, comma-sep)","text",advanced=True,hint="Collected into the 'actions' output and never spoken, e.g. remember,sample."),
         BI.SettingField("kv_cache_type","KV Cache Type (llama.cpp connections)","select",default="",options=[("","(connection default)")]+[(k,k) for k in ("f16","q8_0","q5_1","q5_0","q4_1","q4_0","iq4_nl")],advanced=True),
         BI.SettingField("cache_session","Saved-Context Session","text",advanced=True,hint="Nodes sharing a session reuse each other's prefilled context. Blank = shared default."),
         *_pool_fields()[:2], BI.SettingField("conn_id", "Connection", type="select", default="", options=_generate_conn_options, hint="Follows Modality: the chat model's connection (text), the text encoder (image), the video node (video). Blank = pool-resolved."), _pool_fields()[3], _key_map_field()], guide="One universal generation node - text, image or video, picked by Modality. With no connection pinned, resolves one from this node's resource pool (pipeline pool intersected with this node's own tags) using Priority. Video picks by capability from the frames given (start + end, start, none); the pool may fall back to a lesser capability, a pinned connection may not.")
@@ -749,7 +835,15 @@ def register_builtins():
         BI.SettingField("timeout_s","Timeout (s, blank = the connection's)","number",default=None,step=1,advanced=True),
         *_pool_fields(include_model=False)[:2], BI.SettingField("conn_id","Connection","select",default="",options=_all_conn_options,hint="Blank = the pool picks a connection declaring the capability."), _key_map_field()], guide="Calls one capability any connection declares and returns its JSON answer. New node features become usable in pipelines without a dedicated node type.")
 
-    register_node_type("speak", node_speak, "Speak (text to speech)", in_keys=["text"], out_keys=["audio_b64","format","duration_s"], config_schema=[
+    register_node_type("speak", node_speak, "Speak (text to speech)", in_keys=["text"], out_keys=["audio_b64","format","duration_s","actions"], config_schema=[
         BI.SettingField("voice","Voice","text",hint="Voice id on the speech node (e.g. en_US-lessac-medium). Blank = the node's default."),
         BI.SettingField("length_scale","Speaking Pace (length scale)","number",default=None,hint=">1 slower, <1 faster. Blank = the voice's own pace."),
+        BI.SettingField("lang_voices","Voice per Language","json",default={},advanced=True,hint='{"es": "es_MX-...", "zh": "zh_CN-..."}: text inside <lang code="xx">...</lang> is spoken with that voice.'),
+        BI.SettingField("action_tags","Action Tags (comma-sep)","text",advanced=True,hint="Collected into 'actions' and not spoken, e.g. remember,sample."),
         *_pool_fields(include_model=False, conn_type="text_to_speech"), _key_map_field()], guide="Synthesizes 'text' through any connection declaring text_to_speech and returns base64 audio. The speech node strips thinking blocks, code and markdown before speaking.")
+
+    register_node_type("route_text", node_route_text, "Route Text (wake words, commands - rules only)", in_keys=["input"], out_keys=["text","route","command","args","note","dropped_text"], config_schema=[
+        BI.SettingField("rules_json","Rules (JSON)","json",default={"wake": [], "routes": [], "roles": _ROLE_ORDER},hint='{"wake": ["tessa"], "routes": [{"name": "sleep", "match": ["go to sleep"], "role": "guest"}], "roles": ["unknown", "guest", "trusted", "owner"]}. Patterns are regular expressions over the whole line after the wake word; named groups become args.'),
+        BI.SettingField("wake_words","Extra Wake Words (comma-sep)","text",hint="Added to the rules' wake list. No wake words = every line is addressed."),
+        BI.SettingField("wake_fuzz","Wake Word Tolerance (similarity 0-1, 1 = exact only)","number",default=0.8,hint="The first one or two words may differ this much from a wake word and still count (Tesa, Tess a). Lower accepts more misspellings - and more false wakes."),
+        _key_map_field()], guide="Deterministic routing for spoken or typed lines: wake words, the 'awake' in-key (a follow-up window), and rule-matched commands gated by the 'role' in-key. Only 'chat' lines produce 'text', so a model downstream runs only for those.")
