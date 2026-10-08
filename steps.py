@@ -4,7 +4,7 @@ It reads whatever it needs from the shared pipeline `data` object - ctx.get()/ct
 the in_keys/out_keys a type declares are a scheduling contract, not a firewall - and returns a dict of LOGICAL output names -> values.
 The engine remaps those to actual pipeline keys via the node's key_map and merges them into `data`.
 """
-import re, json, sys, asyncio, uuid, time, io, wave, base64, array, difflib
+import re, json, sys, asyncio, uuid, time, io, wave, base64, array, difflib, ast
 from pathlib import Path
 from tools.ai_manager import engine, resources, connections
 from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
@@ -17,7 +17,7 @@ def init(env: dict):
     global ENV
     ENV = env
 
-def register_node_type(name, fn, label="", in_keys=None, out_keys=None, config_schema=None, guide=""): _NODE_TYPES[name] = {"fn": fn, "label": label or name, "in_keys": in_keys or [], "out_keys": out_keys or [], "config_schema": config_schema or [], "guide": guide}
+def register_node_type(name, fn, label="", in_keys=None, out_keys=None, config_schema=None, guide="", mode_out_keys=None): _NODE_TYPES[name] = {"fn": fn, "label": label or name, "in_keys": in_keys or [], "out_keys": out_keys or [], "config_schema": config_schema or [], "guide": guide, "mode_out_keys": mode_out_keys or {}}   # mode_out_keys: {mode: [logical outs]} for types whose outputs depend on config["mode"]
 def get_node_type(name: str) -> dict: return _NODE_TYPES.get(name)
 def list_node_types() -> list: return [{"type": k, **{kk: vv for kk, vv in v.items() if kk != "fn"}} for k, v in _NODE_TYPES.items()]
 
@@ -53,6 +53,58 @@ def _chunk_paragraphs(text: str, target_chars: int, overlap_chars: int = 0, hard
         for seg in _pack(_SENTENCE_SPLIT_RE.split(p), target_chars):
             segments.extend(_hard_split(seg, target_chars) if len(seg) > target_chars * hard_split_ratio else [seg])
     return _pack(segments, target_chars, overlap_chars)
+
+_SECTION_RE = re.compile(r"^\s*(?:#|//)\s*-{3}\s*(.+?)\s*-{3}\s*$")   # `# --- Title ---` / `// --- Title ---` section headers
+_CODE_START_RE = re.compile(r"""^(?:export\s+)?(?:async\s+)?(?:def|class|function)\b|^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[\w$]+\s*=>)|^[A-Z_][A-Z0-9_]*\s*=|^#{1,6}\s""")
+_SYMBOL_RE = re.compile(r"""^(?:export\s+)?(?:async\s+)?(?:def|class|function)\s+([\w$]+)|^(?:export\s+)?(?:const|let|var)\s+([\w$]+)|^([A-Z_][A-Z0-9_]*)\s*=|^#{1,6}\s+(.+)""")
+_INNER_BREAK_RE = re.compile(r"^\s+(?:async\s+)?(?:def|function)\s|^\s*$")   # where an oversized definition may be cut: an inner def or a blank line
+
+def _py_spans(lines: list):
+    """Top-level statements of a Python file as (first, last) 1-based line spans covering every line: the blank lines, comments and section headers before a statement belong to it. None when the file does not parse (the generic splitter is used instead)."""
+    try: tree = ast.parse("\n".join(lines))
+    except SyntaxError: return None
+    spans, prev = [], 0
+    for node in tree.body: spans.append((prev + 1, node.end_lineno)); prev = node.end_lineno
+    if prev < len(lines): spans = spans[:-1] + [(spans[-1][0], len(lines))] if spans else [(1, len(lines))]
+    return spans
+
+def _generic_spans(lines: list) -> list:
+    """Spans between lines that start a definition, a constant, a markdown heading or a section header, for files without a parser here."""
+    starts = sorted({0} | {i for i, l in enumerate(lines) if _CODE_START_RE.match(l) or _SECTION_RE.match(l)})
+    return [(a + 1, b) for a, b in zip(starts, starts[1:] + [len(lines)]) if b > a]
+
+def _split_span(lines: list, a: int, b: int, target: int) -> list:
+    """An oversized span cut near target chars at an inner def or blank line, or at any line when none comes within twice the target."""
+    out, start, size = [], a, 0
+    for i in range(a, b + 1):
+        size += len(lines[i - 1]) + 1
+        if i > start and ((size >= target and _INNER_BREAK_RE.match(lines[i - 1])) or size >= target * 2): out.append((start, i - 1)); start, size = i, len(lines[i - 1]) + 1
+    return out + [(start, b)]
+
+def _code_chunk(lines: list, path: str, a: int, b: int, section: str, part: str = "") -> dict:
+    symbols = [next(g for g in m.groups() if g) for m in (_SYMBOL_RE.match(l) for l in lines[a - 1:b]) if m]
+    return {"text": f"""File: {path or "(unnamed)"} | Section: {section or "-"} | Defines: {", ".join(symbols[:12]) or "-"} | Lines {a}-{b}{part}\n{chr(10).join(lines[a - 1:b])}""", "path": path, "section": section, "symbols": symbols, "start": a, "end": b}
+
+def _chunk_code(text: str, path: str, target: int) -> list:
+    """Definition-aware chunks of a source file (Python by syntax tree; other files by lines that start a definition, constant or markdown heading).
+    Whole definitions are packed in order up to target chars and never across a section header; one definition over twice the target is split inside itself, and those pieces say so in their header."""
+    lines = text.splitlines()
+    if not lines: return []
+    spans = (_py_spans(lines) if path.endswith(".py") else None) or _generic_spans(lines)
+    sections, cur_sec = [], ""
+    for l in lines: cur_sec = (_SECTION_RE.match(l).group(1) if _SECTION_RE.match(l) else cur_sec); sections.append(cur_sec)
+    size = lambda a, b: sum(len(lines[i]) + 1 for i in range(a - 1, b))
+    chunks, cur = [], []
+    for a, b in spans:
+        if size(a, b) > target * 2:
+            if cur: chunks.append(_code_chunk(lines, path, cur[0][0], cur[-1][1], sections[cur[-1][1] - 1])); cur = []
+            pieces = _split_span(lines, a, b, target)
+            chunks += [_code_chunk(lines, path, x, y, sections[y - 1], f" | Part {k + 1}/{len(pieces)} of one definition") for k, (x, y) in enumerate(pieces)]
+            continue
+        if cur and (sections[b - 1] != sections[cur[-1][1] - 1] or size(cur[0][0], b) > target): chunks.append(_code_chunk(lines, path, cur[0][0], cur[-1][1], sections[cur[-1][1] - 1])); cur = []
+        cur.append((a, b))
+    if cur: chunks.append(_code_chunk(lines, path, cur[0][0], cur[-1][1], sections[cur[-1][1] - 1]))
+    return chunks
 
 class NodeContext:
     """Wraps one node's own key_map so a type's implementation only ever deals in its own logical names, never in actual pipeline key strings - the same function works unmodified no matter what keys a pipeline instance wires it to."""
@@ -208,6 +260,9 @@ async def node_transform(config: dict, data: dict, ctx: NodeContext) -> dict:
         overlap = int(config.get("overlap_chars", 0) or 0)
         chunks = _chunk_paragraphs(text, target, overlap)
         return {"chunks": chunks, "count": len(chunks)}
+    if mode == "chunk_code":
+        spans = _chunk_code(str(ctx.get("input")), ctx.resolve(config.get("path_template") or ""), int(config.get("chunk_chars", 4000) or 4000))
+        return {"chunks": [c["text"] for c in spans], "spans": [{k: v for k, v in c.items() if k != "text"} for c in spans], "count": len(spans), "text": "\n\n".join(c["text"] for c in spans)}
     if mode == "python":
         if config.get("script_body"):
             tmp = Path(f"./data/ai_manager/_scratch_scripts/{ctx.job_id}_{ctx.node.id}.py")
@@ -503,16 +558,25 @@ class _SentenceSpeaker:
     async def _work(self):
         while (item := await self.q.get()) is not None:
             text, lang = item
+            lang = lang or _script_lang(text)   # untagged text in another writing system still gets its language's voice
             if not _words(text): continue   # punctuation-only pieces have nothing to say
             r = await connections.call_capability(self.conn, "text_to_speech", {"text": text, **self.payload, "voice": self.voices.get(lang) or self.payload["voice"]})
             if r.get("error"): await self.ctx.progress(f"""speak while writing: segment {self.seq} failed - {r['error']}""")
             elif r.get("format", "wav") == "wav" and r.get("audio_b64"): self.audio.append(r["audio_b64"])
-            await self._push({"seq": self.seq, "audio_b64": "" if r.get("error") else r.get("audio_b64", ""), "format": r.get("format", "wav"), "text": text, "lang": lang, "last": False})
+            await self._push({"seq": self.seq, "audio_b64": "" if r.get("error") else r.get("audio_b64", ""), "format": r.get("format", "wav"), "text": text, "lang": lang, "voice": r.get("voice", ""), "last": False})
             self.seq += 1
      
     def take(self) -> str: t, self.shown = self.shown, ""; return t   # text read since the last call, tags removed, for the live view
 
 def _words(text: str) -> str: return re.sub(r"[^\w']+", " ", str(text).lower()).strip()   # lowercase words only: punctuation and spacing never decide whether something was said
+
+def _script_lang(text: str) -> str:
+    """A language code from the writing system when CJK, kana or hangul make up at least half the letters (kana present -> ja, hangul -> ko, ideographs alone -> zh); "" for Latin and mixed text, which needs a <lang> tag."""
+    letters = len(re.findall(r"[^\W\d_]", text)) or 1
+    cjk, kana, hangul = (len(re.findall(r, text)) for r in (r"[\u4e00-\u9fff]", r"[\u3040-\u30ff]", r"[\uac00-\ud7af\u1100-\u11ff]"))
+    if hangul * 2 >= letters: return "ko"
+    if (cjk + kana) * 2 >= letters: return "ja" if kana else "zh"
+    return ""
 
 async def node_transcribe(config: dict, data: dict, ctx: NodeContext) -> dict:
     """Nothing said (an empty or punctuation-only transcript, an ignored phrase, or only segments the recognizer rates as non-speech) returns no 'text' key, so every node waiting on it ends unreached; the raw transcript goes to 'dropped_text'."""
@@ -538,7 +602,7 @@ async def node_speak(config: dict, data: dict, ctx: NodeContext) -> dict:
     cnode, conn = _pick_capability_conn(config, ctx, "text_to_speech", "speak")
     parsed, voices, t0, parts = ENV["tools"]["built_ins"].parse_tagged(text, _tag_names(config.get("action_tags"))), _parse_json_config(config.get("lang_voices"), {}), time.time(), []
     for lang, run in parsed["runs"]:
-        r = await connections.call_capability(conn, "text_to_speech", {"text": run, "voice": voices.get(lang) or config.get("voice") or None, "length_scale": None if config.get("length_scale") in (None, "") else float(config["length_scale"])})
+        r = await connections.call_capability(conn, "text_to_speech", {"text": run, "voice": voices.get(lang or _script_lang(run)) or config.get("voice") or None, "length_scale": None if config.get("length_scale") in (None, "") else float(config["length_scale"])})
         if r.get("error"): raise RuntimeError(f"""speak: {r['error']}""")
         parts.append(r)
     duration = sum(float(p.get("duration_s") or 0) for p in parts)
@@ -593,7 +657,7 @@ async def node_route_text(config: dict, data: dict, ctx: NodeContext) -> dict:
     for r in rules.get("routes") or []:
         hit = next((h for p in r.get("match") or [] if (h := re.fullmatch(p, said, re.I))), None)
         if not hit: continue
-        if rank(role) >= rank(r.get("role", "owner")): return {"route": "command", "command": r["name"], "args": hit.groupdict()}
+        if rank(role) >= rank(r.get("role", "owner")): return {"route": "command", "command": r["name"], "args": hit.groupdict(), **({"text": rest} if r.get("pass") else {})}   # pass: the line also goes on to the model
         return {"route": "chat", "text": rest, "note": f"""'{r["name"]}' needs the {r.get("role", "owner")} role - treated as conversation"""}
     return {"route": "chat", "text": rest}
 
@@ -731,7 +795,7 @@ def register_builtins():
         *_pool_fields()[:2], BI.SettingField("conn_id", "Connection", type="select", default="", options=_generate_conn_options, hint="Follows Modality: the chat model's connection (text), the text encoder (image), the video node (video). Blank = pool-resolved."), _pool_fields()[3], _key_map_field()], guide="One universal generation node - text, image or video, picked by Modality. With no connection pinned, resolves one from this node's resource pool (pipeline pool intersected with this node's own tags) using Priority. Video picks by capability from the frames given (start + end, start, none); the pool may fall back to a lesser capability, a pinned connection may not.")
 
     register_node_type("transform", node_transform, "Transform (deterministic)", in_keys=["input"], out_keys=["value"], config_schema=[
-        BI.SettingField("mode", "Mode", "select", default="template", options=[("template","Template fill"), ("expr","Python expression"), ("chunk","Chunk (paragraph-safe split)"), ("regex_find","Regex find"), ("regex_replace","Regex replace"),("python","Inline script")]),
+        BI.SettingField("mode", "Mode", "select", default="template", options=[("template","Template fill"), ("expr","Python expression"), ("chunk","Chunk (paragraph-safe split)"), ("chunk_code","Chunk code (definition-aware)"), ("regex_find","Regex find"), ("regex_replace","Regex replace"),("python","Inline script")]),
         BI.SettingField("template","Template","textarea",default="{input}"),
         BI.SettingField("expr","Expression","text",default="input",advanced=True),
         BI.SettingField("vars_json","Variables (JSON)","json",default={},advanced=True),
@@ -741,11 +805,12 @@ def register_builtins():
         BI.SettingField("replace_mode","Replace","select",default="all",options=[("all","All matches"),("first","First match")],advanced=True),
         BI.SettingField("script_body","Inline Script Body","textarea",advanced=True),
         BI.SettingField("script_path","Script File (instead of inline)","file_picker",advanced=True),
-        BI.SettingField("timeout_s","Timeout (s)","number",default=600,step=1,advanced=True),
+        BI.SettingField("timeout_s","Timeout (s)","number",default=600,step=1, advanced=True),
         BI.SettingField("chunk_chars","Chunk Target Size (chars)","number",default=4000,step=1,advanced=True),
+        BI.SettingField("path_template","File Path (chunk code)","text", advanced=True,hint="Names the file in every chunk header and picks the parser (.py = syntax tree). Supports {key}, e.g. {path}."),
         BI.SettingField("overlap_chars","Chunk Overlap (chars, carried into next chunk)","number",default=0,step=1,advanced=True),
         BI.SettingField("hard_split_ratio", "Hard-split threshold (x target size)", "number", default=2.0, advanced=True),
-        _key_map_field()], guide="One deterministic node covering template-fill, a sandboxed Python expression, regex search/replace, or a full inline/file script. No AI call, no resource pool.")
+        _key_map_field()], guide="One deterministic node covering template-fill, a sandboxed Python expression, regex search/replace, or a full inline/file script. No AI call, no resource pool.", mode_out_keys={"template": ["value"], "expr": ["value"], "chunk": ["chunks", "count"], "chunk_code": ["chunks", "spans", "count", "text"], "regex_find": ["matches", "count"], "regex_replace": ["value"], "python": ["(the script's own JSON keys)"]})
 
     register_node_type("file_read", node_file_read, "File Read", in_keys=["path"], out_keys=["text"], config_schema=[
         BI.SettingField("path","Path Override","text",advanced=True, hint="Leave blank to read the resolved 'path' in-key instead."),

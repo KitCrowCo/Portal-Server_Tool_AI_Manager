@@ -200,7 +200,7 @@ class Flow:
     def remove(self, node_id: str) -> Optional[FlowNode]: return self.nodes.pop(node_id, None)
     def to_dict(self) -> dict: return {"nodes": [n.to_dict() for n in self.nodes.values()], "appearance": self.appearance}
     def required_in_keys(self, node: FlowNode, type_spec: dict) -> set: return {node.in_key(k) for k in type_spec.get("in_keys", [])} | set(node.extra_in_keys) # Actual pipeline keys that must be present in the shared data object before this node can run.
-    def produced_out_keys(self, node: FlowNode, type_spec: dict) -> set: return {node.out_key(k) for k in type_spec.get("out_keys", [])} | set(node.extra_out_keys) # Actual pipeline keys this node promises to write - used only for the causal-level display, never for scheduling (scheduling reacts to keys that actually appear at runtime, not to what a node merely claims it might produce).
+    def produced_out_keys(self, node: FlowNode, type_spec: dict) -> set: return {node.out_key(k) for k in type_spec.get("mode_out_keys", {}).get(node.config.get("mode", ""), type_spec.get("out_keys", []))} | set(node.extra_out_keys) # Actual pipeline keys this node promises to write - used only for the causal-level display, never for scheduling (scheduling reacts to keys that actually appear at runtime, not to what a node merely claims it might produce).
 
     def resolve_levels(self, type_specs: dict) -> Dict[str, int]:
         """Display-only: assigns each node a causal level (0 = no dependencies among current nodes) for the graphical builder view - time flows down, same level means potentially concurrent.

@@ -178,7 +178,7 @@ class PipelineBuilderUI:
                        <div id="pl-new-{p}"></div>
                        <details class="list-new-form" style="margin:.3rem 0"><summary style="cursor:pointer;font-size:.72rem;color:var(--text_muted)">Import (paste JSON)</summary>
                            <form {self._post("import", scope=scope_id)} hx-include="this" style="display:flex;flex-direction:column;gap:.3rem;padding:.3rem 0">
-                               <textarea name="json" class="cm-input" rows="4" placeholder="Paste exported pipeline JSON here"></textarea>
+                               <textarea name="json" class="cm-input" rows="4" style="max-height:8rem;overflow-y:auto;resize:vertical" placeholder="Paste exported pipeline JSON here"></textarea>
                                <button type="submit" class="button">Import</button>
                                <span id="pl-import-msg-{p}"></span>
                            </form>
@@ -205,7 +205,7 @@ class PipelineBuilderUI:
         by_level: dict = {}
         for n in f.nodes.values(): by_level.setdefault(levels.get(n.id, 0), []).append(n)
         rows = "".join(f"""<div class="node-graph-row"><span class="node-graph-row-lbl">{lvl}</span>{"".join(f'<div class="node-block" {self._post("node_form", scope=pl.get(self.scope_key,""), pl_id=pl["id"], nid=n.id)}><b>{UI.escape(n.name or n.id)}</b><span class="dim">{UI.escape(n.type)}</span></div>' for n in nodes)}</div>""" for lvl, nodes in sorted(by_level.items()))
-        return f'<div class="node-graph">{rows or "<div class=dim>No nodes yet.</div>"}</div>'
+        return f"""<div class="node-graph">{rows or "<div class=dim>No nodes yet.</div>"}</div><div id="pl-node-editor-{self.intent_prefix}" class="node-editor"><div class="list-placeholder">Select a node to edit it.</div></div>"""
 
     def _editor_html(self, scope_id, pl, view: str = "list") -> str:
         p = self.intent_prefix
@@ -269,7 +269,15 @@ class PipelineBuilderUI:
         rows = "".join(f'<div style="font-size:.7rem;padding:.15rem 0;border-bottom:1px solid var(--border)"><b>{UI.escape(c["label"])}</b> <span class="dim">[{UI.escape(", ".join(c.get("tags",[])))}]</span> - {UI.escape(", ".join((self.AIM.connections.load_conn_raw(cid) or {}).get("display_name",cid) for cid in c.get("conn_ids",[])) or "no connections")}</div>' for c in candidates)
         return f'<div class="glass" style="padding:.4rem .6rem"><div style="font-size:.65rem;color:var(--text_muted);text-transform:uppercase;margin-bottom:.2rem">Matching CNodes ({len(candidates)})</div>{rows}</div>'
 
-    def _node_config_fields(self, node_type, config, pl=None):
+    def _keys_html(self, node_type, config, key_map) -> str:
+        """The node's wiring at a glance: each logical name it waits for or writes, and the shared data key it maps to. Pipelines are wired by naming keys; order follows from which keys exist."""
+        spec = self.AIM.steps.get_node_type(node_type)
+        if not spec: return ""
+        row = lambda names: ", ".join(f"""{UI.escape(k)} &#x2192; <b>{UI.escape((key_map or {}).get(k, k))}</b>""" for k in names) or "-"
+        outs = spec.get("mode_out_keys", {}).get(config.get("mode", ""), spec.get("out_keys", []))
+        return f"""<div class="glass status-list" style="font-size:.72rem;padding:.3rem .5rem;margin-bottom:.4rem"><div><span class="dim">Waits for:</span> {row(spec.get("in_keys", []))}</div><div><span class="dim">Writes:</span> {row(outs)}</div><div class="dim tiny">Key Map renames them: {{"input": "text"}} makes this node read the key "text". The Run box supplies the key "input". A node runs once every key it waits for exists.</div></div>"""
+    
+    def _node_config_fields(self, node_type, config, pl=None, key_map=None):
         spec = self.AIM.steps.get_node_type(node_type)
         if not spec: return '<div class="dim">Pick a node type to configure it.</div>'
         schema = [copy.copy(f) if f.name in ("conn_id","cnode_tags") else f for f in spec["config_schema"]]
@@ -278,7 +286,7 @@ class PipelineBuilderUI:
             if f.name == "cnode_tags": f.hx_intent, f.hx_target = f"{self.intent_prefix}_node_pool_preview", f"#pl-pool-preview-{self.intent_prefix}"
         guide_html = f"""<details class="glass status-list"><summary>&#x2139; How this node works</summary><div>{UI.escape(spec.get("guide",""))}</div></details>""" if spec.get("guide") else ""
         pool_preview = f'<div id="pl-pool-preview-{self.intent_prefix}" style="margin-bottom:.5rem">{self._pool_preview_html(pl, config.get("cnode_tags",""))}</div>' if (pl is not None and any(f.name == "cnode_tags" for f in schema)) else ""
-        return guide_html + pool_preview + BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
+        return self._keys_html(node_type, config, key_map) + guide_html + pool_preview + BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
 
     async def _im_node_pool_preview(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
@@ -314,7 +322,7 @@ class PipelineBuilderUI:
                        <span class="form-title">{"New Node" if is_new else "Edit Node"}</span>
                        <input type="text" name="name" value="{UI.escape((node or {}).get('name',''))}" placeholder="Node name" class="module-select">
                        <label class="dim">Node Type<select name="node_type" class="module-select" {self._post("node_type_change", scope=scope_id, pl_id=pl["id"])} hx-trigger="change" hx-include="this" hx-target="#pl-node-cfg-{p}">{self._node_type_options(ntype)}</select></label>
-                       <div id="pl-node-cfg-{p}">{self._node_config_fields(ntype, config) if ntype else '<div class="dim">Pick a node type to configure it.</div>'}</div>
+                       <div id="pl-node-cfg-{p}">{self._node_config_fields(ntype, config, key_map=(node or {}).get("key_map", {})) if ntype else '<div class="dim">Pick a node type to configure it.</div>'}</div>
                        <label class="dim">Extra In Keys (comma-sep, actual pipeline keys)<input type="text" name="extra_in_keys" value="{UI.escape(extra_in)}" class="module-select"></label>
                        <label class="dim">Extra Out Keys (comma-sep, actual pipeline keys)<input type="text" name="extra_out_keys" value="{UI.escape(extra_out)}" class="module-select"></label>
                        <label class="dim">Key Map (JSON: logical name -> actual key, advanced)<textarea name="key_map" class="cm-input" rows="3">{UI.escape(key_map)}</textarea></label>
