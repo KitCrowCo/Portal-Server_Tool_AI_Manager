@@ -178,8 +178,13 @@ class FlowNode:
         self.preview: dict = data.get("preview", {})
         self.message: str = data.get("message", "")
 
-    def in_key(self, logical: str) -> str: return self.key_map.get(logical, logical)
-    def out_key(self, logical: str) -> str: return self.key_map.get(logical, logical)
+    # key_map: {"x": "k"} renames logical x to the shared key k for reading and writing; {"in:x": "k"} / {"out:x": "k"} rename one direction only (for a logical name a type both reads and writes); a name mapped to "" is not wired - never waited for, never written.
+    def in_key(self, logical: str) -> str: return self.key_map.get(f"in:{logical}", self.key_map.get(logical, logical))
+    def out_key(self, logical: str) -> str: return self.key_map.get(f"out:{logical}", self.key_map.get(logical, logical))
+    def write(self, data: dict, result: dict):
+        """Merges a node's logical results into the shared data under their mapped keys; outputs mapped to "" are dropped."""
+        for logical, val in (result or {}).items():
+            if (k := self.out_key(logical)): data[k] = val
     def to_dict(self) -> dict: return {"id": self.id, "type": self.type, "name": self.name, "config": self.config, "key_map": self.key_map, "extra_in_keys": self.extra_in_keys, "extra_out_keys": self.extra_out_keys, "appearance": self.appearance, "status": self.status, "ts": self.ts, "preview": self.preview, "message": self.message}
 
 class Flow:
@@ -199,27 +204,21 @@ class Flow:
     def add(self, node: FlowNode): self.nodes[node.id] = node
     def remove(self, node_id: str) -> Optional[FlowNode]: return self.nodes.pop(node_id, None)
     def to_dict(self) -> dict: return {"nodes": [n.to_dict() for n in self.nodes.values()], "appearance": self.appearance}
-    def required_in_keys(self, node: FlowNode, type_spec: dict) -> set: return {node.in_key(k) for k in type_spec.get("in_keys", [])} | set(node.extra_in_keys) # Actual pipeline keys that must be present in the shared data object before this node can run.
-    def produced_out_keys(self, node: FlowNode, type_spec: dict) -> set: return {node.out_key(k) for k in type_spec.get("mode_out_keys", {}).get(node.config.get("mode", ""), type_spec.get("out_keys", []))} | set(node.extra_out_keys) # Actual pipeline keys this node promises to write - used only for the causal-level display, never for scheduling (scheduling reacts to keys that actually appear at runtime, not to what a node merely claims it might produce).
+    def required_in_keys(self, node: FlowNode, type_spec: dict) -> set: return {k for k in (node.in_key(x) for x in type_spec.get("in_keys", [])) if k} | set(node.extra_in_keys) # Actual pipeline keys that must be present in the shared data object before this node can run.
+    def produced_out_keys(self, node: FlowNode, type_spec: dict) -> set: return {k for k in (node.out_key(x) for x in type_spec.get("mode_out_keys", {}).get(node.config.get("mode", ""), type_spec.get("out_keys", []))) if k} | set(node.extra_out_keys) # Actual pipeline keys this node promises to write - used only for the plan display, never for scheduling (scheduling reacts to keys that actually appear at runtime, not to what a node merely claims it might produce).
 
-    def resolve_levels(self, type_specs: dict) -> Dict[str, int]:
-        """Display-only: assigns each node a causal level (0 = no dependencies among current nodes) for the graphical builder view - time flows down, same level means potentially concurrent.
-        Never consulted by the engine."""
-        producers: Dict[str, list] = {}
+    def plan(self, type_specs: dict, start_keys=("input",)) -> dict:
+        """Display-only: the order the engine would run this flow in if every node wrote the keys it declares. Simulates the scheduler - the run starts with start_keys; each wave is every node whose keys all exist; that wave's outputs join the available keys.
+        Returns {"waves": {node id: wave, 1 = first}, "missing": {node id: [keys it would still lack]} for nodes that would never run, "writers": {key: [node ids that write it]}}. Never consulted by the engine."""
+        spec = lambda n: type_specs.get(n.type, {})
+        have, waves, wave = set(start_keys), {}, 0
+        while (ready := [n for n in self.nodes.values() if n.id not in waves and n.type in type_specs and self.required_in_keys(n, spec(n)) <= have]):
+            wave += 1
+            for n in ready: waves[n.id] = wave
+            for n in ready: have |= self.produced_out_keys(n, spec(n))
+        writers: Dict[str, list] = {}
         for n in self.nodes.values():
-            spec = type_specs.get(n.type, {})
-            for k in self.produced_out_keys(n, spec): producers.setdefault(k, []).append(n.id)
-        level: Dict[str, int] = {}
-        def _lvl(n: FlowNode, seen: set) -> int:
-            if n.id in level: return level[n.id]
-            if n.id in seen: return 0
-            seen = seen | {n.id}
-            spec = type_specs.get(n.type, {})
-            deps = set()
-            for k in self.required_in_keys(n, spec): deps.update(producers.get(k, []))
-            deps.discard(n.id)
-            lvl = 1 + max((_lvl(self.nodes[d], seen) for d in deps if d in self.nodes), default=-1)
-            level[n.id] = lvl
-            return lvl
-        for n in self.nodes.values(): _lvl(n, set())
-        return level
+            for k in self.produced_out_keys(n, spec(n)): writers.setdefault(k, []).append(n.id)
+        return {"waves": waves, "missing": {n.id: sorted(self.required_in_keys(n, spec(n)) - have) if n.type in type_specs else [f"(unknown node type {n.type!r})"] for n in self.nodes.values() if n.id not in waves}, "writers": writers}
+
+    def resolve_levels(self, type_specs: dict, start_keys=("input",)) -> Dict[str, int]: return self.plan(type_specs, start_keys)["waves"]    # display-only; nodes that would never run are absent

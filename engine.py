@@ -129,7 +129,7 @@ async def _run_flow(flow: dict, data: dict, job_id: str, username: str, pool_cfg
                 result = await task
             except asyncio.CancelledError:
                 if not task.cancelled() or load_job(job_id)["status"] != "stopping": raise   # the job itself was cancelled (shutdown), not this node by stop(now=True)
-                for logical, val in (getattr(ctx, "partial", None) or {}).items(): data[n.out_key(logical)] = val   # a node may leave ctx.partial - what it had produced when it was stopped
+                n.write(data, getattr(ctx, "partial", None))   # a node may leave ctx.partial - what it had produced when it was stopped
                 await _set_node_status(job_id, username, n.id, "stopped", {"preview": {k: str(v)[:500] for k, v in (getattr(ctx, "partial", None) or {}).items()}, "elapsed_s": round(time.time() - t0, 2)})
                 return n.id
             except Exception as e:
@@ -139,7 +139,7 @@ async def _run_flow(flow: dict, data: dict, job_id: str, username: str, pool_cfg
                     await _set_node_status(job_id, username, n.id, "error", {"message": str(e)})
                     raise
             finally: _NODE_TASKS.get(job_id, {}).pop(n.id, None)
-            for logical, val in (result or {}).items(): data[n.out_key(logical)] = val
+            n.write(data, result)
             await _set_node_status(job_id, username, n.id, "done", {"preview": {k: str(v)[:500] for k, v in (result or {}).items()}, "elapsed_s": round(time.time() - t0, 2)})
             return n.id
      

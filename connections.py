@@ -332,6 +332,7 @@ async def lightrag_query(conn, query: str, mode: str = "hybrid", **extra) -> dic
     return {"response": _get_nested_value(r, parser.get("content_path","response")) or r.get("response",""), "raw": r}
 
 async def lightrag_insert_text(conn, text: str, source: str = "") -> dict: return await _lightrag_call(conn, "insert_text", {"text": text, "source": source or "manual entry"})
+async def lightrag_insert_texts(conn, texts: list, source: str = "") -> dict: return await _lightrag_call(conn, "insert_texts", {"texts": texts, "sources": [source or "manual entry"] * len(texts)})   # one document per text; LightRAG still splits any text longer than its own chunk_token_size
 async def lightrag_insert_file(conn, filename: str, content: bytes) -> dict: return await _lightrag_call(conn, "insert_file", file_bytes=content, file_name=filename)
 async def lightrag_list_documents(conn) -> dict: return await _lightrag_call(conn, "list_documents")
 async def lightrag_delete_document(conn, doc_id: str) -> dict: return await _lightrag_call(conn, "delete_document", {"doc_id": doc_id})

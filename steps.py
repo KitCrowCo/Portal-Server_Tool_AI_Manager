@@ -4,10 +4,10 @@ It reads whatever it needs from the shared pipeline `data` object - ctx.get()/ct
 the in_keys/out_keys a type declares are a scheduling contract, not a firewall - and returns a dict of LOGICAL output names -> values.
 The engine remaps those to actual pipeline keys via the node's key_map and merges them into `data`.
 """
-import re, json, sys, asyncio, uuid, time, io, wave, base64, array, difflib, ast
+import re, os, json, sys, asyncio, uuid, time, io, wave, base64, array, difflib, ast, fnmatch
 from pathlib import Path
 from tools.ai_manager import engine, resources, connections
-from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
+from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_insert_texts, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
 
 _NODE_TYPES: dict = {}
 _EMBED_PATTERNS = ("embed", "minilm", "bge-", "gte-", "e5-", "nomic-embed", "arctic-embed")
@@ -74,20 +74,24 @@ def _generic_spans(lines: list) -> list:
     return [(a + 1, b) for a, b in zip(starts, starts[1:] + [len(lines)]) if b > a]
 
 def _split_span(lines: list, a: int, b: int, target: int) -> list:
-    """An oversized span cut near target chars at an inner def or blank line, or at any line when none comes within twice the target."""
-    out, start, size = [], a, 0
+    """An oversized span cut into pieces of at most target chars, each ending before the last inner def or blank line that fits (at a plain line only when none does). A single line longer than target is a piece by itself."""
+    out, start, size, brk = [], a, 0, None
     for i in range(a, b + 1):
-        size += len(lines[i - 1]) + 1
-        if i > start and ((size >= target and _INNER_BREAK_RE.match(lines[i - 1])) or size >= target * 2): out.append((start, i - 1)); start, size = i, len(lines[i - 1]) + 1
+        n = len(lines[i - 1]) + 1
+        if i > start and size + n > target:
+            cut = brk or i   # the piece ends just before line cut
+            out.append((start, cut - 1)); start, brk = cut, None; size = sum(len(lines[k - 1]) + 1 for k in range(start, i))
+        if i > start and _INNER_BREAK_RE.match(lines[i - 1]): brk = i
+        size += n
     return out + [(start, b)]
 
 def _code_chunk(lines: list, path: str, a: int, b: int, section: str, part: str = "") -> dict:
     symbols = [next(g for g in m.groups() if g) for m in (_SYMBOL_RE.match(l) for l in lines[a - 1:b]) if m]
     return {"text": f"""File: {path or "(unnamed)"} | Section: {section or "-"} | Defines: {", ".join(symbols[:12]) or "-"} | Lines {a}-{b}{part}\n{chr(10).join(lines[a - 1:b])}""", "path": path, "section": section, "symbols": symbols, "start": a, "end": b}
 
-def _chunk_code(text: str, path: str, target: int) -> list:
+def _chunk_code(text: str, path: str, target: int, ratio: float = 2.0) -> list:
     """Definition-aware chunks of a source file (Python by syntax tree; other files by lines that start a definition, constant or markdown heading).
-    Whole definitions are packed in order up to target chars and never across a section header; one definition over twice the target is split inside itself, and those pieces say so in their header."""
+    Whole definitions are packed in order up to target chars and never across a section header; one definition over ratio x target is split inside itself, and those pieces say so in their header."""
     lines = text.splitlines()
     if not lines: return []
     spans = (_py_spans(lines) if path.endswith(".py") else None) or _generic_spans(lines)
@@ -96,7 +100,7 @@ def _chunk_code(text: str, path: str, target: int) -> list:
     size = lambda a, b: sum(len(lines[i]) + 1 for i in range(a - 1, b))
     chunks, cur = [], []
     for a, b in spans:
-        if size(a, b) > target * 2:
+        if size(a, b) > target * ratio:
             if cur: chunks.append(_code_chunk(lines, path, cur[0][0], cur[-1][1], sections[cur[-1][1] - 1])); cur = []
             pieces = _split_span(lines, a, b, target)
             chunks += [_code_chunk(lines, path, x, y, sections[y - 1], f" | Part {k + 1}/{len(pieces)} of one definition") for k, (x, y) in enumerate(pieces)]
@@ -258,11 +262,11 @@ async def node_transform(config: dict, data: dict, ctx: NodeContext) -> dict:
         text = ctx.get("input")
         target = int(config.get("chunk_chars", 4000) or 4000)
         overlap = int(config.get("overlap_chars", 0) or 0)
-        chunks = _chunk_paragraphs(text, target, overlap)
+        chunks = _chunk_paragraphs(text, target, overlap, float(config.get("hard_split_ratio") or 2.0))
         return {"chunks": chunks, "count": len(chunks)}
     if mode == "chunk_code":
-        spans = _chunk_code(str(ctx.get("input")), ctx.resolve(config.get("path_template") or ""), int(config.get("chunk_chars", 4000) or 4000))
-        return {"chunks": [c["text"] for c in spans], "spans": [{k: v for k, v in c.items() if k != "text"} for c in spans], "count": len(spans), "text": "\n\n".join(c["text"] for c in spans)}
+        spans = _chunk_code(str(ctx.get("input")), ctx.resolve(config.get("path_template") or ""), int(config.get("chunk_chars", 4000) or 4000), max(1.0, float(config.get("hard_split_ratio") or 2.0)))
+        return {"chunks": [c["text"] for c in spans], "spans": [{k: v for k, v in c.items() if k != "text"} for c in spans], "count": len(spans), "view": "\n\n".join(c["text"] for c in spans)}   # view: every chunk with its header, one readable text for checking the split
     if mode == "python":
         if config.get("script_body"):
             tmp = Path(f"./data/ai_manager/_scratch_scripts/{ctx.job_id}_{ctx.node.id}.py")
@@ -299,8 +303,8 @@ async def node_file_write(config: dict, data: dict, ctx: NodeContext) -> dict:
     fm_root = config.get("fm_root") or "./data/_common"
     fm = bi.FileManager(fm_root)
     shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(fm_root) / "_shadow"), auto_accept=bool(config.get("auto_accept")))
-    path = ctx.resolve(config.get("path") or "")
-    if not path.strip(): raise RuntimeError("file_write: resolved path is empty")
+    path = ctx.resolve(config.get("path") or "") or str(ctx.get("path") or "")
+    if not path.strip(): raise RuntimeError("file_write: resolved path is empty - set Destination Path, or wire the path in-key")
     content = ctx.get("content")
     if content == "" and not config.get("allow_empty"): raise RuntimeError("file_write: content is empty - check this node's key_map/in-keys")
     if config.get("binary"):
@@ -310,9 +314,18 @@ async def node_file_write(config: dict, data: dict, ctx: NodeContext) -> dict:
     return {"path": path, "status": entry["status"]}
 
 async def node_file_list(config: dict, data: dict, ctx: NodeContext) -> dict:
+    """Relative paths under root. Exclude patterns (fnmatch) match a file or folder name, or a folder's path relative to root; an excluded folder is not walked at all."""
     exts = tuple(e.strip().lower() for e in (config.get("extensions","") or "").split(",") if e.strip())
-    root = Path(config.get("root", "./data/ai_tools/_knowledge"))
-    return {"files": sorted(str(f.relative_to(root)) for f in root.rglob("*") if f.is_file() and (not exts or f.suffix.lower() in exts))}
+    skip = [p.strip() for p in str(config.get("exclude") or "").split(",") if p.strip()]
+    root, out = Path(config.get("root", "./data/ai_tools/_knowledge")), []
+    hit = lambda name, rel: any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p) for p in skip)
+    if not root.is_dir(): raise RuntimeError(f"file_list: {root} is not a folder")
+    for d, dirs, files in os.walk(root):
+        rel_d = os.path.relpath(d, root)
+        dirs[:] = [x for x in dirs if not hit(x, os.path.normpath(os.path.join(rel_d, x)))]
+        out += [os.path.normpath(os.path.join(rel_d, f)) for f in files if not hit(f, os.path.normpath(os.path.join(rel_d, f))) and (not exts or Path(f).suffix.lower() in exts)]
+    if config.get("with_root"): out = [os.path.normpath(os.path.join(str(root), f)) for f in out]
+    return {"files": sorted(out), "count": len(out)}
 
 # --- knowledge: query / insert / entities against LightRAG, one node ---
 
@@ -327,9 +340,13 @@ async def node_knowledge(config: dict, data: dict, ctx: NodeContext) -> dict:
         cnode, conn = picked
     t0 = time.time()
     if mode == "insert":
-        res = await lightrag_insert_text(conn, ctx.resolve(config.get("text_template", "{input}")), config.get("source_label",""))
+        body, label = ctx.resolve_value(config["text_template"]) if config.get("text_template") else ctx.get("input"), ctx.resolve(config.get("source_label") or "")   # no template = this node's own input key, as wired
+        if body in ("", None): raise RuntimeError("knowledge(insert): nothing to insert - check this node's input wiring or Insert Text Template")
+        if body == []: return {"response": "nothing to insert (0 items)", "raw": {}}   # e.g. an empty source file: its chunk list is empty
+        res = await (lightrag_insert_texts(conn, [str(t) for t in body], label) if isinstance(body, list) else lightrag_insert_text(conn, str(body), label))   # a list (e.g. code chunks) goes in as one document per item, so the store keeps those boundaries
         if cnode: resources.log_usage(cnode["id"], "knowledge:insert", time.time()-t0)
-        return res if isinstance(res, dict) else {"status": res}
+        if not isinstance(res, dict) or res.get("error"): raise RuntimeError(f"""knowledge(insert): {res.get("error") if isinstance(res, dict) else res}""")
+        return {"response": res.get("message") or res.get("status", ""), "raw": res}
     if mode == "entities":
         entities = await lightrag_list_entities(conn, limit=config.get("limit", 500))
         if cnode: resources.log_usage(cnode["id"], "knowledge:entities", time.time()-t0)
@@ -563,7 +580,7 @@ class _SentenceSpeaker:
             r = await connections.call_capability(self.conn, "text_to_speech", {"text": text, **self.payload, "voice": self.voices.get(lang) or self.payload["voice"]})
             if r.get("error"): await self.ctx.progress(f"""speak while writing: segment {self.seq} failed - {r['error']}""")
             elif r.get("format", "wav") == "wav" and r.get("audio_b64"): self.audio.append(r["audio_b64"])
-            await self._push({"seq": self.seq, "audio_b64": "" if r.get("error") else r.get("audio_b64", ""), "format": r.get("format", "wav"), "text": text, "lang": lang, "voice": r.get("voice", ""), "last": False})
+            await self._push({"seq": self.seq, "audio_b64": "" if r.get("error") else r.get("audio_b64", ""), "format": r.get("format", "wav"), "text": text, "lang": lang, "voice": r.get("voice") or self.voices.get(lang) or self.payload["voice"] or "", "error": str(r.get("error") or "")[:300], "last": False})   # voice: the one the node used, or the one asked for when it failed
             self.seq += 1
      
     def take(self) -> str: t, self.shown = self.shown, ""; return t   # text read since the last call, tags removed, for the live view
@@ -809,8 +826,8 @@ def register_builtins():
         BI.SettingField("chunk_chars","Chunk Target Size (chars)","number",default=4000,step=1,advanced=True),
         BI.SettingField("path_template","File Path (chunk code)","text", advanced=True,hint="Names the file in every chunk header and picks the parser (.py = syntax tree). Supports {key}, e.g. {path}."),
         BI.SettingField("overlap_chars","Chunk Overlap (chars, carried into next chunk)","number",default=0,step=1,advanced=True),
-        BI.SettingField("hard_split_ratio", "Hard-split threshold (x target size)", "number", default=2.0, advanced=True),
-        _key_map_field()], guide="One deterministic node covering template-fill, a sandboxed Python expression, regex search/replace, or a full inline/file script. No AI call, no resource pool.", mode_out_keys={"template": ["value"], "expr": ["value"], "chunk": ["chunks", "count"], "chunk_code": ["chunks", "spans", "count", "text"], "regex_find": ["matches", "count"], "regex_replace": ["value"], "python": ["(the script's own JSON keys)"]})
+        BI.SettingField("hard_split_ratio", "Hard-split threshold (x target size)", "number", default=2.0, advanced=True, hint="Chunk: a run with no paragraph or sentence break longer than this is cut. Chunk code: one definition longer than this is split inside itself (1 = no chunk much over the target)."),
+        _key_map_field()], guide="One deterministic node covering template-fill, a sandboxed Python expression, regex search/replace, or a full inline/file script. No AI call, no resource pool.", mode_out_keys={"template": ["value"], "expr": ["value"], "chunk": ["chunks", "count"], "chunk_code": ["chunks", "spans", "count", "view"], "regex_find": ["matches", "count"], "regex_replace": ["value"], "python": ["(the script's own JSON keys)"]})
 
     register_node_type("file_read", node_file_read, "File Read", in_keys=["path"], out_keys=["text"], config_schema=[
         BI.SettingField("path","Path Override","text",advanced=True, hint="Leave blank to read the resolved 'path' in-key instead."),
@@ -818,7 +835,7 @@ def register_builtins():
         _key_map_field()], guide="Reads a file's text content.")
 
     register_node_type("file_write", node_file_write, "File Write (shadow-staged)", in_keys=["path","content"], out_keys=["path","status"], config_schema=[
-        BI.SettingField("path","Destination Path Template","text", hint="Supports {key} against real pipeline keys, e.g. articles/{slug}.md."),
+        BI.SettingField("path","Destination Path Template","text", hint="Supports {key} against real pipeline keys, e.g. articles/{slug}.md. Blank = the value of the path in-key. With a template here, set the path in-key to not wired so the node does not wait for it."),
         BI.SettingField("fm_root","FS Root","file_picker",default="./data/_common"),
         BI.SettingField("binary","Binary Content","checkbox",default=False,advanced=True, hint="Content in-key holds raw bytes or a source file path rather than text."),
         BI.SettingField("allow_empty","Allow Empty Content","checkbox",default=False,advanced=True),
@@ -826,19 +843,21 @@ def register_builtins():
         BI.SettingField("source_root","Source Root (binary content, when content is a filename)","file_picker",default=".",advanced=True),
         _key_map_field()], guide="Never writes directly - always through Shadow Stage (accept/reject before it touches the real file).")
 
-    register_node_type("file_list", node_file_list, "File List", in_keys=[], out_keys=["files"], config_schema=[
+    register_node_type("file_list", node_file_list, "File List", in_keys=[], out_keys=["files", "count"], config_schema=[
         BI.SettingField("root","Target Directory","text",default="./data/ai_tools/_knowledge"),
-        BI.SettingField("extensions","Extensions (comma-sep)","text", advanced=True),
-        _key_map_field()], guide="Lists relative file paths under a directory. No dependencies - runs as soon as the pipeline starts.")
+        BI.SettingField("extensions","Extensions (comma-sep)","text", advanced=True, hint="e.g. .py,.md - blank = every file."),
+        BI.SettingField("with_root","Paths Include the Directory","checkbox",default=False, hint="On: each path starts with the Target Directory (e.g. tools/ai_manager/flow.py), so a File Read with FS Root . reads it, and chunk headers name the full path."),
+        BI.SettingField("exclude","Exclude (comma-sep patterns)","text", default=".*,__pycache__,node_modules,venv,_shadow", hint="File or folder names (fnmatch: * ?) or folder paths relative to the directory, e.g. data,static/js/codemirror,*.min.js. Excluded folders are not walked."),
+        _key_map_field()], guide="Lists relative file paths under a directory (files) and how many (count). No dependencies - runs as soon as the pipeline starts. Pair with File Read whose FS Root is the same directory.")
 
     register_node_type("knowledge", node_knowledge, "Knowledge (query / insert / entities)", in_keys=["input"], out_keys=["response","raw"], config_schema=[
         BI.SettingField("mode","Mode","select",default="query",options=[("query","Query"),("insert","Insert Text"),("entities","List Entities")]),
         BI.SettingField("query_template","Query Template","textarea",default="{input}"),
         BI.SettingField("query_mode","Search Mode","select",default="hybrid",options=[("hybrid","Hybrid"),("local","Local"),("global","Global"),("naive","Naive"),("mix","Mix")]),
-        BI.SettingField("text_template","Insert Text Template","textarea",advanced=True),
-        BI.SettingField("source_label","Insert Source Label","text",advanced=True),
+        BI.SettingField("text_template","Insert Text Template","textarea",advanced=True,hint="Blank = this node's input key as wired. A template that is exactly one {key} holding a list inserts one document per item."),
+        BI.SettingField("source_label","Insert Source Label","text",advanced=True,hint="Stored as each document's file source; supports {key}, e.g. {item}."),
         BI.SettingField("limit","Entity Limit","number", default=500,step=1,advanced=True),
-        *_pool_fields(include_model=False, conn_type="knowledge_query"), _key_map_field()], guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.")
+        *_pool_fields(include_model=False, conn_type="knowledge_query"), _key_map_field()], guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.", mode_out_keys={"query": ["response", "raw"], "insert": ["response", "raw"], "entities": ["entities"]})
 
     register_node_type("pipeline", node_pipeline, "Call Pipeline", in_keys=[], out_keys=[], config_schema=[
         BI.SettingField("pipeline_id","Pipeline","select", options=_pipeline_options),

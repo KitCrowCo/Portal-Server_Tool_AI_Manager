@@ -12,7 +12,7 @@ from tools.ai_manager import engine
 from tools.ai_manager import steps
 from tools.ai_manager import connections
 from tools.ai_manager import resources
-from tools.ai_manager.flow import Flow
+from tools.ai_manager.flow import Flow, FlowNode
 
 TOOL_META = {"label": "AI Manager", "icon": "&#x1F9E0;", "description": "Centralized AI connections, steps, and pipeline execution"}
 router = APIRouter()
@@ -110,11 +110,11 @@ def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">",
 def prompt_block_picker_fragment(textarea_id: str) -> str: return BI.prompt_block_picker_html(_PB, textarea_id, f"{_P}/prompt_blocks/save")
 
 class PipelineBuilderUI:
-    """Universal-node pipeline authoring surface. No prev/next wiring anywhere in this UI - node order is entirely a function of key presence, computed fresh for the graphical view via Flow.resolve_levels()."""
+    """Universal-node pipeline authoring surface. No prev/next wiring anywhere in this UI - node order is entirely a function of key presence; both views show the order the engine would run (Flow.plan) from the pipeline's start keys."""
     def __init__(self, IM, AIM, intent_prefix="plb", nesting_level=2, scope_key="project_id"):
         self.IM, self.AIM, self.intent_prefix, self.nesting_level, self.scope_key = IM, AIM, intent_prefix, nesting_level, scope_key
         p = self.intent_prefix
-        IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change], f"{p}_node_pool_preview": [self._im_node_pool_preview], f"{p}_preflight": [self._im_preflight], f"{p}_view_subjob": [self._im_view_subjob]})
+        IM.scripts.update({f"{p}_new_form": [self._im_new_form], f"{p}_create": [self._im_create], f"{p}_delete": [self._im_delete], f"{p}_import": [self._im_import], f"{p}_editor_open": [self._im_editor_open], f"{p}_view_toggle": [self._im_view_toggle], f"{p}_node_form": [self._im_node_form], f"{p}_node_type_change": [self._im_node_type_change], f"{p}_node_add": [self._im_node_save], f"{p}_node_save": [self._im_node_save], f"{p}_node_delete": [self._im_node_delete], f"{p}_rename": [self._im_rename], f"{p}_run": [self._im_run], f"{p}_stop": [self._im_stop], f"{p}_resume": [self._im_resume], f"{p}_status": [self._im_status], f"{p}_pool_form": [self._im_pool_form], f"{p}_pool_save": [self._im_pool_save], f"{p}_node_conn_change": [self._im_node_conn_change], f"{p}_node_pool_preview": [self._im_node_pool_preview], f"{p}_preflight": [self._im_preflight], f"{p}_view_subjob": [self._im_view_subjob], f"{p}_node_wire": [self._im_node_wire], f"{p}_start_keys": [self._im_start_keys]})
 
     # Each need is a capability string (pinned via config conn_id, narrowed by cnode_tags) or a (capability, pin_field, tags_field) tuple for nodes that resolve more than one connection.
     _NODE_CONN_NEEDS = {"generate": lambda cfg: [] if cfg.get("modality") in ("image", "video") else [CAP_CHAT], "knowledge": lambda cfg: [CAP_KNOWLEDGE], "branch": lambda cfg: [CAP_CHAT] if cfg.get("decide_mode") == "llm" else [], "transcribe": lambda cfg: [CAP_STT], "speak": lambda cfg: [CAP_TTS], "agent_loop": lambda cfg: [CAP_CHAT, (CAP_AGENT_TOOLS, "tools_conn_id", "tools_cnode_tags")]}
@@ -189,23 +189,42 @@ class PipelineBuilderUI:
 
     def modal_slot_html(self, scope_id: str = "") -> str: return f'<div id="pl-editor-modal-{self.intent_prefix}"></div>' # Render at a non-transformed DOM level (main content area, not inside a sliding toolbar) - position:fixed modal backdrops are trapped inside any ancestor with an active CSS transform.
 
+    # --- Run plan (display only: the order the engine would run, from the start keys) ---
+
+    def _start_keys(self, pl) -> list: return [k.strip() for k in str(pl.get("start_keys", "input")).split(",") if k.strip()]   # keys present when a run begins: the Run box gives "input"; a sub-pipeline gets its caller's item / import keys
+
+    def _plan(self, pl) -> tuple:
+        f, specs = Flow(pl.get("flow", {})), {t["type"]: t for t in self.AIM.steps.list_node_types()}
+        return f, specs, f.plan(specs, self._start_keys(pl))
+
+    def _missing_text(self, f, plan, nid) -> str:
+        """Why a node would never run: each key it lacks, and whether any node writes it (a writer that itself never runs is named as such)."""
+        ws = lambda k: [f.nodes[w].name or w for w in plan["writers"].get(k, []) if w != nid]   # a node writing a key it waits for still waits
+        return "; ".join(f"""{k} ({"written by " + ", ".join(ws(k)) + ", which never runs" if ws(k) else "nothing writes it"})""" for k in plan["missing"].get(nid, []))
+
+    def _io_lines(self, f, specs, n) -> str: return f"""<span class="node-io">waits: {UI.escape(", ".join(sorted(f.required_in_keys(n, specs.get(n.type, {})))) or "-")}</span><span class="node-io">writes: {UI.escape(", ".join(sorted(f.produced_out_keys(n, specs.get(n.type, {})))) or "-")}</span>"""
+
     def _list_view_html(self, scope_id, pl) -> str:
         p = self.intent_prefix
-        rows = "".join(f"""<div class="node-row" {self._post("node_form", scope=scope_id, pl_id=pl["id"], nid=n["id"])}>{UI.escape(n.get("name") or n["id"])} <span class="dim">({UI.escape(n.get("type",""))})</span></div>""" for n in pl.get("flow",{}).get("nodes",[])) or '<div class="dim">No nodes yet.</div>'
+        f, specs, plan = self._plan(pl)
+        order = sorted(f.nodes.values(), key=lambda n: plan["waves"].get(n.id, 10**6))   # stable: nodes in the same wave keep their saved order; nodes that never run go last
+        badge = lambda n: f"""<span class="dim tiny">wave {plan["waves"][n.id]}</span>""" if n.id in plan["waves"] else f"""<span class="node-miss">never runs - missing {UI.escape(self._missing_text(f, plan, n.id))}</span>"""
+        rows = "".join(f"""<div class="node-row" {self._post("node_form", scope=scope_id, pl_id=pl["id"], nid=n.id)}>{UI.escape(n.name or n.id)} <span class="dim">({UI.escape(n.type)})</span> {badge(n)}</div>""" for n in order) or '<div class="dim">No nodes yet.</div>'
         return f"""<div id="pl-node-editor-{p}" class="node-editor">
-                       <div class="list-placeholder">Select or add a node.</div>
-                       <div class="node-list">{rows}</div>
-                       <button class="btn-icon" {self._post("node_form", scope=scope_id, pl_id=pl["id"])}>+ Add Node</button>
-                   </div>"""
+                        <div class="list-placeholder">Select or add a node.</div>
+                        <div class="node-list">{rows}</div>
+                    </div>"""
 
     def _graph_view_html(self, pl) -> str:
-        f = Flow(pl.get("flow", {}))
-        type_specs = {t["type"]: t for t in self.AIM.steps.list_node_types()}
-        levels = f.resolve_levels(type_specs)
-        by_level: dict = {}
-        for n in f.nodes.values(): by_level.setdefault(levels.get(n.id, 0), []).append(n)
-        rows = "".join(f"""<div class="node-graph-row"><span class="node-graph-row-lbl">{lvl}</span>{"".join(f'<div class="node-block" {self._post("node_form", scope=pl.get(self.scope_key,""), pl_id=pl["id"], nid=n.id)}><b>{UI.escape(n.name or n.id)}</b><span class="dim">{UI.escape(n.type)}</span></div>' for n in nodes)}</div>""" for lvl, nodes in sorted(by_level.items()))
-        return f"""<div class="node-graph">{rows or "<div class=dim>No nodes yet.</div>"}</div><div id="pl-node-editor-{self.intent_prefix}" class="node-editor"><div class="list-placeholder">Select a node to edit it.</div></div>"""
+        """Rows are waves: everything in one row would run together, once the rows above have written their keys. The start row is what a run begins with; the last row holds nodes that would never run, with the keys they lack."""
+        f, specs, plan = self._plan(pl)
+        by_wave: dict = {}
+        for n in f.nodes.values(): by_wave.setdefault(plan["waves"].get(n.id, 0), []).append(n)
+        block = lambda n, never: f"""<div class="node-block{" never" if never else ""}" {self._post("node_form", scope=pl.get(self.scope_key,""), pl_id=pl["id"], nid=n.id)}><b>{UI.escape(n.name or n.id)}</b><span class="dim">{UI.escape(n.type)}</span>{self._io_lines(f, specs, n)}{f'<span class="node-miss">missing {UI.escape(self._missing_text(f, plan, n.id))}</span>' if never else ""}</div>"""
+        row = lambda lbl, body: f"""<div class="node-graph-row"><span class="node-graph-row-lbl">{lbl}</span>{body}</div>"""
+        start = row("start", f"""<div class="node-block" style="cursor:default"><b>Run begins with</b><span class="node-io">{UI.escape(", ".join(self._start_keys(pl)) or "(no keys)")}</span></div>""")
+        rows = "".join(row(str(w), "".join(block(n, False) for n in by_wave[w])) for w in sorted(k for k in by_wave if k)) + (row("never", "".join(block(n, True) for n in by_wave[0])) if by_wave.get(0) else "")
+        return f"""<div class="node-graph">{start + rows if f.nodes else "<div class=dim>No nodes yet.</div>"}</div><div id="pl-node-editor-{self.intent_prefix}" class="node-editor"><div class="list-placeholder">Select a node to edit it.</div></div>"""
 
     def _editor_html(self, scope_id, pl, view: str = "list") -> str:
         p = self.intent_prefix
@@ -216,6 +235,7 @@ class PipelineBuilderUI:
                          {toggle}
                          <button type="button" class="btn-icon" {self._post("pool_form", scope=scope_id, pl_id=pl["id"])} title="Resource pool">Pool</button>
                      </div>
+                     <label class="dim tiny" style="display:flex;gap:.4rem;align-items:center;margin-bottom:.4rem" title="Keys that exist when a run begins. The Run box gives input; a pipeline called For Each gets its Item Key (e.g. item) plus its Import Keys. Used only to show the run plan.">Run begins with keys<input type="text" name="start_keys" value="{UI.escape(", ".join(self._start_keys(pl)))}" class="module-select" style="flex:1;font-family:var(--font-mono)" {self._post("start_keys", scope=scope_id, pl_id=pl["id"], view=view)} hx-trigger="change" hx-include="this"></label>
                      <div id="pl-pool-{p}"></div>"""
         return UI.modal(f"{p}-editor", "Pipeline Editor", header + body, width="90%", max_width="70rem")
 
@@ -269,24 +289,61 @@ class PipelineBuilderUI:
         rows = "".join(f'<div style="font-size:.7rem;padding:.15rem 0;border-bottom:1px solid var(--border)"><b>{UI.escape(c["label"])}</b> <span class="dim">[{UI.escape(", ".join(c.get("tags",[])))}]</span> - {UI.escape(", ".join((self.AIM.connections.load_conn_raw(cid) or {}).get("display_name",cid) for cid in c.get("conn_ids",[])) or "no connections")}</div>' for c in candidates)
         return f'<div class="glass" style="padding:.4rem .6rem"><div style="font-size:.65rem;color:var(--text_muted);text-transform:uppercase;margin-bottom:.2rem">Matching CNodes ({len(candidates)})</div>{rows}</div>'
 
-    def _keys_html(self, node_type, config, key_map) -> str:
-        """The node's wiring at a glance: each logical name it waits for or writes, and the shared data key it maps to. Pipelines are wired by naming keys; order follows from which keys exist."""
+    # --- Node wiring (which shared keys a node reads and writes) ---
+
+    def _wire_names(self, spec, mode) -> tuple: return [k for k in spec.get("in_keys", []) if k.isidentifier()], [k for k in spec.get("mode_out_keys", {}).get(mode, spec.get("out_keys", [])) if k.isidentifier()]   # declared logical names; placeholders such as "(the script's own JSON keys)" are not wireable
+
+    def _wiring_html(self, node_type, config, key_map) -> str:
+        """One field per logical name the node type declares: the shared key it reads or writes. Blank = not wired (never waited for / never written). Renames the fields do not cover (e.g. keys an inline script writes) stay editable as JSON."""
         spec = self.AIM.steps.get_node_type(node_type)
-        if not spec: return ""
-        row = lambda names: ", ".join(f"""{UI.escape(k)} &#x2192; <b>{UI.escape((key_map or {}).get(k, k))}</b>""" for k in names) or "-"
-        outs = spec.get("mode_out_keys", {}).get(config.get("mode", ""), spec.get("out_keys", []))
-        return f"""<div class="glass status-list" style="font-size:.72rem;padding:.3rem .5rem;margin-bottom:.4rem"><div><span class="dim">Waits for:</span> {row(spec.get("in_keys", []))}</div><div><span class="dim">Writes:</span> {row(outs)}</div><div class="dim tiny">Key Map renames them: {{"input": "text"}} makes this node read the key "text". The Run box supplies the key "input". A node runs once every key it waits for exists.</div></div>"""
+        if not spec: return f"""<div id="pl-node-wire-{self.intent_prefix}"></div>"""
+        km, (ins, outs) = key_map or {}, self._wire_names(spec, config.get("mode", ""))
+        node = FlowNode({"key_map": km})
+        fld = lambda d, k: f"""<span class="dim">{UI.escape(k)}</span><input type="text" name="wire_{d}_{k}" value="{UI.escape(node.in_key(k) if d == "in" else node.out_key(k))}" class="module-select" placeholder="(not wired)">"""
+        rest = {k: v for k, v in km.items() if k.split(":", 1)[-1] not in set(ins) | set(outs)}
+        return f"""<div id="pl-node-wire-{self.intent_prefix}" class="glass status-list" style="padding:.3rem .5rem;margin-bottom:.4rem">
+                        <div class="dim tiny">Reads (logical name - the shared key it waits for)</div><div class="wire-grid">{"".join(fld("in", k) for k in ins) or '<span class="dim">-</span><span></span>'}</div>
+                        <div class="dim tiny">Writes (logical name - the shared key it writes)</div><div class="wire-grid">{"".join(fld("out", k) for k in outs) or '<span class="dim">-</span><span></span>'}</div>
+                        <details><summary class="dim tiny">Other renames (JSON, advanced)</summary><textarea name="key_map_rest" class="cm-input" rows="2" placeholder='{{"out:score": "draft_score"}}'>{UI.escape(json.dumps(rest) if rest else "")}</textarea></details>
+                        <div class="dim tiny">A node runs once every key it reads exists. The Run box supplies "input". Templates ({{key}}) always use shared key names. Blank = not wired.</div>
+                    </div>"""
+
+    def _wiring_from(self, payload, spec, mode) -> dict:
+        """The node's key_map from the wiring fields: a name read and written under different keys gets "in:" / "out:" entries; identity mappings are not stored. Raises ValueError on invalid JSON in Other renames."""
+        ins, outs = self._wire_names(spec, mode)
+        val = lambda d, k: str(payload.get(f"wire_{d}_{k}", k)).strip()
+        km = json.loads(payload.get("key_map_rest") or "{}")
+        for k in dict.fromkeys(ins + outs):
+            i, o = (val("in", k) if k in ins else None), (val("out", k) if k in outs else None)
+            if i is not None and o is not None and i != o: km.update({f"{d}:{k}": v for d, v in (("in", i), ("out", o)) if v != k})
+            elif (v := i if i is not None else o) != k: km[k] = v
+        return km
+
+    async def _im_node_wire(self, request, payload, imr):
+        """Mode changed: the outputs a node writes may differ, so the wiring panel is rebuilt with the values typed so far."""
+        spec = self.AIM.steps.get_node_type(payload.get("node_type", ""))
+        if not spec: return imr
+        try: km = self._wiring_from(payload, spec, payload.get("cfg_mode", ""))
+        except ValueError: km = {}   # the save reports the bad JSON
+        return imr.oob(self._wiring_html(payload.get("node_type", ""), {"mode": payload.get("cfg_mode", "")}, km), f"pl-node-wire-{self.intent_prefix}", swap="outerHTML")
+
+    async def _im_start_keys(self, request, payload, imr):
+        pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
+        if not pl: return imr
+        pl["start_keys"] = ", ".join(k.strip() for k in str(payload.get("start_keys", "")).split(",") if k.strip()); self.AIM.engine.save_pipeline(pl)
+        return imr.oob(self._editor_html(payload.get("scope",""), pl, view=payload.get("view","list")), f"pl-editor-modal-{self.intent_prefix}")
     
     def _node_config_fields(self, node_type, config, pl=None, key_map=None):
         spec = self.AIM.steps.get_node_type(node_type)
         if not spec: return '<div class="dim">Pick a node type to configure it.</div>'
-        schema = [copy.copy(f) if f.name in ("conn_id","cnode_tags") else f for f in spec["config_schema"]]
+        schema = [copy.copy(f) if f.name in ("conn_id","cnode_tags","mode") else f for f in spec["config_schema"] if f.name != "key_map"]   # a type's own key_map config field is never read - the wiring panel is the node's key map
         for f in schema:
             if f.name == "conn_id": f.hx_intent, f.hx_target = f"{self.intent_prefix}_node_conn_change", "#cfg_model_wrap"
             if f.name == "cnode_tags": f.hx_intent, f.hx_target = f"{self.intent_prefix}_node_pool_preview", f"#pl-pool-preview-{self.intent_prefix}"
+            if f.name == "mode" and spec.get("mode_out_keys"): f.hx_intent, f.hx_target = f"{self.intent_prefix}_node_wire", f"#pl-node-wire-{self.intent_prefix}"
         guide_html = f"""<details class="glass status-list"><summary>&#x2139; How this node works</summary><div>{UI.escape(spec.get("guide",""))}</div></details>""" if spec.get("guide") else ""
         pool_preview = f'<div id="pl-pool-preview-{self.intent_prefix}" style="margin-bottom:.5rem">{self._pool_preview_html(pl, config.get("cnode_tags",""))}</div>' if (pl is not None and any(f.name == "cnode_tags" for f in schema)) else ""
-        return self._keys_html(node_type, config, key_map) + guide_html + pool_preview + BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
+        return self._wiring_html(node_type, config, key_map) + guide_html + pool_preview + BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
 
     async def _im_node_pool_preview(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
@@ -323,10 +380,9 @@ class PipelineBuilderUI:
                        <input type="text" name="name" value="{UI.escape((node or {}).get('name',''))}" placeholder="Node name" class="module-select">
                        <label class="dim">Node Type<select name="node_type" class="module-select" {self._post("node_type_change", scope=scope_id, pl_id=pl["id"])} hx-trigger="change" hx-include="this" hx-target="#pl-node-cfg-{p}">{self._node_type_options(ntype)}</select></label>
                        <div id="pl-node-cfg-{p}">{self._node_config_fields(ntype, config, key_map=(node or {}).get("key_map", {})) if ntype else '<div class="dim">Pick a node type to configure it.</div>'}</div>
-                       <label class="dim">Extra In Keys (comma-sep, actual pipeline keys)<input type="text" name="extra_in_keys" value="{UI.escape(extra_in)}" class="module-select"></label>
-                       <label class="dim">Extra Out Keys (comma-sep, actual pipeline keys)<input type="text" name="extra_out_keys" value="{UI.escape(extra_out)}" class="module-select"></label>
-                       <label class="dim">Key Map (JSON: logical name -> actual key, advanced)<textarea name="key_map" class="cm-input" rows="3">{UI.escape(key_map)}</textarea></label>
-                       <div class="form-actions"><button type="submit" class="button">{"Add Node" if is_new else "Save Node"}</button>{del_btn}</div>
+                       <label class="dim">Also Wait For (shared keys, comma-sep)<input type="text" name="extra_in_keys" value="{UI.escape(extra_in)}" class="module-select" title="Keys this node needs beyond its Reads - e.g. keys a template uses, or the Import Keys of a Call Pipeline node"></label>
+                       <label class="dim">Also Writes (shared keys, comma-sep - labels for the run plan only)<input type="text" name="extra_out_keys" value="{UI.escape(extra_out)}" class="module-select" title="Keys the node really writes but does not declare (an inline script's keys, a called pipeline's export keys). Naming them here only lets the plan show what depends on them; it never makes the node write them."></label>
+                       <div class="form-actions"><button type="submit" class="button">{"Add Node" if is_new else "Save Node"}</button>{del_btn}<span id="pl-node-msg-{p}"></span></div>
                    </form>"""
 
     async def _im_new_form(self, request, payload, imr):
@@ -373,8 +429,8 @@ class PipelineBuilderUI:
                     try: config[field.name] = json.loads(raw) if raw and raw.strip() else field.default
                     except Exception: config[field.name] = field.default
                 else: config[field.name] = raw if raw is not None else field.default
-        try: key_map = json.loads(payload.get("key_map","{}") or "{}")
-        except Exception: key_map = {}
+        try: key_map = self._wiring_from(payload, spec, config.get("mode", "")) if spec else {}
+        except ValueError as e: return imr.oob(f"""<span class="err-box">Not saved - Other renames is not valid JSON ({UI.escape(str(e))})</span>""", f"pl-node-msg-{self.intent_prefix}")        
         extra_in = [k.strip() for k in payload.get("extra_in_keys","").split(",") if k.strip()]
         extra_out = [k.strip() for k in payload.get("extra_out_keys","").split(",") if k.strip()]
         node = next((n for n in flow["nodes"] if n["id"]==nid), None) if nid else None
