@@ -931,3 +931,6 @@ def register_builtins():
         BI.SettingField("wake_words","Extra Wake Words (comma-sep)","text",hint="Added to the rules' wake list. No wake words = every line is addressed."),
         BI.SettingField("wake_fuzz","Wake Word Tolerance (similarity 0-1, 1 = exact only)","number",default=0.8,hint="The first one or two words may differ this much from a wake word and still count (Tesa, Tess a). Lower accepts more misspellings - and more false wakes."),
         _key_map_field()], guide="Deterministic routing for spoken or typed lines: wake words, the 'awake' in-key (a follow-up window), and rule-matched commands gated by the 'role' in-key. Only 'chat' lines produce 'text', so a model downstream runs only for those.")
+    
+    from tools.ai_manager import agent_loop   # imported here, not at the top: agent_loop imports from this module
+    agent_loop.register(BI, _pool_fields, _key_map_field)
