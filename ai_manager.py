@@ -260,7 +260,7 @@ class PipelineBuilderUI:
         except Exception as e:
             imr.raw(f'<span id="pl-import-msg-{self.intent_prefix}" style="color:#ff5f5f;font-size:.7rem" hx-swap-oob="outerHTML">Invalid JSON: {UI.escape(str(e))}</span>')
             return imr
-        doc["id"] = f"pl_{uuid.uuid4().hex[:10]}"
+        if not (str(doc.get("id", "")).startswith("pl_") and not self.AIM.engine.load_pipeline(doc["id"])): doc["id"] = f"pl_{uuid.uuid4().hex[:10]}"   # an unused id is kept, so pipelines that call each other by id can be imported together
         doc[self.scope_key] = scope_id
         doc.setdefault("pool", self.AIM.engine.DEFAULT_POOL)
         doc.setdefault("created", "")

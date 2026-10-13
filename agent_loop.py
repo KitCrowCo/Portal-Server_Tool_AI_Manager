@@ -63,7 +63,7 @@ def shadow_for(root):
     bi, root = steps.ENV["tools"]["built_ins"], Path(str(root)).resolve()
     return bi.ShadowStore(bi.FileManager(root), SHADOW_DIR / re.sub(r"\W+", "_", str(root)).strip("_"))
 
-_SKIP_DIRS = {"_shadow", "__pycache__", "node_modules", "venv"}   # never listed or searched, besides any folder whose name starts with "."
+_FILES_EXCLUDE = ".*,data,_shadow,__pycache__,node_modules,venv"   # default Files exclude: hidden files and folders, the portal's data folder (logins, conversations, keys), generated folders
 _OUTLINE_RE = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+\w+|^\s*(?:#|//)\s*-{3}.+-{3}\s*$|^#{1,6}\s|^\s*(?:export\s+)?(?:async\s+)?function\s+\w+")
 
 class FilesTools:
@@ -72,12 +72,14 @@ class FilesTools:
     A path another author already has pending is refused: that change belongs to its own review."""
     def __init__(self, cfg, ctx):
         self.root, self.author = Path(str(cfg["files_root"])).resolve(), f"agent:{ctx.job_id}"
+        if self.root.is_file(): raise RuntimeError(f"agent_loop: Files must be a folder, and {self.root} is a file - set Files to {self.root.parent} and name {self.root.name} in the task")
         if not self.root.is_dir(): raise RuntimeError(f"agent_loop: Files folder {self.root} does not exist")
-        self.shadow = shadow_for(self.root)
+        self.shadow, self.skip = shadow_for(self.root), [x.strip() for x in str(_FILES_EXCLUDE if cfg.get("files_exclude") is None else cfg["files_exclude"]).split(",") if x.strip()]    
+    def _excluded(self, rel: Path) -> bool: return any(fnmatch.fnmatch(part, pat) or fnmatch.fnmatch(str(Path(*rel.parts[:i + 1])), pat) for i, part in enumerate(rel.parts) for pat in self.skip)   # a name at any depth, or a path from the root
     def _path(self, rel) -> Path:
         p = (self.root / str(rel or ".")).resolve()
         if p != self.root and self.root not in p.parents: raise ToolError(f"path escapes the folder: {rel}")
-        if any(x.startswith(".") or x in _SKIP_DIRS for x in p.relative_to(self.root).parts[:-1]): raise ToolError(f"{rel} is inside a hidden or excluded folder")
+        if self._excluded(p.relative_to(self.root)): raise ToolError(f"{rel} is excluded from this folder's files")
         return p
     def _rel(self, p: Path) -> str: return str(p.relative_to(self.root))
     def _mine(self, rel: str): e = self.shadow.get(rel); return e if e and e["status"] == "pending" and e.get("author") == self.author else None
@@ -89,7 +91,8 @@ class FilesTools:
     def _files(self, base: Path):
         if base.is_file(): yield base; return
         for f in sorted(base.iterdir()):
-            if f.is_dir() and not (f.name.startswith(".") or f.name in _SKIP_DIRS): yield from self._files(f)
+            if self._excluded(f.relative_to(self.root)): continue
+            if f.is_dir(): yield from self._files(f)
             elif f.is_file(): yield f
     def _stage(self, rel: str, content: str):
         rel = self._rel(self._path(rel))
@@ -99,7 +102,7 @@ class FilesTools:
         return True, f"""staged {rel} for review ({len(content.splitlines())} lines) - read_file now shows this version"""
     async def open(self) -> str: return f"""Files: you can read the folder '{self.root.name}' (list_files, read_file, grep, outline). You cannot change it directly: propose_file and propose_edit stage a change for the people who own these files to review, and read_file then shows your proposed version."""
     async def tools(self) -> list: return [
-        _tool("list_files", "List files under a folder (hidden and generated folders are skipped).", {"path": _p("string", "folder, default the root"), "pattern": _p("string", "optional glob on the name or path, e.g. *.py")}, [], read_only=True),
+        _tool("list_files", "List files under a folder (hidden, data and generated folders are excluded).", {"path": _p("string", "folder, default the root"), "pattern": _p("string", "optional glob on the name or path, e.g. *.py")}, [], read_only=True),
         _tool("read_file", "Read a file with line numbers. Long files: read a range.", {"path": _p("string", "file path"), "start": _p("integer", "first line, default 1"), "end": _p("integer", "last line, default the end")}, ["path"], read_only=True),
         _tool("grep", "Search file contents with a regular expression. Returns path:line: text.", {"pattern": _p("string", "regular expression"), "path": _p("string", "folder or file, default the root"), "glob": _p("string", "optional file glob, e.g. *.py")}, ["pattern"], read_only=True),
         _tool("outline", "Section headers, classes and functions of a file with line numbers - read this before reading a large file.", {"path": _p("string", "file path")}, read_only=True),
@@ -312,6 +315,7 @@ def register(BI, pool_fields, key_map_field):
         F("max_steps", "Max Steps (model turns)", "number", default=40, step=1),
         F("space", "Own Space (folder name)", "text", default="", hint="A folder under data/ai_manager/agent_spaces the agent reads and writes directly and keeps between runs. Blank = none."),
         F("files_root", "Files (folder)", "text", default="", hint="A folder the agent may read and propose changes to, e.g. ./tools/ai_manager or ./modules. Changes are staged for review (data/ai_manager/shadow), never written. Blank = none."),
+        F("files_exclude", "Files: Exclude (comma-sep patterns)", "text", default=_FILES_EXCLUDE, advanced=True, hint="Names at any depth or paths from the folder (fnmatch: * ?). Excluded files can be neither read nor proposed. The default keeps hidden files (.env), the portal's data folder and generated folders out."),
         F("tools_conn_id", "Toolset Connection", "select", default="", options=_toolset_conn_options, advanced=True, hint="Tools served by an outside node (agent_tools_call). Blank = none."),
         F("session_args_json", "Toolset Session Arguments (JSON)", "json", default={}, advanced=True, hint='Sent when the toolset opens a session, e.g. {"base": "main"} for a code workspace.'),
         F("tools_cnode_tags", "Toolset Pool Tags (comma-sep)", "text", default="", advanced=True, hint="With Toolset Connection = pool: narrows the pool to CNodes carrying all these tags."),

@@ -336,7 +336,7 @@ async def node_knowledge(config: dict, data: dict, ctx: NodeContext) -> dict:
     conn, cnode = (get_conn(config.get("conn_id",""), conn_type="lightrag"), None) if config.get("conn_id") else (None, None)
     if not conn:
         picked = resources.pick_conn_for_capability(resources.resolve_candidates(ctx.pool_cfg, tags, capability="knowledge_query"), "knowledge_query", priority)
-        if not picked: raise RuntimeError("knowledge: no lightrag connection matches this node's resource pool")
+        if not picked: raise RuntimeError("knowledge: no Connection pinned and no CNode in this node's resource pool carries a knowledge connection - pin the knowledge base in Connection (with several knowledge bases the node never guesses one)")
         cnode, conn = picked
     t0 = time.time()
     if mode == "insert":
@@ -351,7 +351,7 @@ async def node_knowledge(config: dict, data: dict, ctx: NodeContext) -> dict:
         entities = await lightrag_list_entities(conn, limit=config.get("limit", 500))
         if cnode: resources.log_usage(cnode["id"], "knowledge:entities", time.time()-t0)
         return {"entities": entities}
-    r = await lightrag_query(conn, ctx.resolve(config.get("query_template", "{input}")), config.get("query_mode", "hybrid"))
+    r = await lightrag_query(conn, ctx.resolve(config.get("query_template", "{input}")), config.get("query_mode", "hybrid"), **({"only_need_context": True} if config.get("context_only") else {}))
     if cnode: resources.log_usage(cnode["id"], "knowledge:query", time.time()-t0)
     return {"response": r.get("response", r.get("error","")), "raw": r}
 
@@ -853,7 +853,8 @@ def register_builtins():
     register_node_type("knowledge", node_knowledge, "Knowledge (query / insert / entities)", in_keys=["input"], out_keys=["response","raw"], config_schema=[
         BI.SettingField("mode","Mode","select",default="query",options=[("query","Query"),("insert","Insert Text"),("entities","List Entities")]),
         BI.SettingField("query_template","Query Template","textarea",default="{input}"),
-        BI.SettingField("query_mode","Search Mode","select",default="hybrid",options=[("hybrid","Hybrid"),("local","Local"),("global","Global"),("naive","Naive"),("mix","Mix")]),
+        BI.SettingField("query_mode","Search Mode","select",default="hybrid",options=[("hybrid","Hybrid"),("local","Local"),("global","Global"),("naive","Naive"),("mix","Mix")], hint="Naive = chunk similarity only: no LLM call at query time (fastest; best for code chunks). The graph modes also ask the store's own LLM for keywords."),
+        BI.SettingField("context_only","Retrieved Context Only","checkbox",default=False, hint="Returns the passages found instead of an answer the store's LLM writes from them. Use when another node (or an agent) answers from the context."),
         BI.SettingField("text_template","Insert Text Template","textarea",advanced=True,hint="Blank = this node's input key as wired. A template that is exactly one {key} holding a list inserts one document per item."),
         BI.SettingField("source_label","Insert Source Label","text",advanced=True,hint="Stored as each document's file source; supports {key}, e.g. {item}."),
         BI.SettingField("limit","Entity Limit","number", default=500,step=1,advanced=True),
