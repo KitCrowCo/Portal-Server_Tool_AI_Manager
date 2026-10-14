@@ -4,7 +4,7 @@ It reads whatever it needs from the shared pipeline `data` object - ctx.get()/ct
 the in_keys/out_keys a type declares are a scheduling contract, not a firewall - and returns a dict of LOGICAL output names -> values.
 The engine remaps those to actual pipeline keys via the node's key_map and merges them into `data`.
 """
-import re, os, json, sys, asyncio, uuid, time, io, wave, base64, array, difflib, ast, fnmatch
+import re, os, json, sys, asyncio, uuid, time, io, wave, base64, array, difflib, ast, fnmatch, copy
 from pathlib import Path
 from tools.ai_manager import engine, resources, connections
 from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_insert_texts, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
@@ -484,6 +484,27 @@ def _pick_chat_model(conn: dict, model: str, label: str) -> str:
     picked = pick_default_chat_model(models)
     if not picked: raise RuntimeError(f"""{label}: connection {conn.get('_id','?')} has no non-embedding models available - pin one via the Model field. Available: {models}""")
     return picked
+
+# --- Chat settings for callers outside a pipeline (an assistant's settings, a query page): the generate node's own fields and fallbacks, so every chat picker behaves the same ---
+
+def chat_fields(refresh_intent: str = "", names: tuple = ("conn_id", "model", "num_ctx", "temperature")) -> list:
+    """Copies of the generate node's chat fields. With refresh_intent, changing Connection posts that intent (the form's values included), so the caller can re-render the fields and Model lists that connection's models."""
+    std = {f.name: f for f in get_node_type("generate")["config_schema"]}
+    out = [copy.copy(std[n]) for n in names]
+    for f in out:
+        if f.name == "conn_id" and refresh_intent: f.hx_intent, f.hx_target, f.hint = refresh_intent, "none", "Blank = the first connection that declares chat."
+    return out
+
+def resolve_chat_conn(conn_id: str, label: str) -> dict:
+    """The pinned connection, or (blank) the first connection declaring chat - the fallback a generate node without a pool uses."""
+    conn = get_conn(conn_id) if conn_id else next(iter(conns_matching("chat")), None)
+    if not conn: raise RuntimeError(f"""{label}: {"connection '" + conn_id + "' no longer exists" if conn_id else "no connection declares chat"}""")
+    return conn
+
+def resolve_chat(conn_id: str, model: str, label: str) -> tuple:
+    """(connection, model): resolve_chat_conn, then the given model or the connection's first non-embedding model."""
+    conn = resolve_chat_conn(conn_id, label)
+    return conn, _pick_chat_model(conn, model, label)
 
 # --- speech: transcribe / speak through whichever connection declares speech_to_text / text_to_speech ---
 

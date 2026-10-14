@@ -16,11 +16,20 @@
     "insert_text":    {"method": "POST",   "path": "/documents/text", "body": {"text": "{text}", "file_source": "{source}"}},
     "insert_texts":   {"method": "POST",   "path": "/documents/texts", "body": {"texts": "{texts}", "file_sources": "{sources}"}},
     "insert_file":    {"method": "POST",   "path": "/documents/upload", "fallback_path": "/documents/file", "file_field": "file"},
-    "insert_file":    {"method": "POST",   "path": "/documents/upload", "fallback_path": "/documents/file", "file_field": "file"},
     "list_documents": {"method": "GET",    "path": "/documents"},
     "clear_all":      {"method": "DELETE", "path": "/documents"},
-    "delete_document":{"method": "DELETE", "path": "/documents/{doc_id}", "fallback_path": "/documents/delete_document"},
-    "graph":          {"method": "GET",    "path": "/graphs", "fallback_path": "/graph/label/list", "body": {"label": "{label}", "max_depth": "{max_depth}", "max_nodes": "{max_nodes}"}}
+    "delete_document":{"method": "DELETE", "path": "/documents/delete_document", "body": {"doc_ids": "{doc_ids}", "delete_file": "{delete_file}"}},
+    "list_documents_paginated": {"method": "POST", "path": "/documents/paginated", "body": {"page": "{page}", "page_size": "{page_size}", "sort_field": "{sort_field}", "sort_direction": "{sort_direction}", "status_filter": "{status_filter}"}},
+    "status_counts":  {"method": "GET",    "path": "/documents/status_counts"},
+    "pipeline_status":{"method": "GET",    "path": "/documents/pipeline_status"},
+    "track_status":   {"method": "GET",    "path": "/documents/track_status/{track_id}"},
+    "reprocess_failed":{"method": "POST",  "path": "/documents/reprocess_failed"},
+    "cancel_pipeline":{"method": "POST",   "path": "/documents/cancel_pipeline"},
+    "scan":           {"method": "POST",   "path": "/documents/scan"},
+    "query_data":     {"method": "POST",   "path": "/query/data", "body": {"query": "{query}", "mode": "{mode}"}},
+    "graph":          {"method": "GET",    "path": "/graphs", "fallback_path": "/graph/label/list", "body": {"label": "{label}", "max_depth": "{max_depth}", "max_nodes": "{max_nodes}"}},
+    "graph_labels":   {"method": "GET",    "path": "/graph/label/list"},
+    "openapi":        {"method": "GET",    "path": "/openapi.json"}
   },
   "query_options_schema": {
     "enable_rerank":     {"type": "boolean", "default": null, "label": "Rerank results", "hint": "Uses a reranker model if the server has one configured."},

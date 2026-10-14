@@ -2,7 +2,7 @@
 Shared utilities for all ai tools conenctions.
 Not a sub-module (no subdirectory/router) - import directly.
 """
-import json, httpx, time, re
+import json, httpx, time, re, asyncio
 from pathlib import Path
 
 _QUERY_CACHE: dict = {}
@@ -291,6 +291,18 @@ def lightrag_query_options_schema(conn) -> dict:
     """UI callers (Kimi) render this dynamically as query-time toggles/fields - a new option is a JSON edit, never a new checkbox hand-added to kimi.py."""
     return _lightrag_profile(conn).get("query_options_schema", {})
 
+def lightrag_query_defaults(conn) -> dict:
+    """Query options in effect for one knowledge group: the profile's schema defaults, overlaid with the group's own saved defaults (conn["query_defaults"], set from Kimi).
+    Every caller (Kimi, knowledge nodes, context blocks) gets the same per-group behaviour, e.g. rerank on for one group and off for another."""
+    return {**{k: spec.get("default") for k, spec in lightrag_query_options_schema(conn).items()}, **(conn.get("query_defaults") or {})}
+
+def base_url(conn) -> str: return _base(conn)   # for links to a server's own pages (e.g. LightRAG's WebUI)
+
+async def lightrag_op(conn, name: str, **params) -> dict:
+    """Any operation declared under endpoints in the connection's profile, by name - pipeline_status, track_status (track_id=...), reprocess_failed, cancel_pipeline, status_counts, graph_labels, openapi.
+    A server without that route answers with its own HTTP error, returned as {"error": ...}."""
+    return await _lightrag_call(conn, name, params)
+
 async def lightrag_health(conn) -> dict:
     r = await _lightrag_call(conn, "health")
     return {"ok": "error" not in r, "detail": r.get("error", r)}
@@ -301,8 +313,7 @@ async def lightrag_query_stream(conn, query: str, mode: str = "mix", **extra):
     profile = _lightrag_profile(conn)
     ep = profile.get("endpoints", {}).get("query_stream", {})
     if not ep: yield "", None, "lightrag profile has no 'query_stream' endpoint declared"; return
-    schema = lightrag_query_options_schema(conn)
-    opts = {k: extra.pop(k, spec.get("default")) for k, spec in schema.items()}
+    opts = {k: extra.pop(k, v) for k, v in lightrag_query_defaults(conn).items()}
     body = {"query": query, "mode": mode, "stream": True, **{k:v for k,v in opts.items() if v is not None}, **{k:v for k,v in extra.items() if v is not None}}
     read_timeout = float(conn.get("values", {}).get("timeout_s", 2400))
     try:
@@ -323,8 +334,7 @@ async def lightrag_query_stream(conn, query: str, mode: str = "mix", **extra):
         yield "", None, str(e)
 
 async def lightrag_query(conn, query: str, mode: str = "hybrid", **extra) -> dict:
-    schema = lightrag_query_options_schema(conn)
-    opts = {k: extra.pop(k, spec.get("default")) for k, spec in schema.items()}
+    opts = {k: extra.pop(k, v) for k, v in lightrag_query_defaults(conn).items()}
     extra_body = {**{k:v for k,v in opts.items() if v is not None}, **{k:v for k,v in extra.items() if v is not None}}
     r = await _lightrag_call(conn, "query", {"query": query, "mode": mode}, extra_body=extra_body)
     if _lr_failed(r): return r
@@ -335,20 +345,92 @@ async def lightrag_insert_text(conn, text: str, source: str = "") -> dict: retur
 async def lightrag_insert_texts(conn, texts: list, source: str = "") -> dict: return await _lightrag_call(conn, "insert_texts", {"texts": texts, "sources": [source or "manual entry"] * len(texts)})   # one document per text; LightRAG still splits any text longer than its own chunk_token_size
 async def lightrag_insert_file(conn, filename: str, content: bytes) -> dict: return await _lightrag_call(conn, "insert_file", file_bytes=content, file_name=filename)
 async def lightrag_list_documents(conn) -> dict: return await _lightrag_call(conn, "list_documents")
-async def lightrag_delete_document(conn, doc_id: str) -> dict: return await _lightrag_call(conn, "delete_document", {"doc_id": doc_id})
+async def lightrag_delete_document(conn, doc_id: str, delete_file: bool = True) -> dict: return await lightrag_delete_documents(conn, [doc_id], delete_file)
+
+async def lightrag_delete_documents(conn, doc_ids: list, delete_file: bool = True) -> dict:
+    """Deletes documents and what was extracted from them only (entities and relations other documents share are rebuilt). delete_file also removes the server's own uploaded copy,
+    which a server needs gone before a changed file of the same name can be uploaded again. Servers refuse while their pipeline is busy: the answer then carries status "busy"."""
+    return await _lightrag_call(conn, "delete_document", {"doc_ids": list(doc_ids), "delete_file": delete_file})
+
+def _flatten_docs(r) -> list:
+    """The unpaginated document list in either shape seen across versions - {"statuses": {status: [doc, ...]}} or a bare list - as one list, each doc carrying its status."""
+    if isinstance(r, list): return r
+    groups = r.get("statuses") or r.get("documents") or {}
+    if isinstance(groups, list): return groups
+    return [{**d, "status": d.get("status") or st} for st, ds in groups.items() for d in (ds if isinstance(ds, list) else [ds]) if isinstance(d, dict)]
+
+async def lightrag_documents(conn, page: int = 1, page_size: int = 100, status: str = "", sort_field: str = "file_path", sort_direction: str = "asc") -> dict:
+    """One page of the knowledge server's documents: {documents, pagination: {page, page_size, total_count, total_pages, has_next, has_prev}, status_counts}.
+    Servers without the paginated route get their whole list paged here, so callers see one shape."""
+    r = await _lightrag_call(conn, "list_documents_paginated", {"page": page, "page_size": page_size, "sort_field": sort_field, "sort_direction": sort_direction, **({"status_filter": status} if status else {})})
+    if not _lr_failed(r) or not re.match(r"HTTP 40[45]", r["error"]): return r
+    full = await lightrag_list_documents(conn)
+    if _lr_failed(full): return full
+    docs = _flatten_docs(full)
+    counts = {st: sum(1 for d in docs if str(d.get("status", "")).lower() == st) for st in sorted({str(d.get("status", "")).lower() for d in docs})}
+    docs = sorted((d for d in docs if not status or str(d.get("status", "")).lower() == status.lower()), key=lambda d: str(d.get(sort_field, "")), reverse=sort_direction == "desc")
+    pages = max(1, -(-len(docs) // page_size))
+    return {"documents": docs[(page - 1) * page_size:page * page_size], "pagination": {"page": page, "page_size": page_size, "total_count": len(docs), "total_pages": pages, "has_next": page < pages, "has_prev": page > 1}, "status_counts": counts}
+
+def lightrag_upload_name(rel: str) -> str: return rel.replace("\\", "/").strip("/").replace("/", "__")   # the folder path kept in the name ("notes/a.md" -> "notes__a.md"): current LightRAG refuses path separators in uploaded names, earlier versions stripped them
+def _lr_name_forms(name: str) -> set: return {name, name.replace("__", "/"), name.replace("__", "")}   # the forms earlier ingests may be stored under: the raw path, or the path with its separators stripped
+
+async def lightrag_doc_index(conn) -> dict:
+    """file path -> the server's documents for it, over every page - built once per batch so replacing many files does not list the server per file."""
+    out, page = {}, 1
+    while True:
+        r = await lightrag_documents(conn, page=page, page_size=200)
+        if _lr_failed(r): raise RuntimeError(f"""listing documents failed: {r["error"]}""")
+        for d in r.get("documents", []): out.setdefault(d.get("file_path", ""), []).append(d)
+        if not r.get("pagination", {}).get("has_next"): return out
+        page += 1
+
+async def lightrag_replace_file(conn, filename: str, content: bytes, index: dict = None, wait_s: int = 1800) -> dict:
+    """Inserts a file (filename = lightrag_upload_name(...)), first deleting the documents the server already holds under that name - so a changed file replaces its earlier version
+    instead of being refused as a duplicate (current LightRAG answers HTTP 409) or kept beside it. A busy pipeline refuses deletion; this waits for it (checking every 15 s) up to wait_s, then gives up without inserting."""
+    index = await lightrag_doc_index(conn) if index is None else index
+    old = [d["id"] for name in _lr_name_forms(filename) for d in index.get(name, []) if d.get("id")]
+    deadline = time.time() + wait_s
+    while old:
+        r = await lightrag_delete_documents(conn, old)
+        if _lr_failed(r): return r
+        if r.get("status") != "busy": break
+        if time.time() > deadline: return {"error": f"the knowledge server stayed busy for {wait_s} s - earlier version not deleted, file not inserted"}
+        await asyncio.sleep(15)
+    r = await lightrag_insert_file(conn, filename, content)
+    return {**r, "replaced": old}
 
 async def lightrag_clear_all(conn) -> dict:
     r = await _lightrag_call(conn, "clear_all")
     return {"ok": True} if "error" not in r else r
 
 async def lightrag_query_cached(conn, query: str, mode: str = "hybrid", ttl: int = 300, **extra) -> dict:
-    key = (conn.get("_id", id(conn)), mode, query, tuple(sorted(extra.items())))
+    key = (conn.get("_id", id(conn)), mode, query, tuple(sorted(extra.items())), tuple(sorted((conn.get("query_defaults") or {}).items())))
     now = time.time()
     hit = _QUERY_CACHE.get(key)
     if hit and now - hit[0] < ttl: return hit[1]
     result = await lightrag_query(conn, query, mode, **extra)
     _QUERY_CACHE[key] = (now, result)
     return result
+
+async def lightrag_query_data(conn, query: str, mode: str = "mix", **extra) -> dict:
+    """Retrieval only - the entities, relationships and text chunks a query finds, with no answer written by the knowledge server, so any chat model can answer from them.
+    Returns {"context": text block, "data": structured result}; servers without /query/data fall back to a query with only_need_context."""
+    opts = {k: extra.pop(k, v) for k, v in lightrag_query_defaults(conn).items()}
+    r = await _lightrag_call(conn, "query_data", {"query": query, "mode": mode}, extra_body={**{k: v for k, v in opts.items() if v is not None and k != "only_need_context"}, **{k: v for k, v in extra.items() if v is not None}})
+    if _lr_failed(r) and re.match(r"HTTP 40[45]", r["error"]):
+        r = await lightrag_query(conn, query, mode, **{**extra, "only_need_context": True})
+        return r if _lr_failed(r) else {"context": r.get("response", ""), "data": {}}
+    if _lr_failed(r): return r
+    data = r.get("data", r)
+    return {"context": _format_query_data(data), "data": data}
+
+def _format_query_data(d: dict) -> str:
+    """Structured retrieval as one plain-text context block for a chat model."""
+    ents = "\n".join(f"""- {e.get("entity_name") or e.get("entity") or e.get("id", "?")} ({e.get("entity_type", "")}): {e.get("description", "")}""" for e in d.get("entities", []))
+    rels = "\n".join(f"""- {r.get("src_id") or r.get("source", "?")} -> {r.get("tgt_id") or r.get("target", "?")}: {r.get("description", "")}""" for r in d.get("relationships", []))
+    chunks = "\n\n".join(f"""[{c.get("file_path", "")}]\n{c.get("content", "")}""" for c in d.get("chunks", []))
+    return "\n\n".join(part for part in (f"Entities:\n{ents}" if ents else "", f"Relationships:\n{rels}" if rels else "", f"Text:\n{chunks}" if chunks else "") if part)
 
 async def lightrag_context_block(conn, query: str, mode: str = "hybrid", label: str = "Knowledge") -> str:
     r = await lightrag_query_cached(conn, query, mode)
@@ -360,6 +442,13 @@ def _parse_graph_response(data) -> tuple:
     if isinstance(data, dict): return data.get("nodes", []), data.get("edges", [])
     if isinstance(data, list): return [{"id": i, "label": i} if isinstance(i, str) else i for i in data], []
     return [], []
+
+async def lightrag_graph(conn, label: str = "*", max_depth: int = 3, max_nodes: int = 1000) -> dict:
+    """The subgraph around a label ("*" = the whole graph) as {"nodes", "edges", "is_truncated"} - the server cuts it at max_nodes."""
+    data = await _lightrag_call(conn, "graph", {"limit": max_nodes, "label": label, "max_depth": max_depth, "max_nodes": max_nodes})
+    if _lr_failed(data): return data
+    nodes, edges = _parse_graph_response(data)
+    return {"nodes": nodes, "edges": edges, "is_truncated": bool(data.get("is_truncated")) if isinstance(data, dict) else False}
 
 async def lightrag_graph_dot(conn, limit: int = 1000, label: str = "*") -> str:
     data = await _lightrag_call(conn, "graph", {"limit": limit, "label": label, "max_depth": 3, "max_nodes": limit})

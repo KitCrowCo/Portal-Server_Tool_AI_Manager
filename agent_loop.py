@@ -2,7 +2,7 @@
 Nothing here is coding-specific. Working on code is the Files toolset (read a folder tree, propose changes into its shadow store) plus knowledge search; an owned space, saved pipelines and outside toolset connections are others.
 Tools use the MCP tool shape - {name, description, inputSchema}, results {content: [{type, text}], isError} - so an MCP server is one more toolset adapter, not a new loop.
 Where writes land is each toolset's own rule, applied in one place per toolset: the agent's own space is written directly (it is that space's sole stakeholder); shared data goes through a shadow stage (a git branch, file_write staging) for its stakeholders to accept."""
-import re, json, time, uuid, fnmatch
+import re, ast, json, time, uuid, fnmatch, builtins, symtable
 from pathlib import Path
 from tools.ai_manager import engine, resources, connections, steps
 from tools.ai_manager.steps import NodeContext, _pick_capability_conn, _pick_chat_model, _parse_json_config, _opt, get_conn, conns_matching, register_node_type, _sub_run_error
@@ -66,6 +66,42 @@ def shadow_for(root):
 _FILES_EXCLUDE = ".*,data,_shadow,__pycache__,node_modules,venv"   # default Files exclude: hidden files and folders, the portal's data folder (logins, conversations, keys), generated folders
 _OUTLINE_RE = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+\w+|^\s*(?:#|//)\s*-{3}.+-{3}\s*$|^#{1,6}\s|^\s*(?:export\s+)?(?:async\s+)?function\s+\w+")
 
+# --- File checks (problems a reader would hit first; standard library only, nothing is run) ---
+
+_CHECKED = (".py", ".json")
+_MODULE_NAMES = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__spec__", "__loader__", "__package__", "__builtins__", "__path__", "__cached__", "__annotations__"}
+
+def _scopes(t):
+    yield t
+    for c in t.get_children(): yield from _scopes(c)
+
+def _py_problems(text: str, rel: str) -> list:
+    """Syntax errors as this server's Python compiles the file, functions or classes defined twice in one body (the later replaces the earlier), and names never defined anywhere they could come from. String annotations are not evaluated, so they are not checked."""
+    try: compile(text, rel, "exec")
+    except (SyntaxError, ValueError) as e: return [f"""line {getattr(e, "lineno", None) or "?"}: syntax error: {getattr(e, "msg", None) or e}"""]
+    tree, out = ast.parse(text), []
+    for body in [tree.body] + [n.body for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+        seen = {}
+        for n in (n for n in body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))):
+            if n.name in seen and not any(isinstance(d, ast.Attribute) for d in n.decorator_list): out.append(f"line {n.lineno}: {n.name} replaces the one defined on line {seen[n.name]}")   # @x.setter and similar decorators redefine on purpose
+            seen[n.name] = n.lineno
+    if any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names) for n in ast.walk(tree)): return out   # names from "import *" cannot be known
+    scopes = list(_scopes(symtable.symtable(text, rel, "exec")))
+    defined = _MODULE_NAMES | {s.get_name() for s in scopes[0].get_symbols() if s.is_assigned() or s.is_imported() or s.is_namespace()} | {s.get_name() for t in scopes for s in t.get_symbols() if s.is_declared_global() and (s.is_assigned() or s.is_imported())}
+    missing, first = {s.get_name() for t in scopes for s in t.get_symbols() if s.is_referenced() and (t is scopes[0] or s.is_global()) and s.get_name() not in defined}, {}
+    for n in (n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id in missing): first[n.id] = min(first.get(n.id, n.lineno), n.lineno)
+    return out + [f"""line {first.get(k, "?")}: undefined name {k}""" for k in sorted(missing, key=lambda k: first.get(k, 0))]
+
+def _problems(rel: str, text: str) -> list:
+    """What check_files reports for one file's text, by type; types outside _CHECKED are not checked."""
+    if rel.endswith(".py"): return _py_problems(text, rel)
+    if rel.endswith(".json"):
+        try: json.loads(text)
+        except json.JSONDecodeError as e: return [f"line {e.lineno}: invalid JSON: {e.msg}"]
+    return []
+
+def _problem_key(p: str) -> str: return re.sub(r"\d+", "#", p)   # a problem without its line numbers, so one a file already had is recognised after lines move
+
 class FilesTools:
     """A folder tree (a repo, a module, a wiki) the agent reads directly and changes only by proposal: propose_file / propose_edit stage the change in the folder's review store (shadow_for),
     where the people who own those files accept, reject or diff it. Reads show a file as this run proposed it, so edits build on each other.
@@ -99,13 +135,29 @@ class FilesTools:
         e = self.shadow.get(rel)
         if e and e["status"] == "pending" and e.get("author") != self.author: raise ToolError(f"""{rel} already has a change pending review from {e.get("author") or "someone else"} - leave it, and mention what you wanted to change in finish""")
         self.shadow.stage(rel, content, author=self.author)
-        return True, f"""staged {rel} for review ({len(content.splitlines())} lines) - read_file now shows this version"""
-    async def open(self) -> str: return f"""Files: you can read the folder '{self.root.name}' (list_files, read_file, grep, outline). You cannot change it directly: propose_file and propose_edit stage a change for the people who own these files to review, and read_file then shows your proposed version."""
+        return True, f"""staged {rel} for review ({len(content.splitlines())} lines) - read_file now shows this version{self._stage_note(rel)}"""
+    def _diagnose(self, rel: str) -> tuple:
+        """(new, earlier): problems in this run's version of a file, split by whether the version on disk already had them."""
+        p = self._path(rel)
+        before, now = {_problem_key(x) for x in _problems(rel, p.read_text(errors="replace"))} if p.is_file() else set(), _problems(rel, self._text(rel))
+        return [x for x in now if _problem_key(x) not in before], [x for x in now if _problem_key(x) in before]
+    def _stage_note(self, rel: str) -> str:
+        if not rel.endswith(_CHECKED): return ""
+        new, earlier = self._diagnose(rel)
+        if new: return "\n".join([f"\ncheck: {len(new)} new problem(s) - fix them before finishing:", *new])
+        return f"\ncheck: no new problems ({len(earlier)} were in the file before this run - leave them unless the task is about them)" if earlier else "\ncheck: no problems found"
+    def _report(self, rel: str) -> tuple:
+        """(ok, text) for check_files: one file's new problems first, then those it already had; ok is False only for new ones."""
+        if not rel.endswith(_CHECKED): return True, f"""{rel}: not checked (only {", ".join(_CHECKED)} files are)"""
+        new, earlier = self._diagnose(rel)
+        return not new, "\n  ".join([f"{rel}: {len(new)} new problem(s)" if new else f"{rel}: no new problems", *new] + ([f"""already in the file before this run: {"; ".join(earlier)}"""] if earlier else []))
+    async def open(self) -> str: return f"""Files: you can read the folder '{self.root.name}' (list_files, read_file, grep, outline). You cannot change it directly: propose_file and propose_edit stage a change for the people who own these files to review, and read_file then shows your proposed version. Proposals of {" and ".join(_CHECKED)} files are checked (syntax, undefined names, definitions that replace earlier ones) and the result is added to the reply; check_files checks again."""
     async def tools(self) -> list: return [
         _tool("list_files", "List files under a folder (hidden, data and generated folders are excluded).", {"path": _p("string", "folder, default the root"), "pattern": _p("string", "optional glob on the name or path, e.g. *.py")}, [], read_only=True),
         _tool("read_file", "Read a file with line numbers. Long files: read a range.", {"path": _p("string", "file path"), "start": _p("integer", "first line, default 1"), "end": _p("integer", "last line, default the end")}, ["path"], read_only=True),
         _tool("grep", "Search file contents with a regular expression. Returns path:line: text.", {"pattern": _p("string", "regular expression"), "path": _p("string", "folder or file, default the root"), "glob": _p("string", "optional file glob, e.g. *.py")}, ["pattern"], read_only=True),
         _tool("outline", "Section headers, classes and functions of a file with line numbers - read this before reading a large file.", {"path": _p("string", "file path")}, read_only=True),
+        _tool("check_files", "Check files for problems a reader would hit first: Python (syntax as this server compiles it, functions or classes defined twice, undefined names) and JSON. Problems a file already had before this run are listed separately.", {"path": _p("string", "a file; default every file this run proposed")}, [], read_only=True),
         _tool("propose_edit", "Propose replacing one exact, unique block of text in a file. Staged for review, not applied.", {"path": _p("string", "file path"), "old": _p("string", "exact current text, matching once (copy it from read_file without the line numbers)"), "new": _p("string", "replacement text")}),
         _tool("propose_file", "Propose a whole new file, or a full replacement of one. Staged for review, not applied. Prefer propose_edit for changes to existing files.", {"path": _p("string", "file path"), "content": _p("string", "full file content")})]
     async def call(self, name, args):
@@ -120,6 +172,9 @@ class FilesTools:
             hits = [f"{self._rel(f)}:{i}: {l.strip()[:200]}" for f in self._files(self._path(args.get("path"))) if not args.get("glob") or fnmatch.fnmatch(f.name, args["glob"]) for i, l in enumerate(self._text(self._rel(f)).splitlines() if f.suffix not in (".png", ".jpg", ".gguf", ".bin", ".zip", ".pdf") else [], 1) if rx.search(l)]
             return True, "\n".join(hits[:300]) + (f"\n[... {len(hits) - 300} more - narrow the pattern or path]" if len(hits) > 300 else "") if hits else "(no matches)"
         if name == "outline": return True, "\n".join(f"{i}: {l.rstrip()}" for i, l in enumerate(self._text(args["path"]).splitlines(), 1) if _OUTLINE_RE.match(l)) or "(no sections, classes or functions found)"
+        if name == "check_files":
+            reports = [self._report(r) for r in ([self._rel(self._path(args["path"]))] if args.get("path") else [e["path"] for e in self.shadow.pending() if e.get("author") == self.author])]
+            return all(ok for ok, _ in reports), "\n".join(t for _, t in reports) or "nothing proposed yet - give a path to check a file"
         if name == "propose_file": return self._stage(args["path"], str(args.get("content", "")))
         text, old = self._text(args["path"]), str(args.get("old", ""))
         if not old or text.count(old) != 1: raise ToolError(f"""old text matches {text.count(old) if old else 0} times in {args["path"]} - it must match exactly once (copy it from read_file without the line numbers, adding surrounding lines if needed)""")
@@ -325,7 +380,7 @@ def register(BI, pool_fields, key_map_field):
         F("read_only", "Read-only (only tools marked readOnlyHint)", "checkbox", default=False, hint="For review / explain runs. finish is always offered."),
         F("allow_tools", "Allowed Tools (comma-sep, blank = all)", "text", default="", advanced=True),
         F("deny_tools", "Denied Tools (comma-sep)", "text", default="", advanced=True),
-        F("check_tool", "Goal Check: Tool", "text", default="", advanced=True, hint="Run when the model calls finish, e.g. run_check. Problems send the model back to work."),
+        F("check_tool", "Goal Check: Tool", "text", default="", advanced=True, hint="Run when the model calls finish, e.g. check_files (with Files: new problems in the proposed files) or run_check (a code workspace). Problems send the model back to work."),
         F("check_fail_pattern", "Goal Check: Failure Pattern (regex)", "text", default="", advanced=True, hint="Blank = COMPILE ERROR|FAILED|TIMEOUT|Traceback."),
         F("check_pipeline_id", "Goal Check: Pipeline", "select", default="", options=_pipeline_options, advanced=True, hint="Gets input (the task) and summary; must write ok and may write feedback."),
         F("max_checks", "Goal Check: Attempts", "number", default=3, step=1, advanced=True),

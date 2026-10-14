@@ -98,13 +98,6 @@ def publish_live(job_id: str, node_id: str, live: dict):
     node = next((n for n in (job or {}).get("flow", {}).get("nodes", []) if n["id"] == node_id), None)
     if node: node["live"] = live; _save_job(job)
 
-def publish_live(job_id: str, node_id: str, live: dict):
-    """A long-running node's progress (e.g. an agent's transcript so far), kept on its node record as node["live"] for views that poll the job. Nothing is pushed to the browser.
-    Load and save run with no await between them, so on the one event loop they cannot interleave with _set_node_status."""
-    job = load_job(job_id)
-    node = next((n for n in (job or {}).get("flow", {}).get("nodes", []) if n["id"] == node_id), None)
-    if node: node["live"] = live; _save_job(job)
-
 async def _set_node_status(job_id: str, username: str, node_id: str, status: str, extra: dict = None):
     """Known pre-existing race: two nodes finishing in the same concurrent wave can each load-modify-save this job doc and clobber one another's status write.
     Cosmetic only (data merge itself is unaffected, see _run_flow) - not fixed here, flagged for whoever eventually adds a lock around job file writes."""
