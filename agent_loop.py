@@ -2,7 +2,7 @@
 Nothing here is coding-specific. Working on code is the Files toolset (read a folder tree, propose changes into its shadow store) plus knowledge search; an owned space, saved pipelines and outside toolset connections are others.
 Tools use the MCP tool shape - {name, description, inputSchema}, results {content: [{type, text}], isError} - so an MCP server is one more toolset adapter, not a new loop.
 Where writes land is each toolset's own rule, applied in one place per toolset: the agent's own space is written directly (it is that space's sole stakeholder); shared data goes through a shadow stage (a git branch, file_write staging) for its stakeholders to accept."""
-import re, ast, json, time, uuid, asyncio, fnmatch, builtins, symtable
+import re, ast, json, time, uuid, asyncio, fnmatch, builtins, symtable, traceback
 from pathlib import Path
 from tools.ai_manager import engine, resources, connections, steps, code_index
 from tools.ai_manager.steps import NodeContext, _pick_capability_conn, _pick_chat_model, _parse_json_config, _opt, get_conn, conns_matching, register_node_type, _sub_run_error
@@ -50,6 +50,7 @@ class SpaceTools:
     def __init__(self, cfg, ctx): self.root = (SPACES_DIR / Path(str(cfg["space"])).name).resolve()
     def _path(self, rel) -> Path:
         p = (self.root / str(rel or ".")).resolve()
+        if p.is_dir(): raise ToolError(f"{args.get('path') or '.'} is a folder - give a file path, e.g. notes/{args.get('path') or ''}todo.md (missing folders are created)")
         if p != self.root and self.root not in p.parents: raise ToolError(f"path escapes the space: {rel}")
         return p
     async def open(self) -> str: self.root.mkdir(parents=True, exist_ok=True); return f"""You own a space named '{self.root.name}' (space_* tools): it is yours to organise, and it is kept between runs."""
@@ -108,9 +109,9 @@ def _problems(rel: str, text: str) -> list:
 def _problem_key(p: str) -> str: return re.sub(r"\d+", "#", p)   # a problem without its line numbers, so one a file already had is recognised after lines move
 
 class FilesTools:
-    """A folder tree (a repo, a module, a wiki) the agent reads directly and changes only by proposal: propose_file / propose_edit stage the change in the folder's review store (shadow_for),
-    where the people who own those files accept, reject or diff it. Reads show a file as this run proposed it, so edits build on each other.
-    A path another author already has pending is refused: that change belongs to its own review."""
+    """A folder tree (a repo, a module, a wiki) the agent reads directly and changes only by proposal:
+    propose_file / propose_edit stage the change in the folder's review store (shadow_for), where the people who own those files accept, reject or diff it.
+    Reads show a file as this run proposed it, so edits build on each other. A path another author already has pending is refused: that change belongs to its own review."""
     def __init__(self, cfg, ctx):
         self.root, self.author = Path(str(cfg["files_root"])).resolve(), f"""agent:{cfg.get("author") or ctx.job_id}"""   # runs sharing an author (a project's steps) build on each other's pending changes
         if self.root.is_file(): raise RuntimeError(f"agent_loop: Files must be a folder, and {self.root} is a file - set Files to {self.root.parent} and name {self.root.name} in the task")
@@ -129,12 +130,19 @@ class FilesTools:
         if (e := self._mine(self._rel(p))): return e["proposed"]
         if not p.is_file(): raise ToolError(f"no file {rel}")
         return p.read_text(errors="replace")
-    def _files(self, base: Path):
-        if base.is_file(): yield base; return
-        for f in sorted(base.iterdir()):
-            if self._excluded(f.relative_to(self.root)): continue
-            if f.is_dir(): yield from self._files(f)
-            elif f.is_file(): yield f
+    def _new_files(self, base: Path) -> list: return sorted(p for p in (self.root / e["path"] for e in self.shadow.pending() if e.get("author") == self.author) if not p.exists() and (p == base or base in p.parents)) # Proposed by this run, not on disk yet (new files, often in new folders).
+    def _files(self, base: Path, top: bool = True):
+        """Files under base as this run sees them: those on disk, then the new files it proposed there."""
+        if base.is_file():
+            yield base
+            return
+        if top and not base.is_dir() and not self._new_files(base): raise ToolError(f"no file or folder {self._rel(base)} - propose_file creates a new file and any folders it needs")
+        if base.is_dir():
+            for f in sorted(base.iterdir()):
+                if self._excluded(f.relative_to(self.root)): continue
+                if f.is_dir(): yield from self._files(f, top=False)
+                elif f.is_file(): yield f
+        if top: yield from self._new_files(base)
     def _stage(self, rel: str, content: str):
         rel = self._rel(self._path(rel))
         e = self.shadow.get(rel)
@@ -193,7 +201,7 @@ class FilesTools:
         if name == "references": return True, self.index.refs(str(args.get("name", "")))
         if name == "file_map": return True, self.index.file_map(self._rel(self._path(args.get("path"))))
         if name == "read_symbol": return True, self._read_symbol(str(args.get("name", "")), args.get("path") or "")
-        if name == "list_files": return True, "\n".join(r for r in (self._rel(f) for f in self._files(self._path(args.get("path")))) if not args.get("pattern") or fnmatch.fnmatch(r, args["pattern"]) or fnmatch.fnmatch(Path(r).name, args["pattern"])) or "(no files)"
+        if name == "list_files": return True, "\n".join(r + ("" if (self.root / r).exists() else "  (new, proposed)") for r in (self._rel(f) for f in self._files(self._path(args.get("path")))) if not args.get("pattern") or fnmatch.fnmatch(r, args["pattern"]) or fnmatch.fnmatch(Path(r).name, args["pattern"])) or "(no files)"
         if name == "read_file":
             lines = self._text(args["path"]).splitlines()
             a, b = max(1, int(args.get("start") or 1)), int(args.get("end") or 0) or len(lines)
@@ -372,9 +380,15 @@ async def node_agent_loop(config: dict, data: dict, ctx: NodeContext) -> dict:
                 await ctx.stream("text", f"""\n> {c["name"]} {json.dumps(c["arguments"])[:300]}\n""")
                 if c["name"] == "finish": finished = c; break
                 if c["name"] not in {t["name"] for t in offered}: results.append((c, f"""error: unknown or disallowed tool '{c["name"]}'. Available: {", ".join(t["name"] for t in offered)}""")); continue
-                try: ok, res = await owner[c["name"]].call(c["name"], c["arguments"])
-                except ToolError as e: ok, res = False, str(e)
-                results.append((c, ("" if ok else "error: ") + (res if len(res) <= max_chars else f"""{res[:max_chars]}\n[... {len(res) - max_chars} more chars cut - narrow the request]""")))
+                try:
+                    ok, res = await owner[c["name"]].call(c["name"], c["arguments"])
+                except ToolError as e:
+                    ok, res = False, str(e)
+                except Exception as e:   # a fault inside a tool ends this call, not the run; the traceback goes to the server log so the fault is still found and fixed
+                    print(f"[agent_loop] tool {c['name']} failed in job {ctx.job_id}:")
+                    traceback.print_exc()
+                    ok, res = False, f"tool fault {type(e).__name__}: {e} - this is a problem in the tool, not in your request; try another way, and mention it in finish"
+                results.append((c, ("" if ok else "error: ") + (res if len(res) <= max_chars else f"{res[:max_chars]}\n[... {len(res) - max_chars} more chars cut - narrow the request]")))
             if finished:
                 passed, feedback = await _check(config, ctx, owner, str(finished["arguments"].get("summary", "")))
                 if passed: out.update(summary=str(finished["arguments"].get("summary", "")), agent_status="blocked" if finished["arguments"].get("status") == "blocked" else "done"); break
