@@ -2,9 +2,9 @@
 Nothing here is coding-specific. Working on code is the Files toolset (read a folder tree, propose changes into its shadow store) plus knowledge search; an owned space, saved pipelines and outside toolset connections are others.
 Tools use the MCP tool shape - {name, description, inputSchema}, results {content: [{type, text}], isError} - so an MCP server is one more toolset adapter, not a new loop.
 Where writes land is each toolset's own rule, applied in one place per toolset: the agent's own space is written directly (it is that space's sole stakeholder); shared data goes through a shadow stage (a git branch, file_write staging) for its stakeholders to accept."""
-import re, ast, json, time, uuid, fnmatch, builtins, symtable
+import re, ast, json, time, uuid, asyncio, fnmatch, builtins, symtable
 from pathlib import Path
-from tools.ai_manager import engine, resources, connections, steps
+from tools.ai_manager import engine, resources, connections, steps, code_index
 from tools.ai_manager.steps import NodeContext, _pick_capability_conn, _pick_chat_model, _parse_json_config, _opt, get_conn, conns_matching, register_node_type, _sub_run_error
 
 SPACES_DIR = Path("./data/ai_manager/agent_spaces")
@@ -34,11 +34,16 @@ class ToolError(Exception): """A tool-level failure the model should see and cor
 # One toolset owns a group of tools: open() -> context text for the system prompt, tools() -> MCP tool list, call(name, args) -> (ok, text), close() -> outputs for the node result.
 
 class CoreTools:
-    def __init__(self, cfg, ctx): pass
+    """finish, and the run's working notes: kept in the system prompt for the whole run, so what the model found and decided survives when older tool results are removed to fit the context window."""
+    def __init__(self, cfg, ctx): self.notes = ""
     async def open(self) -> str: return ""
-    async def tools(self) -> list: return [_tool("finish", "End the task. Call exactly once, when the task is done or you cannot progress further.", {"summary": _p("string", "what you did, what you verified, what is left undone or uncertain"), "status": _p("string", "done | blocked")}, ["summary"])]
-    async def call(self, name, args): return True, ""
-    async def close(self, status) -> dict: return {}
+    async def tools(self) -> list: return [_tool("finish", "End the task. Call exactly once, when the task is done or you cannot progress further.", {"summary": _p("string", "what you did, what you verified, what is left undone or uncertain"), "status": _p("string", "done | blocked")}, ["summary"]),
+                                           _tool("notes", "Replace your working notes: what you found (files, functions, line numbers), what you decided, what is left to do. They stay in your instructions for the whole run, even after older tool results are removed to save room - write down anything you will need later.", {"text": _p("string", "the full notes (they replace the previous ones)")}, read_only=True)]
+    async def call(self, name, args):
+        self.notes = str(args.get("text", "")).strip()[:6000]
+        return True, f"notes kept ({len(self.notes)} chars)"
+    def pinned(self, system: str) -> str: return f"{system}\n\nYour working notes (the notes tool replaces them):\n{self.notes}" if self.notes else system
+    async def close(self, status) -> dict: return {"notes": self.notes} if self.notes else {}
 
 class SpaceTools:
     """A folder the agent owns (its own partition): read and written directly, kept between runs under the same space name."""
@@ -107,7 +112,7 @@ class FilesTools:
     where the people who own those files accept, reject or diff it. Reads show a file as this run proposed it, so edits build on each other.
     A path another author already has pending is refused: that change belongs to its own review."""
     def __init__(self, cfg, ctx):
-        self.root, self.author = Path(str(cfg["files_root"])).resolve(), f"agent:{ctx.job_id}"
+        self.root, self.author = Path(str(cfg["files_root"])).resolve(), f"""agent:{cfg.get("author") or ctx.job_id}"""   # runs sharing an author (a project's steps) build on each other's pending changes
         if self.root.is_file(): raise RuntimeError(f"agent_loop: Files must be a folder, and {self.root} is a file - set Files to {self.root.parent} and name {self.root.name} in the task")
         if not self.root.is_dir(): raise RuntimeError(f"agent_loop: Files folder {self.root} does not exist")
         self.shadow, self.skip = shadow_for(self.root), [x.strip() for x in str(_FILES_EXCLUDE if cfg.get("files_exclude") is None else cfg["files_exclude"]).split(",") if x.strip()]    
@@ -151,16 +156,43 @@ class FilesTools:
         if not rel.endswith(_CHECKED): return True, f"""{rel}: not checked (only {", ".join(_CHECKED)} files are)"""
         new, earlier = self._diagnose(rel)
         return not new, "\n  ".join([f"{rel}: {len(new)} new problem(s)" if new else f"{rel}: no new problems", *new] + ([f"""already in the file before this run: {"; ".join(earlier)}"""] if earlier else []))
-    async def open(self) -> str: return f"""Files: you can read the folder '{self.root.name}' (list_files, read_file, grep, outline). You cannot change it directly: propose_file and propose_edit stage a change for the people who own these files to review, and read_file then shows your proposed version. Proposals of {" and ".join(_CHECKED)} files are checked (syntax, undefined names, definitions that replace earlier ones) and the result is added to the reply; check_files checks again."""
+    def _guide(self) -> str:
+        """The nearest AGENT.md - in the Files folder or a folder above it (the portal root holds the house rules for every module) - added to the agent's instructions."""
+        f = next((d / "AGENT.md" for d in [self.root, *self.root.parents] if (d / "AGENT.md").is_file()), None)
+        return f"""\n\nHouse rules for this code ({f}):\n{f.read_text(errors="replace")[:8000]}""" if f else ""
+    async def open(self) -> str:
+        self.index = code_index.CodeIndex(self.root, self._excluded)
+        st = await asyncio.to_thread(self.index.update)
+        return self._guide() + f"""\n\nFiles: you can read the folder '{self.root.name}' ({st["files"]} code and text files). Find your way with the code map first - search_code (words), find_symbol (a definition), references (where a name, intent, route, CSS class or element id is used), file_map (a file's sections and functions), read_symbol (one function's source) - then read only the lines you need (read_file with start / end). You can also use list_files, grep and outline. You cannot change it directly: propose_file and propose_edit stage a change for the people who own these files to review, and read_file then shows your proposed version. Proposals of {" and ".join(_CHECKED)} files are checked (syntax, undefined names, definitions that replace earlier ones) and the result is added to the reply; check_files checks again."""
     async def tools(self) -> list: return [
         _tool("list_files", "List files under a folder (hidden, data and generated folders are excluded).", {"path": _p("string", "folder, default the root"), "pattern": _p("string", "optional glob on the name or path, e.g. *.py")}, [], read_only=True),
         _tool("read_file", "Read a file with line numbers. Long files: read a range.", {"path": _p("string", "file path"), "start": _p("integer", "first line, default 1"), "end": _p("integer", "last line, default the end")}, ["path"], read_only=True),
         _tool("grep", "Search file contents with a regular expression. Returns path:line: text.", {"pattern": _p("string", "regular expression"), "path": _p("string", "folder or file, default the root"), "glob": _p("string", "optional file glob, e.g. *.py")}, ["pattern"], read_only=True),
         _tool("outline", "Section headers, classes and functions of a file with line numbers - read this before reading a large file.", {"path": _p("string", "file path")}, read_only=True),
+        _tool("search_code", "Search the code map by words: function, class and section names, their docstrings and signatures, file summaries. Best first step when you do not know where something is.", {"query": _p("string", "a few words, e.g. 'recurring table save cell'")}, read_only=True),
+        _tool("find_symbol", "Where something is defined: function, method, class, constant, route ('/ui/tree'), intent ('finance_rec_cell'), section header, CSS class, element id. Exact name first, then names containing it.", {"name": _p("string", "the name, or part of it"), "kind": _p("string", "optional: function, method, class, constant, route, intent, section, css, html-id")}, ["name"], read_only=True),
+        _tool("references", "Where a name is used across the folder: calls, uses, intents sent by pages, routes posted to, CSS classes and element ids used - grouped by file with line numbers. Check this before changing or renaming anything.", {"name": _p("string", "exact name")}, read_only=True),
+        _tool("file_map", "A file's summary, section headers, classes and functions (with signatures, line ranges and first docstring line) - the way to see a large file without reading it.", {"path": _p("string", "file path")}, read_only=True),
+        _tool("read_symbol", "The source of one function, method, class or constant, with line numbers (your proposed version when you changed the file).", {"name": _p("string", "its name"), "path": _p("string", "file, when the name is defined in more than one")}, ["name"], read_only=True),
         _tool("check_files", "Check files for problems a reader would hit first: Python (syntax as this server compiles it, functions or classes defined twice, undefined names) and JSON. Problems a file already had before this run are listed separately.", {"path": _p("string", "a file; default every file this run proposed")}, [], read_only=True),
         _tool("propose_edit", "Propose replacing one exact, unique block of text in a file. Staged for review, not applied.", {"path": _p("string", "file path"), "old": _p("string", "exact current text, matching once (copy it from read_file without the line numbers)"), "new": _p("string", "replacement text")}),
         _tool("propose_file", "Propose a whole new file, or a full replacement of one. Staged for review, not applied. Prefer propose_edit for changes to existing files.", {"path": _p("string", "file path"), "content": _p("string", "full file content")})]
+    def _read_symbol(self, name: str, rel: str = "") -> str:
+        spans = self.index.span(name, self._rel(self._path(rel)) if rel else "")
+        if not spans: raise ToolError(f"no function, class or constant named {name}{' in ' + rel if rel else ''} - try find_symbol with part of the name")
+        if len(spans) > 1: return "defined more than once - give path:\n" + "\n".join(f"{p}:{a}-{b} ({k})" for p, a, b, k in spans)
+        path, (a, b) = spans[0][0], spans[0][1:3]
+        text = self._text(path)
+        if self._mine(path):   # this run changed the file: positions from its proposed version
+            a, b = next(((x[2], x[3]) for x in code_index.parse(path, text)[1] if x[0] == name and x[1] in ("function", "method", "class", "constant")), (a, b))
+        lines = text.splitlines()
+        return f"{path}\n" + "\n".join(f"{i}: {lines[i - 1]}" for i in range(a, min(b or a, len(lines)) + 1))
     async def call(self, name, args):
+        if name == "search_code": return True, self.index.search(str(args.get("query", "")))
+        if name == "find_symbol": return True, self.index.find(str(args.get("name", "")), str(args.get("kind") or ""))
+        if name == "references": return True, self.index.refs(str(args.get("name", "")))
+        if name == "file_map": return True, self.index.file_map(self._rel(self._path(args.get("path"))))
+        if name == "read_symbol": return True, self._read_symbol(str(args.get("name", "")), args.get("path") or "")
         if name == "list_files": return True, "\n".join(r for r in (self._rel(f) for f in self._files(self._path(args.get("path")))) if not args.get("pattern") or fnmatch.fnmatch(r, args["pattern"]) or fnmatch.fnmatch(Path(r).name, args["pattern"])) or "(no files)"
         if name == "read_file":
             lines = self._text(args["path"]).splitlines()
@@ -320,6 +352,7 @@ async def node_agent_loop(config: dict, data: dict, ctx: NodeContext) -> dict:
             if (engine.load_job(ctx.job_id) or {}).get("status") == "stopping": out["agent_status"] = "stopped"; break
             out["steps"] += 1
             if _compact(messages, budget): await ctx.progress("older tool results removed to fit the context window")
+            messages[0]["content"] = toolsets[0].pinned(system)
             text, thinking, calls = "", "", []
             async for ev in connections.stream_llm_events(conn, [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages], model, think=config.get("think", ""), tools=native_tools, temperature=float(_opt(config, "temperature", 0.2)), num_ctx=int(_opt(config, "num_ctx", 32768))):
                 text, thinking, calls = text + ev["text"], thinking + ev["thinking"], calls + ev["tool_calls"]
@@ -365,12 +398,13 @@ def _pipeline_options(values=None): return [("", "(none)")] + [(p["id"], p.get("
 
 def register(BI, pool_fields, key_map_field):
     F = BI.SettingField
-    register_node_type("agent_loop", node_agent_loop, "Agent (tool-using loop)", in_keys=["input"], out_keys=["summary", "agent_status", "steps", "transcript", "workspace", "branch", "space", "files_root", "staged"], config_schema=[
+    register_node_type("agent_loop", node_agent_loop, "Agent (tool-using loop)", in_keys=["input"], out_keys=["summary", "agent_status", "steps", "transcript", "workspace", "branch", "space", "files_root", "staged", "notes"], config_schema=[
         F("system_prompt", "System Prompt", "textarea", default=_DEFAULT_SYSTEM, hint="Toolset context (e.g. a repo's AGENT.md) and, for text protocol, the tool list are added after it."),
         F("max_steps", "Max Steps (model turns)", "number", default=40, step=1),
         F("space", "Own Space (folder name)", "text", default="", hint="A folder under data/ai_manager/agent_spaces the agent reads and writes directly and keeps between runs. Blank = none."),
         F("files_root", "Files (folder)", "text", default="", hint="A folder the agent may read and propose changes to, e.g. ./tools/ai_manager or ./modules. Changes are staged for review (data/ai_manager/shadow), never written. Blank = none."),
         F("files_exclude", "Files: Exclude (comma-sep patterns)", "text", default=_FILES_EXCLUDE, advanced=True, hint="Names at any depth or paths from the folder (fnmatch: * ?). Excluded files can be neither read nor proposed. The default keeps hidden files (.env), the portal's data folder and generated folders out."),
+        F("author", "Files: Author", "text", default="", advanced=True, hint="Runs with the same author see and build on each other's pending proposals (a project's steps). Blank = this run alone."),
         F("tools_conn_id", "Toolset Connection", "select", default="", options=_toolset_conn_options, advanced=True, hint="Tools served by an outside node (agent_tools_call). Blank = none."),
         F("session_args_json", "Toolset Session Arguments (JSON)", "json", default={}, advanced=True, hint='Sent when the toolset opens a session, e.g. {"base": "main"} for a code workspace.'),
         F("tools_cnode_tags", "Toolset Pool Tags (comma-sep)", "text", default="", advanced=True, hint="With Toolset Connection = pool: narrows the pool to CNodes carrying all these tags."),
