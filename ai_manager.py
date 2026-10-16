@@ -129,6 +129,11 @@ class PipelineBuilderUI:
     def _card_html(self, scope_id, pl) -> str:
         pl_id = pl["id"]
         last_job = self.AIM.engine.load_job(pl.get("last_job_id","")) if pl.get("last_job_id") else None
+        # print("###\n",pl,"\n###")
+        # flow_data = (last_job.get("flow") if last_job else pl.get("flow"))
+        # if isinstance(flow_data, list): nodes = flow_data
+        # elif isinstance(flow_data, dict): nodes = flow_data.get("nodes", [])
+        # else: nodes = []
         nodes = (last_job["flow"]["nodes"] if last_job else pl.get("flow",{}).get("nodes",[]))
         pool = pl.get("pool", self.AIM.engine.DEFAULT_POOL)
         preflight = self._preflight_pipeline(pl)
@@ -529,13 +534,37 @@ class PipelineBuilderUI:
             out[cap] = ("pool_ok", picked[1].get("display_name", picked[1].get("_id",""))) if picked else ("pool_ok", f"""{fallback.get('display_name', fallback['_id'])} (no CNode carries it - first connection declaring {cap})""") if fallback else ("pool_empty", f"{len(candidates)} CNode(s) matched tags/pool, none carry a {cap} connection" if candidates else "no CNode matches this pool's whitelist/blacklist + node tags")
         return out
 
+    # def _preflight_pipeline(self, pl, _visited=None) -> list:
+    #     """One row per node, recursing into called sub-pipelines (pipeline/pipeline_foreach/branch routes) up to a depth guard. _visited prevents infinite recursion on a cyclic pipeline reference."""
+    #     _visited = _visited or set()
+    #     if pl["id"] in _visited or len(_visited) > 20: return []
+    #     _visited = _visited | {pl["id"]}
+    #     rows = []
+    #     for n in pl.get("flow", {}).get("nodes", []):
+    #         needs = self._preflight_node(pl, n)
+    #         called_ids = self._NODE_CALLS.get(n.get("type",""), lambda c: [])(n.get("config", {}))
+    #         sub_pipelines = []
+    #         for cid in called_ids:
+    #             sub_pl = self.AIM.engine.load_pipeline(cid)
+    #             if not sub_pl: sub_pipelines.append({"id": cid, "name": None, "rows": []}); continue
+    #             sub_pipelines.append({"id": cid, "name": sub_pl.get("name", cid), "rows": self._preflight_pipeline(sub_pl, _visited)})
+    #         rows.append({"id": n["id"], "name": n.get("name") or n["id"], "type": n.get("type",""), "needs": needs, "sub_pipelines": sub_pipelines, "recurses": n.get("type","") in self._NODE_RECURSES, "ok": all(v[0] in ("pinned_ok","pool_ok") for v in needs.values()) and all(all(r["ok"] for r in sp["rows"]) for sp in sub_pipelines if sp["name"])})
+    #     return rows
+
     def _preflight_pipeline(self, pl, _visited=None) -> list:
         """One row per node, recursing into called sub-pipelines (pipeline/pipeline_foreach/branch routes) up to a depth guard. _visited prevents infinite recursion on a cyclic pipeline reference."""
         _visited = _visited or set()
         if pl["id"] in _visited or len(_visited) > 20: return []
         _visited = _visited | {pl["id"]}
         rows = []
-        for n in pl.get("flow", {}).get("nodes", []):
+
+        # Robustly resolve nodes whether 'flow' is stored as a dict or a raw list
+        flow_data = pl.get("flow")
+        if isinstance(flow_data, list): nodes = flow_data
+        elif isinstance(flow_data, dict): nodes = flow_data.get("nodes", [])
+        else: nodes = []
+
+        for n in nodes:
             needs = self._preflight_node(pl, n)
             called_ids = self._NODE_CALLS.get(n.get("type",""), lambda c: [])(n.get("config", {}))
             sub_pipelines = []
