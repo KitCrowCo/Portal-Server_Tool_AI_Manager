@@ -214,7 +214,7 @@ class PipelineBuilderUI:
         f, specs, plan = self._plan(pl)
         order = sorted(f.nodes.values(), key=lambda n: plan["waves"].get(n.id, 10**6))   # stable: nodes in the same wave keep their saved order; nodes that never run go last
         badge = lambda n: f"""<span class="dim tiny">wave {plan["waves"][n.id]}</span>""" if n.id in plan["waves"] else f"""<span class="node-miss">never runs - missing {UI.escape(self._missing_text(f, plan, n.id))}</span>"""
-        rows = "".join(f"""<div class="node-row" {self._post("node_form", scope=scope_id, pl_id=pl["id"], nid=n.id)}>{UI.escape(n.name or n.id)} <span class="dim">({UI.escape(n.type)})</span> {badge(n)}</div>""" for n in order) or '<div class="dim">No nodes yet.</div>'
+        rows = "".join(f"""<div class="node-row" {self._post("node_form", scope=scope_id, pl_id=pl["id"], nid=n.id, view="list")}>{UI.escape(n.name or n.id)} <span class="dim">({UI.escape(n.type)})</span> {badge(n)}</div>""" for n in order) or '<div class="dim">No nodes yet.</div>'
         return f"""<div id="pl-node-editor-{p}" class="node-editor">
                         <div class="list-placeholder">Select or add a node.</div>
                         <div class="node-list">{rows}</div>
@@ -225,7 +225,7 @@ class PipelineBuilderUI:
         f, specs, plan = self._plan(pl)
         by_wave: dict = {}
         for n in f.nodes.values(): by_wave.setdefault(plan["waves"].get(n.id, 0), []).append(n)
-        block = lambda n, never: f"""<div class="node-block{" never" if never else ""}" {self._post("node_form", scope=pl.get(self.scope_key,""), pl_id=pl["id"], nid=n.id)}><b>{UI.escape(n.name or n.id)}</b><span class="dim">{UI.escape(n.type)}</span>{self._io_lines(f, specs, n)}{f'<span class="node-miss">missing {UI.escape(self._missing_text(f, plan, n.id))}</span>' if never else ""}</div>"""
+        block = lambda n, never: f"""<div class="node-block{" never" if never else ""}" {self._post("node_form", scope=pl.get(self.scope_key,""), pl_id=pl["id"], nid=n.id, view="graph")}><b>{UI.escape(n.name or n.id)}</b><span class="dim">{UI.escape(n.type)}</span>{self._io_lines(f, specs, n)}{f'<span class="node-miss">missing {UI.escape(self._missing_text(f, plan, n.id))}</span>' if never else ""}</div>"""
         row = lambda lbl, body: f"""<div class="node-graph-row"><span class="node-graph-row-lbl">{lbl}</span>{body}</div>"""
         start = row("start", f"""<div class="node-block" style="cursor:default"><b>Run begins with</b><span class="node-io">{UI.escape(", ".join(self._start_keys(pl)) or "(no keys)")}</span></div>""")
         rows = "".join(row(str(w), "".join(block(n, False) for n in by_wave[w])) for w in sorted(k for k in by_wave if k)) + (row("never", "".join(block(n, True) for n in by_wave[0])) if by_wave.get(0) else "")
@@ -238,6 +238,7 @@ class PipelineBuilderUI:
         header = f"""<div style="display:flex;gap:.4rem;align-items:center;margin-bottom:.5rem">
                          <input type="text" value="{UI.escape(pl.get("name",""))}" class="module-select" {self._post("rename", scope=scope_id, pl_id=pl["id"])} hx-trigger="change" hx-include="this" name="name" style="flex:1">
                          {toggle}
+                         <button type="button" class="cm-qbtn" {self._post("node_form", scope=scope_id, pl_id=pl["id"], view=view)} title="Add a node">+ Node</button>
                          <button type="button" class="btn-icon" {self._post("pool_form", scope=scope_id, pl_id=pl["id"])} title="Resource pool">Pool</button>
                      </div>
                      <label class="dim tiny" style="display:flex;gap:.4rem;align-items:center;margin-bottom:.4rem" title="Keys that exist when a run begins. The Run box gives input; a pipeline called For Each gets its Item Key (e.g. item) plus its Import Keys. Used only to show the run plan.">Run begins with keys<input type="text" name="start_keys" value="{UI.escape(", ".join(self._start_keys(pl)))}" class="module-select" style="flex:1;font-family:var(--font-mono)" {self._post("start_keys", scope=scope_id, pl_id=pl["id"], view=view)} hx-trigger="change" hx-include="this"></label>
@@ -372,14 +373,15 @@ class PipelineBuilderUI:
         blank = '<option value="" selected disabled>-- select node type --</option>' if not selected else ""
         return blank + "".join(f'<option value="{t["type"]}" {"selected" if t["type"]==selected else ""}>{UI.escape(t.get("label",t["type"]))}</option>' for t in self.AIM.steps.list_node_types())
 
-    def _node_form_html(self, scope_id, pl, node=None) -> str:
+    def _node_form_html(self, scope_id, pl, node=None, view: str = "list") -> str:
         p = self.intent_prefix
         nid, is_new = (node or {}).get("id",""), not (node or {}).get("id")
         ntype, config = (node or {}).get("type",""), (node or {}).get("config",{})
         key_map = json.dumps((node or {}).get("key_map",{}), indent=2)
         extra_in, extra_out = ", ".join((node or {}).get("extra_in_keys",[])), ", ".join((node or {}).get("extra_out_keys",[]))
-        del_btn = f"""<button type="button" class="btn-icon" style="color:#ff5f5f" {self._post("node_delete", scope=scope_id, pl_id=pl["id"], nid=nid)} onclick="return confirm('Remove node?')">Remove</button>""" if not is_new else ""
-        return f"""<form {self._post("node_save", scope=scope_id, pl_id=pl["id"], nid=nid) if not is_new else self._post("node_add", scope=scope_id, pl_id=pl["id"])} hx-include="this" class="node-form">
+        del_btn = f"""<button type="button" class="btn-icon" style="color:#ff5f5f" {self._post("node_delete", scope=scope_id, pl_id=pl["id"], nid=nid, view=view)} onclick="return confirm('Remove node?')">Remove</button>""" if not is_new else ""
+        back_btn = f"""<button type="button" class="btn-icon" {self._post("editor_open", scope=scope_id, pl_id=pl["id"], view=view)} title="Back to the nodes, without saving">Back</button>"""
+        return f"""<form {self._post("node_save", scope=scope_id, pl_id=pl["id"], nid=nid, view=view) if not is_new else self._post("node_add", scope=scope_id, pl_id=pl["id"], view=view)} hx-include="this" class="node-form">
                        <input type="hidden" name="pl_id" value="{pl["id"]}">
                        <span class="form-title">{"New Node" if is_new else "Edit Node"}</span>
                        <input type="text" name="name" value="{UI.escape((node or {}).get('name',''))}" placeholder="Node name" class="module-select">
@@ -387,7 +389,7 @@ class PipelineBuilderUI:
                        <div id="pl-node-cfg-{p}">{self._node_config_fields(ntype, config, key_map=(node or {}).get("key_map", {})) if ntype else '<div class="dim">Pick a node type to configure it.</div>'}</div>
                        <label class="dim">Also Wait For (shared keys, comma-sep)<input type="text" name="extra_in_keys" value="{UI.escape(extra_in)}" class="module-select" title="Keys this node needs beyond its Reads - e.g. keys a template uses, or the Import Keys of a Call Pipeline node"></label>
                        <label class="dim">Also Writes (shared keys, comma-sep - labels for the run plan only)<input type="text" name="extra_out_keys" value="{UI.escape(extra_out)}" class="module-select" title="Keys the node really writes but does not declare (an inline script's keys, a called pipeline's export keys). Naming them here only lets the plan show what depends on them; it never makes the node write them."></label>
-                       <div class="form-actions"><button type="submit" class="button">{"Add Node" if is_new else "Save Node"}</button>{del_btn}<span id="pl-node-msg-{p}"></span></div>
+                       <div class="form-actions"><button type="submit" class="button">{"Add Node" if is_new else "Save Node"}</button>{back_btn}{del_btn}<span id="pl-node-msg-{p}"></span></div>
                    </form>"""
 
     async def _im_new_form(self, request, payload, imr):
@@ -408,13 +410,13 @@ class PipelineBuilderUI:
 
     async def _im_editor_open(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
-        return imr.oob(self._editor_html(payload.get("scope",""), pl), f"pl-editor-modal-{self.intent_prefix}") if pl else imr
+        return imr.oob(self._editor_html(payload.get("scope",""), pl, view=payload.get("view","list")), f"pl-editor-modal-{self.intent_prefix}") if pl else imr
 
     async def _im_node_form(self, request, payload, imr):
         pl = self.AIM.engine.load_pipeline(payload.get("pl_id",""))
         if not pl: return imr
         node = next((n for n in pl.get("flow",{}).get("nodes",[]) if n["id"]==payload.get("nid")), None)
-        return imr.oob(self._node_form_html(payload.get("scope",""), pl, node), f"pl-node-editor-{self.intent_prefix}")
+        return imr.oob(self._node_form_html(payload.get("scope",""), pl, node, view=payload.get("view","list")), f"pl-node-editor-{self.intent_prefix}")
 
     async def _im_node_type_change(self, request, payload, imr): return imr.oob(self._node_config_fields(payload.get("node_type",""), {}, self.AIM.engine.load_pipeline(payload.get("pl_id",""))), f"pl-node-cfg-{self.intent_prefix}")
 
@@ -442,7 +444,7 @@ class PipelineBuilderUI:
         if node: node.update(name=payload.get("name","").strip(), type=ntype, config=config, key_map=key_map, extra_in_keys=extra_in, extra_out_keys=extra_out)
         else: flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "name": payload.get("name","").strip(), "type": ntype, "config": config, "key_map": key_map, "extra_in_keys": extra_in, "extra_out_keys": extra_out, "status": "idle"})
         self.AIM.engine.save_pipeline(pl)
-        imr.oob(self._editor_html(payload.get("scope",""), pl), f"pl-editor-modal-{self.intent_prefix}")
+        imr.oob(self._editor_html(payload.get("scope",""), pl, view=payload.get("view","list")), f"pl-editor-modal-{self.intent_prefix}")
         imr.oob("".join(self._node_status_row(n) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
         imr.oob("".join(self._card_html(payload.get("scope",""), p_) for p_ in self._pipelines(payload.get("scope",""))) or '<div class="list-empty">No pipelines.</div>', f"pl-list-{self.intent_prefix}")
         return imr
@@ -453,7 +455,7 @@ class PipelineBuilderUI:
         flow = pl.setdefault("flow", {"nodes": []})
         flow["nodes"] = [n for n in flow["nodes"] if n["id"] != payload.get("nid","")]
         self.AIM.engine.save_pipeline(pl)
-        imr.oob(self._editor_html(payload.get("scope",""), pl), f"pl-editor-modal-{self.intent_prefix}")
+        imr.oob(self._editor_html(payload.get("scope",""), pl, view=payload.get("view","list")), f"pl-editor-modal-{self.intent_prefix}")
         imr.oob("".join(self._node_status_row(n) for n in flow["nodes"]), f"pl-nodetable-{pl['id']}")
         return imr
 

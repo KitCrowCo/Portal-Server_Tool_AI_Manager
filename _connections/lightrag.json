@@ -5,15 +5,17 @@
     "port": {"type": "integer", "label": "Port", "default": 9621},
     "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
     "base_path": {"type": "string", "label": "Base Path", "default": ""},
-    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 2400, "hint": "Max seconds to wait for query/insert - raise on slow indexing"}
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 2400, "hint": "Max seconds to wait for query/insert - raise on slow indexing"},
+    "api_key": {"type": "secret", "label": "API Key", "default": "", "hint": "The server's LIGHTRAG_API_KEY, sent as X-API-Key. Blank = none sent."}
   },
+  "auth_header": {"name": "X-API-Key", "format": "{key}"},
   "domain_notes": {"type": "string", "label": "Domain Notes", "default": "", "hint": "What kind of knowledge lives here - shown under the selector in Kimi."},
   "capabilities": {"knowledge_query": true, "knowledge_insert": true, "knowledge_entities": true},
   "endpoints": {
     "health":         {"method": "GET",    "path": "/health"},
     "query":          {"method": "POST",   "path": "/query", "body": {"query": "{query}", "mode": "{mode}"}, "response_parser": {"content_path": "response"}},
     "query_stream":   {"method": "POST",   "path": "/query/stream", "body": {"query": "{query}", "mode": "{mode}", "stream": true}},
-    "insert_text":    {"method": "POST",   "path": "/documents/text", "body": {"text": "{text}", "file_source": "{source}"}},
+    "insert_text":    {"method": "POST",   "path": "/documents/text", "body": {"text": "{text}", "file_source": "{source}"}, "split_separator": "\n\u241e\n", "split_body": {"chunking": {"strategy": "fixed_token", "params": {"split_by_character": "{separator}", "split_by_character_only": false}}}, "_split_doc": "split_body is merged into the body when a caller gives its own chunk boundaries: the server cuts at split_separator, and still windows a piece longer than its chunk size. Remove split_body for a server whose /documents/text has no chunking field (Kimi > Server shows its API); callers that give boundaries then fail with a message instead of losing them."},
     "insert_texts":   {"method": "POST",   "path": "/documents/texts", "body": {"texts": "{texts}", "file_sources": "{sources}"}},
     "insert_file":    {"method": "POST",   "path": "/documents/upload", "fallback_path": "/documents/file", "file_field": "file"},
     "list_documents": {"method": "GET",    "path": "/documents"},

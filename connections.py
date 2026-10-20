@@ -2,7 +2,7 @@
 Shared utilities for all ai tools conenctions.
 Not a sub-module (no subdirectory/router) - import directly.
 """
-import json, httpx, time, re, asyncio
+import json, httpx, time, re, asyncio, hashlib
 from pathlib import Path
 
 _QUERY_CACHE: dict = {}
@@ -59,11 +59,14 @@ async def list_models_async(conn) -> list:
         return []  # unreachable backend is an external failure, not a program bug - caller shows an empty list and lets the user pick another connection
 
 def list_models_sync(conn) -> list:
+    """Model names from the profile's list_models endpoint, read with its model_list_parser (root_key, name_field); Ollama's /api/tags shape when the profile names neither."""
     if not conn: return []
+    profile = _conn_profile(conn)
+    path, mp = profile.get("endpoints", {}).get("list_models", {}).get("path", "/api/tags"), profile.get("model_list_parser") or {}
     try:
         with httpx.Client(timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)) as c:
-            r = c.get(f"{_base(conn)}/api/tags")
-            return sorted(m["name"] for m in r.json().get("models",[])) if r.status_code==200 else []
+            r = c.get(f"{_base(conn)}{path}", headers=_auth_headers(conn))
+            return sorted(str(m[mp.get("name_field", "name")]) for m in r.json().get(mp.get("root_key", "models"), [])) if r.status_code==200 else []
     except Exception:
         return []
 
@@ -139,7 +142,10 @@ def connection_capabilities(conn: dict) -> dict:
     """What this connection's own profile declares it can do - checked before ever routing a request to it. A missing/false key always means 'not supported', never assumed true."""
     return _conn_profile(conn).get("capabilities", {})
 
-def _auth_headers(conn: dict) -> dict: return {"Authorization": f"""Bearer {conn['values']['api_key']}"""} if conn.get("values", {}).get("api_key") else {}
+def _auth_headers(conn: dict) -> dict:
+    """The connection's api_key in the header its profile names ("auth_header": {"name", "format"}), Authorization: Bearer <key> when the profile names none. No key, no header."""
+    key, spec = conn.get("values", {}).get("api_key"), _conn_profile(conn).get("auth_header") or {"name": "Authorization", "format": "Bearer {key}"}
+    return {spec["name"]: spec["format"].replace("{key}", key)} if key else {}
 
 def _norm_tool_call(tc: dict) -> dict:
     """Ollama sends function.arguments as a dict, OpenAI-shaped providers as a JSON string - every caller gets {id, name, arguments: dict}."""
@@ -166,7 +172,8 @@ async def stream_llm_events(conn: dict, messages: list, model: str, think = Fals
     supports_thinking, think = profile.get("supports_thinking", False), _think_value(think)
     if think and not supports_thinking: print(f"""[stream_llm] '{conn.get('connection_type')}' has no supports_thinking - think={think!r} ignored for this call""")
     options = _resolved_options(profile, kwargs)
-    payload = _render_template(chat_ep.get("body", {}), {"model": model, "messages": messages, "think": (think if supports_thinking else False), "options": options, **options, **({"tools": tools} if tools else {})})
+    think = profile.get("think_map", {}).get(str(think if supports_thinking else False).lower(), think if supports_thinking else False)   # a profile can map on / off / a level to its provider's own value (OpenAI-style reasoning_effort: off -> "none")
+    payload = _render_template(chat_ep.get("body", {}), {"model": model, "messages": messages, "think": think, "options": options, **options, **({"tools": tools} if tools else {})})
     if tools and "tools" not in payload: print(f"""[stream_llm] '{conn.get('connection_type')}' chat body has no {{tools}} placeholder - tools not sent for this call""")
     url = _base(conn) + chat_ep.get("path", "/api/chat")
     parser = profile.get("response_parser", {"stream_format": "jsonl", "content_path": "message.content"})
@@ -276,9 +283,9 @@ async def _lightrag_call(conn, endpoint_name: str, params: dict = None, extra_bo
     if body is not None and extra_body: body = {**body, **extra_body}
     read_timeout = float(conn.get("values", {}).get("timeout_s", 2400))
     async def _do(c, p):
-        if file_bytes is not None: return await c.request(method, _base(conn)+p, files={ep.get("file_field","file"): (file_name, file_bytes)})
-        if method == "GET": return await c.request(method, _base(conn)+p, params=body)
-        return await c.request(method, _base(conn)+p, json=body)
+        if file_bytes is not None: return await c.request(method, _base(conn)+p, files={ep.get("file_field","file"): (file_name, file_bytes)}, headers=_auth_headers(conn))
+        if method == "GET": return await c.request(method, _base(conn)+p, params=body, headers=_auth_headers(conn))
+        return await c.request(method, _base(conn)+p, json=body, headers=_auth_headers(conn))
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=read_timeout, write=60.0, pool=20.0)) as c:
             r = await _do(c, path)
@@ -318,7 +325,7 @@ async def lightrag_query_stream(conn, query: str, mode: str = "mix", **extra):
     read_timeout = float(conn.get("values", {}).get("timeout_s", 2400))
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=read_timeout, write=60.0, pool=20.0)) as c:
-            async with c.stream("POST", _base(conn) + ep.get("path", "/query/stream"), json=body) as resp:
+            async with c.stream("POST", _base(conn) + ep.get("path", "/query/stream"), json=body, headers=_auth_headers(conn)) as resp:
                 if resp.status_code != 200:
                     text = await resp.aread()
                     yield "", None, f"HTTP {resp.status_code}: {text.decode(errors='replace')[:300]}"
@@ -341,8 +348,19 @@ async def lightrag_query(conn, query: str, mode: str = "hybrid", **extra) -> dic
     parser = _lightrag_profile(conn).get("endpoints",{}).get("query",{}).get("response_parser", {"content_path":"response"})
     return {"response": _get_nested_value(r, parser.get("content_path","response")) or r.get("response",""), "raw": r}
 
-async def lightrag_insert_text(conn, text: str, source: str = "") -> dict: return await _lightrag_call(conn, "insert_text", {"text": text, "source": source or "manual entry"})
-async def lightrag_insert_texts(conn, texts: list, source: str = "") -> dict: return await _lightrag_call(conn, "insert_texts", {"texts": texts, "sources": [source or "manual entry"] * len(texts)})   # one document per text; LightRAG still splits any text longer than its own chunk_token_size
+async def lightrag_insert_text(conn, text: str, source: str = "", pieces: list = None) -> dict:
+    """One document. pieces (a list of texts) makes it one document whose chunks are exactly those pieces: they are joined with the profile's split_separator and the profile's split_body
+    tells the server to split there (a piece over the server's chunk size is still windowed by it). A profile without split_body cannot keep the boundaries, and says so instead of inserting."""
+    ep = _lightrag_profile(conn).get("endpoints", {}).get("insert_text", {})
+    if pieces is not None and not ep.get("split_body"): return {"error": "this LightRAG profile has no insert_text.split_body - the server version cannot be told where chunks end; use one document per piece instead"}
+    sep = ep.get("split_separator", "\n␞\n")
+    return await _lightrag_call(conn, "insert_text", {"text": sep.join(pieces) if pieces is not None else text, "source": source or "manual entry"}, extra_body=_render_template(ep["split_body"], {"separator": sep}) if pieces is not None else None)
+
+async def lightrag_insert_texts(conn, texts: list, sources) -> dict:
+    """One document per text. sources: one name per text (current LightRAG refuses a batch whose names repeat, and compares basenames), or one name that lightrag_part_names spreads over the texts."""
+    return await _lightrag_call(conn, "insert_texts", {"texts": texts, "sources": sources if isinstance(sources, list) else lightrag_part_names(sources or "manual entry", texts)})
+
+def lightrag_part_names(name: str, texts: list) -> list: return [f"{name}__part{k + 1:03d}-{len(texts):03d}" for k in range(len(texts))] if len(texts) > 1 else [name]   # "__" as in lightrag_upload_name: a source reads as a folder of its parts
 async def lightrag_insert_file(conn, filename: str, content: bytes) -> dict: return await _lightrag_call(conn, "insert_file", file_bytes=content, file_name=filename)
 async def lightrag_list_documents(conn) -> dict: return await _lightrag_call(conn, "list_documents")
 async def lightrag_delete_document(conn, doc_id: str, delete_file: bool = True) -> dict: return await lightrag_delete_documents(conn, [doc_id], delete_file)
@@ -385,20 +403,57 @@ async def lightrag_doc_index(conn) -> dict:
         if not r.get("pagination", {}).get("has_next"): return out
         page += 1
 
-async def lightrag_replace_file(conn, filename: str, content: bytes, index: dict = None, wait_s: int = 1800) -> dict:
-    """Inserts a file (filename = lightrag_upload_name(...)), first deleting the documents the server already holds under that name - so a changed file replaces its earlier version
-    instead of being refused as a duplicate (current LightRAG answers HTTP 409) or kept beside it. A busy pipeline refuses deletion; this waits for it (checking every 15 s) up to wait_s, then gives up without inserting."""
-    index = await lightrag_doc_index(conn) if index is None else index
-    old = [d["id"] for name in _lr_name_forms(filename) for d in index.get(name, []) if d.get("id")]
-    deadline = time.time() + wait_s
-    while old:
-        r = await lightrag_delete_documents(conn, old)
+def _lr_stored(index: dict, name: str, parts: bool = False) -> list:
+    """The server's documents stored under name in any form earlier ingests used - with parts, also its <name>__partNNN-NNN pieces."""
+    forms = _lr_name_forms(name)
+    return [d for k, ds in index.items() if k in forms or (parts and any(k.startswith(f"{f}__part") for f in forms)) for d in ds]
+
+async def _lr_delete_stored(conn, docs: list, wait_s: int) -> dict:
+    """Deletes docs (from _lr_stored). A busy pipeline refuses deletion; this waits for it (checking every 15 s) up to wait_s, then gives up."""
+    ids, deadline = [d["id"] for d in docs if d.get("id")], time.time() + wait_s
+    while ids:
+        r = await lightrag_delete_documents(conn, ids)
         if _lr_failed(r): return r
         if r.get("status") != "busy": break
-        if time.time() > deadline: return {"error": f"the knowledge server stayed busy for {wait_s} s - earlier version not deleted, file not inserted"}
+        if time.time() > deadline: return {"error": f"the knowledge server stayed busy for {wait_s} s - earlier version not deleted, nothing inserted"}
         await asyncio.sleep(15)
-    r = await lightrag_insert_file(conn, filename, content)
-    return {**r, "replaced": old}
+    return {"deleted": ids}
+
+async def lightrag_replace_file(conn, filename: str, content: bytes, index: dict = None, wait_s: int = 1800) -> dict:
+    """Inserts a file (filename = lightrag_upload_name(...)), first deleting the documents the server already holds under that name - so a changed file replaces its earlier version
+    instead of being refused as a duplicate (current LightRAG answers HTTP 409) or kept beside it."""
+    d = await _lr_delete_stored(conn, _lr_stored(await lightrag_doc_index(conn) if index is None else index, filename), wait_s)
+    if _lr_failed(d): return d
+    return {**await lightrag_insert_file(conn, filename, content), "replaced": d["deleted"]}
+
+# Hashes of what was inserted under each name, per connection - lets "replace_changed" tell an unchanged source from an edited one without reading the server's copy back.
+_MANIFEST_DIR = Path("./data/ai_manager/_knowledge_manifest")
+def _manifest(conn) -> dict: return json.loads(p.read_text()) if (p := _MANIFEST_DIR / f"""{conn.get("_id", "conn")}.json""").exists() else {}
+def _manifest_set(conn, name: str, digest: str):
+    _MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    m = {**_manifest(conn), name: digest}
+    (_MANIFEST_DIR / f"""{conn.get("_id", "conn")}.json""").write_text(json.dumps(m, indent=1, sort_keys=True))
+
+ON_EXISTS = ("skip", "replace_changed", "replace", "fail")
+
+async def lightrag_insert_named(conn, name: str, text: str = "", pieces: list = None, separate: bool = False, on_exists: str = "skip", wait_s: int = 1800) -> dict:
+    """Inserts text (or pieces) under name, deciding first what to do when the server already holds that name:
+    skip - keep what is stored, insert nothing (stored-as-failed documents are reported, not removed: the server's reprocess-failed retries them);
+    replace_changed - replace only when the content differs from what this portal last inserted under the name (a name it never inserted counts as changed);
+    replace - delete what is stored, then insert; fail - insert anyway, so the server refuses the duplicate.
+    pieces with separate=False: one document split at the pieces; separate=True: one document per piece (<name>__partNNN-NNN).
+    Answers {"status": "inserted" | "replaced" | "skipped", "name", "stored": [statuses], "deleted": [ids], "response": server answer}."""
+    if on_exists not in ON_EXISTS: raise ValueError(f"on_exists must be one of {ON_EXISTS}, got {on_exists!r}")
+    digest = hashlib.sha256("\x00".join(pieces if pieces is not None else [text]).encode()).hexdigest()[:16]
+    old = _lr_stored(await lightrag_doc_index(conn), name, parts=True) if on_exists != "fail" else []
+    stored = sorted({str(d.get("status", "")) for d in old})
+    if old and (on_exists == "skip" or (on_exists == "replace_changed" and _manifest(conn).get(name) == digest)): return {"status": "skipped", "name": name, "stored": stored, "deleted": [], "response": {}}
+    d = await _lr_delete_stored(conn, old, wait_s) if old else {"deleted": []}
+    if _lr_failed(d): return d
+    r = await (lightrag_insert_texts(conn, pieces, lightrag_part_names(name, pieces)) if pieces is not None and separate else lightrag_insert_text(conn, text, name, pieces=pieces))
+    if _lr_failed(r): return r
+    _manifest_set(conn, name, digest)
+    return {"status": "replaced" if d["deleted"] else "inserted", "name": name, "stored": stored, "deleted": d["deleted"], "response": r}
 
 async def lightrag_clear_all(conn) -> dict:
     r = await _lightrag_call(conn, "clear_all")

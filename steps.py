@@ -7,7 +7,7 @@ The engine remaps those to actual pipeline keys via the node's key_map and merge
 import re, os, json, sys, asyncio, uuid, time, io, wave, base64, array, difflib, ast, fnmatch, copy
 from pathlib import Path
 from tools.ai_manager import engine, resources, connections
-from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_text, lightrag_insert_texts, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
+from tools.ai_manager.connections import get_conn, lightrag_query, lightrag_insert_named, lightrag_upload_name, lightrag_list_entities, stream_llm, flux2_encode, flux2_generate, list_models_sync, list_conns, conns_matching
 
 _NODE_TYPES: dict = {}
 _EMBED_PATTERNS = ("embed", "minilm", "bge-", "gte-", "e5-", "nomic-embed", "arctic-embed")
@@ -17,7 +17,7 @@ def init(env: dict):
     global ENV
     ENV = env
 
-def register_node_type(name, fn, label="", in_keys=None, out_keys=None, config_schema=None, guide="", mode_out_keys=None): _NODE_TYPES[name] = {"fn": fn, "label": label or name, "in_keys": in_keys or [], "out_keys": out_keys or [], "config_schema": config_schema or [], "guide": guide, "mode_out_keys": mode_out_keys or {}}   # mode_out_keys: {mode: [logical outs]} for types whose outputs depend on config["mode"]
+def register_node_type(name, fn, label="", in_keys=None, out_keys=None, config_schema=None, guide="", mode_out_keys=None, config_out_keys=None): _NODE_TYPES[name] = {"fn": fn, "label": label or name, "in_keys": in_keys or [], "out_keys": out_keys or [], "config_schema": config_schema or [], "guide": guide, "mode_out_keys": mode_out_keys or {}, "config_out_keys": config_out_keys or (lambda config: [])}   # mode_out_keys: {mode: [logical outs]} for types whose outputs depend on config["mode"]; config_out_keys(config): actual keys a node's own config says it writes (Switch cases), for the run plan
 def get_node_type(name: str) -> dict: return _NODE_TYPES.get(name)
 def list_node_types() -> list: return [{"type": k, **{kk: vv for kk, vv in v.items() if kk != "fn"}} for k, v in _NODE_TYPES.items()]
 
@@ -86,7 +86,7 @@ def _split_span(lines: list, a: int, b: int, target: int) -> list:
     return out + [(start, b)]
 
 def _code_chunk(lines: list, path: str, a: int, b: int, section: str, part: str = "") -> dict:
-    symbols = [next(g for g in m.groups() if g) for m in (_SYMBOL_RE.match(l) for l in lines[a - 1:b]) if m]
+    symbols = [next(g for g in m.groups() if g) for m in (_SYMBOL_RE.match(l) for l in lines[a - 1:b] if not _SECTION_RE.match(l)) if m and not (m.group(4) and path.endswith(".py"))]   # in Python a leading # is a comment, not a markdown heading
     return {"text": f"""File: {path or "(unnamed)"} | Section: {section or "-"} | Defines: {", ".join(symbols[:12]) or "-"} | Lines {a}-{b}{part}\n{chr(10).join(lines[a - 1:b])}""", "path": path, "section": section, "symbols": symbols, "start": a, "end": b}
 
 def _chunk_code(text: str, path: str, target: int, ratio: float = 2.0) -> list:
@@ -314,11 +314,11 @@ async def node_file_write(config: dict, data: dict, ctx: NodeContext) -> dict:
     return {"path": path, "status": entry["status"]}
 
 async def node_file_list(config: dict, data: dict, ctx: NodeContext) -> dict:
-    """Relative paths under root. Exclude patterns (fnmatch) match a file or folder name, or a folder's path relative to root; an excluded folder is not walked at all."""
+    """Relative paths under root. Exclude patterns (fnmatch) match a file or folder name, or its path relative to root, or its path including root (so core_files/static/js excludes the same folder whether root is . or ./core_files); an excluded folder is not walked at all."""
     exts = tuple(e.strip().lower() for e in (config.get("extensions","") or "").split(",") if e.strip())
-    skip = [p.strip() for p in str(config.get("exclude") or "").split(",") if p.strip()]
+    skip = [os.path.normpath(p.strip()) for p in str(config.get("exclude") or "").split(",") if p.strip()]
     root, out = Path(config.get("root", "./data/ai_tools/_knowledge")), []
-    hit = lambda name, rel: any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p) for p in skip)
+    hit = lambda name, rel: any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(os.path.normpath(os.path.join(str(root), rel)), p) for p in skip)
     if not root.is_dir(): raise RuntimeError(f"file_list: {root} is not a folder")
     for d, dirs, files in os.walk(root):
         rel_d = os.path.relpath(d, root)
@@ -340,13 +340,15 @@ async def node_knowledge(config: dict, data: dict, ctx: NodeContext) -> dict:
         cnode, conn = picked
     t0 = time.time()
     if mode == "insert":
-        body, label = ctx.resolve_value(config["text_template"]) if config.get("text_template") else ctx.get("input"), ctx.resolve(config.get("source_label") or "")   # no template = this node's own input key, as wired
+        body = ctx.resolve_value(config["text_template"]) if config.get("text_template") else ctx.get("input")   # no template = this node's own input key, as wired
+        name = lightrag_upload_name(ctx.resolve(config.get("source_label") or "") or f"pipeline_{ctx.job_id}_{ctx.node.id}")   # the folder path stays in the name: the server keeps only the last path part
         if body in ("", None): raise RuntimeError("knowledge(insert): nothing to insert - check this node's input wiring or Insert Text Template")
         if body == []: return {"response": "nothing to insert (0 items)", "raw": {}}   # e.g. an empty source file: its chunk list is empty
-        res = await (lightrag_insert_texts(conn, [str(t) for t in body], label) if isinstance(body, list) else lightrag_insert_text(conn, str(body), label))   # a list (e.g. code chunks) goes in as one document per item, so the store keeps those boundaries
+        pieces = [str(t) for t in body] if isinstance(body, list) else None
+        res = await lightrag_insert_named(conn, name, "" if pieces else str(body), pieces=pieces, separate=config.get("insert_as") == "separate", on_exists=config.get("on_exists") or "skip")
         if cnode: resources.log_usage(cnode["id"], "knowledge:insert", time.time()-t0)
-        if not isinstance(res, dict) or res.get("error"): raise RuntimeError(f"""knowledge(insert): {res.get("error") if isinstance(res, dict) else res}""")
-        return {"response": res.get("message") or res.get("status", ""), "raw": res}
+        if res.get("error"): raise RuntimeError(f"""knowledge(insert) {name}: {res["error"]}""")
+        return {"response": f"""{res["status"]} {name}{" (stored: " + ", ".join(res["stored"]) + ")" if res["stored"] else ""}""", "raw": res}
     if mode == "entities":
         entities = await lightrag_list_entities(conn, limit=config.get("limit", 500))
         if cnode: resources.log_usage(cnode["id"], "knowledge:entities", time.time()-t0)
@@ -699,6 +701,22 @@ async def node_route_text(config: dict, data: dict, ctx: NodeContext) -> dict:
         return {"route": "chat", "text": rest, "note": f"""'{r["name"]}' needs the {r.get("role", "owner")} role - treated as conversation"""}
     return {"route": "chat", "text": rest}
 
+_SWITCH_TESTS = {"equals": lambda s, x: s == str(x), "in": lambda s, x: s in [str(i) for i in x], "contains": lambda s, x: str(x) in s, "matches": lambda s, x: re.fullmatch(str(x), s, re.I | re.S) is not None, "empty": lambda s, x: (not s.strip()) == bool(x), "any": lambda s, x: bool(x)}
+
+def _switch_hit(when: dict, v) -> bool:
+    """One Switch rule against one value. Every condition named in the rule must hold; a rule with none always matches. matches = regular expression over the whole value, any case."""
+    if set(when) - set(_SWITCH_TESTS) - {"key"}: raise RuntimeError(f"""switch: unknown condition(s) {sorted(set(when) - set(_SWITCH_TESTS) - {"key"})} - conditions are {sorted(_SWITCH_TESTS)}, plus key""")
+    return all(t("" if v is None else str(v), when[k]) for k, t in _SWITCH_TESTS.items() if k in when)
+
+async def node_switch(config: dict, data: dict, ctx: NodeContext) -> dict:
+    """Writes the keys of the first case whose rule matches (each value a template: {key}, or exactly one {key} for its raw value), else the default's keys, plus 'case'.
+    Keys a case does not write stay absent, so nodes waiting on them stay unreached - that is the whole branch; no script, no model."""
+    fill = lambda m: {k: ctx.resolve_value(t) for k, t in (m or {}).items()}
+    for i, c in enumerate(_parse_json_config(config.get("cases_json"), [])):
+        when = c.get("when") or {}
+        if _switch_hit(when, data.get(when["key"]) if when.get("key") else ctx.get("input")): return {**fill(c.get("set")), "case": str(c.get("name") or i + 1)}
+    return {**fill(_parse_json_config(config.get("default_json"), {})), "case": "default"}
+
 # --- call_capability: any capability a connection's profile declares (video_join, model_list, voice_list, ...) ---
 
 def _resolve_deep(v, ctx: NodeContext):
@@ -876,8 +894,10 @@ def register_builtins():
         BI.SettingField("query_template","Query Template","textarea",default="{input}"),
         BI.SettingField("query_mode","Search Mode","select",default="hybrid",options=[("hybrid","Hybrid"),("local","Local"),("global","Global"),("naive","Naive"),("mix","Mix")], hint="Naive = chunk similarity only: no LLM call at query time (fastest; best for code chunks). The graph modes also ask the store's own LLM for keywords."),
         BI.SettingField("context_only","Retrieved Context Only","checkbox",default=False, hint="Returns the passages found instead of an answer the store's LLM writes from them. Use when another node (or an agent) answers from the context."),
-        BI.SettingField("text_template","Insert Text Template","textarea",advanced=True,hint="Blank = this node's input key as wired. A template that is exactly one {key} holding a list inserts one document per item."),
-        BI.SettingField("source_label","Insert Source Label","text",advanced=True,hint="Stored as each document's file source; supports {key}, e.g. {item}."),
+        BI.SettingField("text_template","Insert Text Template","textarea",advanced=True,hint="Blank = this node's input key as wired. A template that is exactly one {key} holding a list (e.g. code chunks) inserts its items as pieces - see Insert a List As."),
+        BI.SettingField("source_label","Insert Source Label","text",hint="The document's name; supports {key}, e.g. {item}. Folders are kept as __ (core_files/auth.py -> core_files__auth.py): the server keeps only the last path part, so two README.md files would collide. Blank = a name from this run and node."),
+        BI.SettingField("insert_as","Insert a List As","select",default="joined",options=[("joined","One document, chunked at the items"),("separate","One document per item (name__partNNN-NNN)")],advanced=True,hint="Joined keeps one name per source (simple replace / skip, references name the file) and still cuts chunks exactly where the items end."),
+        BI.SettingField("on_exists","If Already Stored","select",default="skip",options=[("skip","Skip (keep what is stored)"),("replace_changed","Replace if changed since this portal inserted it"),("replace","Replace (delete stored, insert)"),("fail","Insert anyway (server refuses: error)")],hint="Replace deletes the stored document and what was extracted only from it. Skip leaves failed documents for the server's reprocess-failed (Kimi > Documents)."),
         BI.SettingField("limit","Entity Limit","number", default=500,step=1,advanced=True),
         *_pool_fields(include_model=False, conn_type="knowledge_query"), _key_map_field()], guide="One node for the three LightRAG operations. Resource pool resolves a lightrag connection the same way Generate resolves an LLM connection.", mode_out_keys={"query": ["response", "raw"], "insert": ["response", "raw"], "entities": ["entities"]})
 
@@ -953,6 +973,12 @@ def register_builtins():
         BI.SettingField("wake_words","Extra Wake Words (comma-sep)","text",hint="Added to the rules' wake list. No wake words = every line is addressed."),
         BI.SettingField("wake_fuzz","Wake Word Tolerance (similarity 0-1, 1 = exact only)","number",default=0.8,hint="The first one or two words may differ this much from a wake word and still count (Tesa, Tess a). Lower accepts more misspellings - and more false wakes."),
         _key_map_field()], guide="Deterministic routing for spoken or typed lines: wake words, the 'awake' in-key (a follow-up window), and rule-matched commands gated by the 'role' in-key. Only 'chat' lines produce 'text', so a model downstream runs only for those.")
+
+    register_node_type("switch", node_switch, "Switch (fill keys by rule - no script, no model)", in_keys=["input"], out_keys=["case"], config_schema=[
+        BI.SettingField("cases_json","Cases (JSON list, first match wins)","json",default=[],hint='[{"name": "python", "when": {"matches": ".*\\.py"}, "set": {"code_path": "{input}"}}, {"name": "text", "when": {"matches": ".*\\.(md|txt)"}, "set": {"text_path": "{input}"}}]. Conditions: equals, in (list), contains, matches (regex, whole value), empty (true/false), any; "key" tests another shared key instead of input (add it to Also Wait For).'),
+        BI.SettingField("default_json","Default (JSON: key -> template)","json",default={},hint='Written when no case matches, e.g. {"other_path": "{input}"}. {} = write nothing, so every downstream branch stays unreached.'),
+        _key_map_field()], guide="A branch without code or a model: tests input (or another key) against each case in order and writes the first matching case's keys. Nodes waiting on keys of the cases that did not match never run. The run plan shows every case's keys as written, since any case may win. 'case' says which case won.",
+        config_out_keys=lambda c: sorted({k for case in _parse_json_config(c.get("cases_json"), []) for k in (case.get("set") or {})} | set(_parse_json_config(c.get("default_json"), {}))))
     
     from tools.ai_manager import agent_loop   # imported here, not at the top: agent_loop imports from this module
     agent_loop.register(BI, _pool_fields, _key_map_field)
