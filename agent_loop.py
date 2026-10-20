@@ -115,7 +115,7 @@ class FilesTools:
     def __init__(self, cfg, ctx):
         self.root, self.author = Path(str(cfg["files_root"])).resolve(), f"""agent:{cfg.get("author") or ctx.job_id}"""   # runs sharing an author (a project's steps) build on each other's pending changes
         if self.root.is_file(): raise RuntimeError(f"agent_loop: Files must be a folder, and {self.root} is a file - set Files to {self.root.parent} and name {self.root.name} in the task")
-        if not self.root.is_dir(): raise RuntimeError(f"agent_loop: Files folder {self.root} does not exist")
+        self.root.mkdir(parents=True, exist_ok=True)   # a Files folder that does not exist yet is created (empty): the run can then propose files into a new project folder; nothing lands there until a proposal is accepted
         self.shadow, self.skip = shadow_for(self.root), [x.strip() for x in str(_FILES_EXCLUDE if cfg.get("files_exclude") is None else cfg["files_exclude"]).split(",") if x.strip()]    
     def _excluded(self, rel: Path) -> bool: return any(fnmatch.fnmatch(part, pat) or fnmatch.fnmatch(str(Path(*rel.parts[:i + 1])), pat) for i, part in enumerate(rel.parts) for pat in self.skip)   # a name at any depth, or a path from the root
     def _path(self, rel) -> Path:

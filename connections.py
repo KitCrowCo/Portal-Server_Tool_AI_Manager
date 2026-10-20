@@ -447,7 +447,8 @@ async def lightrag_insert_named(conn, name: str, text: str = "", pieces: list = 
     digest = hashlib.sha256("\x00".join(pieces if pieces is not None else [text]).encode()).hexdigest()[:16]
     old = _lr_stored(await lightrag_doc_index(conn), name, parts=True) if on_exists != "fail" else []
     stored = sorted({str(d.get("status", "")) for d in old})
-    if old and (on_exists == "skip" or (on_exists == "replace_changed" and _manifest(conn).get(name) == digest)): return {"status": "skipped", "name": name, "stored": stored, "deleted": [], "response": {}}
+    done = [d for d in old if str(d.get("status", "")).lower() == "processed"]   # only a successfully-processed doc counts as "already there": a failed or still-pending one is retried, so a re-run after a crash picks up what did not finish
+    if done and (on_exists == "skip" or (on_exists == "replace_changed" and _manifest(conn).get(name) == digest)): return {"status": "skipped", "name": name, "stored": stored, "deleted": [], "response": {}}
     d = await _lr_delete_stored(conn, old, wait_s) if old else {"deleted": []}
     if _lr_failed(d): return d
     r = await (lightrag_insert_texts(conn, pieces, lightrag_part_names(name, pieces)) if pieces is not None and separate else lightrag_insert_text(conn, text, name, pieces=pieces))
