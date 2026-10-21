@@ -300,12 +300,22 @@ Results come back in <tool_response> blocks. Available tools (JSON schema):
 """
 def _text_protocol(tools: list) -> str: return _TEXT_PROTOCOL + "\n".join(json.dumps({k: t[k] for k in ("name", "description", "inputSchema")}) for t in tools)
 
+def _loads_call(raw: str):
+    """Parse one tool-call block, tolerant of the ways a weaker model mangles it. None when no name can be found."""
+    try: return json.loads(raw)
+    except json.JSONDecodeError: pass
+    fixed = re.sub(r'("name"\s*:\s*"[^"]+")\s*,\s*(\{)', r'\1,"arguments":\2', raw)   # a bare args object with no "arguments": key, e.g. {"name":"x", {args}} - a common small-model slip
+    try: return json.loads(fixed)
+    except json.JSONDecodeError: return None
+
 def _text_calls(text: str) -> list:
     out = []
     for i, raw in enumerate(_CALL_RE.findall(text)):
-        try: obj = json.loads(raw)
-        except json.JSONDecodeError: out.append({"id": f"t{i}", "name": "", "arguments": {"_raw": raw}}); continue
-        out.append({"id": f"t{i}", "name": obj.get("name", ""), "arguments": obj.get("arguments") or obj.get("parameters") or {}})
+        obj = _loads_call(raw)
+        if not isinstance(obj, dict): out.append({"id": f"t{i}", "name": "", "arguments": {"_raw": raw}}); continue
+        args = obj.get("arguments") or obj.get("parameters")
+        if not isinstance(args, dict): args = {k: v for k, v in obj.items() if k != "name"}
+        out.append({"id": f"t{i}", "name": obj.get("name", ""), "arguments": args})
     return out
 
 def _results_message(native: bool, results: list) -> list:
@@ -396,6 +406,12 @@ async def node_agent_loop(config: dict, data: dict, ctx: NodeContext) -> dict:
                 if checks >= int(_opt(config, "max_checks", 3)): out.update(summary=f"""{finished["arguments"].get("summary", "")}\n\nGoal check still failing:\n{feedback}""", agent_status="check_failed"); break
                 results.append((finished, f"""The goal check failed, so the task is not finished:\n{feedback}\nFix this, then call finish again."""))
             messages.extend(_results_message(structured, results))
+            if not finished:   # break a model stuck re-sending the same failing call before it burns the step budget
+                failed_all = bool(results) and all(t.startswith("error") for _, t in results)
+                sig = json.dumps([[c["name"], c["arguments"]] for c in calls], sort_keys=True, default=str) if failed_all else None
+                stuck = stuck + 1 if (failed_all and sig == last_sig) else 0
+                last_sig = sig
+                if stuck >= 2: out.update(summary=f"""stopped: the model repeated the same failing tool call 3 times (tool {calls[0]["name"] or "unparsed"!r}) - likely a malformed tool call or a disallowed tool for this model.""", agent_status="stuck"); break
             engine.publish_live(ctx.job_id, ctx.node.id, {"steps": out["steps"], "transcript": messages})
             ctx.partial = dict(out)
     finally:
