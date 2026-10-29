@@ -1,0 +1,29 @@
+{
+  "_meta": {"schema_version": "1.0", "connection_type": "colibri", "display_name": "colibri (large MoE, experts streamed from disk)", "icon": "&#x25C7;", "description": "colibri's OpenAI-compatible coli serve - DeepSeek V4.1 Flash, GLM-5.x, Kimi K3 and other models llama.cpp does not run. Directly (port 8000), or through llama_direct's /engines/<name> proxy, which starts it on demand and frees the node's memory from llama-server first.", "docs_url": "https://github.com/JustVugg/colibri/blob/main/docs/api.md"},
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1", "required": true},
+    "port": {"type": "integer", "label": "Port", "default": 8790, "required": true, "hint": "8790 = llama_direct (with Base Path /engines/<name>); 8000 = coli serve directly (Base Path blank)"},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": "/engines/colibri", "hint": "/engines/<engine name in llama_direct's engines.json>, or blank when talking to coli serve directly"},
+    "api_key": {"type": "secret", "label": "API Key", "default": "", "hint": "coli serve's COLI_API_KEY, sent as Authorization: Bearer"},
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 36000, "hint": "Disk-streaming prefill of a long prompt can take many minutes before the first token"}
+  },
+  "capabilities": {"chat": true, "list_models": true, "streaming": true, "model_list": true},
+  "endpoints": {
+    "health": {"method": "GET", "path": "/v1/models"},
+    "list_models": {"method": "GET", "path": "/v1/models"},
+    "model_list": {"method": "GET", "path": "/v1/models"},
+    "chat": {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "{model}", "messages": "{messages}", "stream": true, "temperature": "{temperature}", "top_p": "{top_p}", "max_tokens": "{num_predict}", "reasoning_effort": "{think}"}}
+  },
+  "think_map": {"false": "none", "true": "high", "": "none"},
+  "_think_doc": "Thinking off sends reasoning_effort none; on sends high; a level (low, medium, high, max) passes through. colibri maps levels onto the model's own vocabulary (DeepSeek V4: low / high / max).",
+  "options_schema": {
+    "temperature": {"type": "float", "default": 0.6, "min": 0.0, "max": 2.0},
+    "top_p": {"type": "float", "default": 0.95, "min": 0.0, "max": 1.0},
+    "num_predict": {"type": "integer", "default": 4096, "min": 1, "max": 65536, "hint": "sent as max_tokens - a ceiling; colibri clamps it to what the context holds"}
+  },
+  "model_list_parser": {"root_key": "data", "name_field": "id"},
+  "response_parser": {"stream_format": "sse", "content_path": "choices.0.delta.content", "thinking_path": "choices.0.delta.reasoning_content"},
+  "status_map": {"success_codes": [200], "error_key": "error"},
+  "supports_thinking": true
+}

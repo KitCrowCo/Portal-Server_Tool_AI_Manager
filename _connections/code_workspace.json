@@ -1,0 +1,23 @@
+{
+  "_meta": {"schema_version": "1.0", "connection_type": "code_workspace", "display_name": "Code workspace (agent toolset)", "icon": "&#x2387;",
+            "description": "Toolset node for agent_loop: owns one git repo, gives each agent run its own worktree on an ai/<id> branch, and exposes file tools confined to that worktree. Git is the shadow stage - nothing is merged by the node."},
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1", "required": true},
+    "port": {"type": "integer", "label": "Port", "default": 8796, "required": true},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": ""},
+    "api_key": {"type": "secret", "label": "Node Token", "default": "", "hint": "Must match NODE_TOKEN on the node (blank on both = no auth, LAN only)"},
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 900}
+  },
+  "capabilities": {"agent_tools_list": true, "agent_tools_call": true, "agent_session_open": true, "agent_session_close": true, "agent_session_list": true, "agent_session_diff": true, "agent_session_discard": true},
+  "endpoints": {
+    "health": {"method": "GET", "path": "/health"},
+    "agent_tools_list": {"method": "GET", "path": "/api/tools"},
+    "agent_tools_call": {"method": "POST", "path": "/api/tools/call", "body": {"session": "{session}", "name": "{name}", "arguments": "{arguments}"}},
+    "agent_session_open": {"method": "POST", "path": "/api/session/open", "body": {"label": "{label}", "base": "{base}"}},
+    "agent_session_close": {"method": "POST", "path": "/api/session/close", "body": {"session": "{session}", "message": "{message}"}},
+    "agent_session_list": {"method": "GET", "path": "/api/sessions"},
+    "agent_session_diff": {"method": "POST", "path": "/api/session/diff", "body": {"session": "{session}", "path": "{path}"}},
+    "agent_session_discard": {"method": "POST", "path": "/api/session/discard", "body": {"session": "{session}", "confirm": "{confirm}"}}
+  }
+}
