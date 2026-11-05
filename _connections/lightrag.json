@@ -1,0 +1,42 @@
+{
+  "_meta": {"display_name": "LightRAG", "icon": "&#x1F578;", "connection_type": "lightrag", "docs_url": "https://github.com/HKUDS/LightRAG"},
+  "connection": {
+    "host": {"type": "string", "label": "Host", "default": "127.0.0.1"},
+    "port": {"type": "integer", "label": "Port", "default": 9621},
+    "tls": {"type": "boolean", "label": "Use HTTPS", "default": false},
+    "base_path": {"type": "string", "label": "Base Path", "default": ""},
+    "timeout_s": {"type": "integer", "label": "Request Timeout (s)", "default": 2400, "hint": "Max seconds to wait for query/insert - raise on slow indexing"},
+    "api_key": {"type": "secret", "label": "API Key", "default": "", "hint": "The server's LIGHTRAG_API_KEY, sent as X-API-Key. Blank = none sent."}
+  },
+  "auth_header": {"name": "X-API-Key", "format": "{key}"},
+  "domain_notes": {"type": "string", "label": "Domain Notes", "default": "", "hint": "What kind of knowledge lives here - shown under the selector in Kimi."},
+  "capabilities": {"knowledge_query": true, "knowledge_insert": true, "knowledge_entities": true},
+  "endpoints": {
+    "health":         {"method": "GET",    "path": "/health"},
+    "query":          {"method": "POST",   "path": "/query", "body": {"query": "{query}", "mode": "{mode}"}, "response_parser": {"content_path": "response"}},
+    "query_stream":   {"method": "POST",   "path": "/query/stream", "body": {"query": "{query}", "mode": "{mode}", "stream": true}},
+    "insert_text":    {"method": "POST",   "path": "/documents/text", "body": {"text": "{text}", "file_source": "{source}"}, "split_separator": "\n\u241e\n", "split_body": {"chunking": {"strategy": "fixed_token", "params": {"split_by_character": "{separator}", "split_by_character_only": false}}}, "_split_doc": "split_body is merged into the body when a caller gives its own chunk boundaries: the server cuts at split_separator, and still windows a piece longer than its chunk size. Remove split_body for a server whose /documents/text has no chunking field (Kimi > Server shows its API); callers that give boundaries then fail with a message instead of losing them."},
+    "insert_texts":   {"method": "POST",   "path": "/documents/texts", "body": {"texts": "{texts}", "file_sources": "{sources}"}},
+    "insert_file":    {"method": "POST",   "path": "/documents/upload", "fallback_path": "/documents/file", "file_field": "file"},
+    "list_documents": {"method": "GET",    "path": "/documents"},
+    "clear_all":      {"method": "DELETE", "path": "/documents"},
+    "delete_document":{"method": "DELETE", "path": "/documents/delete_document", "body": {"doc_ids": "{doc_ids}", "delete_file": "{delete_file}"}},
+    "list_documents_paginated": {"method": "POST", "path": "/documents/paginated", "body": {"page": "{page}", "page_size": "{page_size}", "sort_field": "{sort_field}", "sort_direction": "{sort_direction}", "status_filter": "{status_filter}"}},
+    "status_counts":  {"method": "GET",    "path": "/documents/status_counts"},
+    "pipeline_status":{"method": "GET",    "path": "/documents/pipeline_status"},
+    "track_status":   {"method": "GET",    "path": "/documents/track_status/{track_id}"},
+    "reprocess_failed":{"method": "POST",  "path": "/documents/reprocess_failed"},
+    "cancel_pipeline":{"method": "POST",   "path": "/documents/cancel_pipeline"},
+    "scan":           {"method": "POST",   "path": "/documents/scan"},
+    "query_data":     {"method": "POST",   "path": "/query/data", "body": {"query": "{query}", "mode": "{mode}"}},
+    "graph":          {"method": "GET",    "path": "/graphs", "fallback_path": "/graph/label/list", "body": {"label": "{label}", "max_depth": "{max_depth}", "max_nodes": "{max_nodes}"}},
+    "graph_labels":   {"method": "GET",    "path": "/graph/label/list"},
+    "openapi":        {"method": "GET",    "path": "/openapi.json"}
+  },
+  "query_options_schema": {
+    "enable_rerank":     {"type": "boolean", "default": null, "label": "Rerank results", "hint": "Uses a reranker model if the server has one configured."},
+    "only_need_context": {"type": "boolean", "default": null, "label": "Vector-only (no LLM synthesis)", "hint": "Returns raw retrieved context, skips LightRAG's own re-synthesis pass."},
+    "top_k":             {"type": "integer", "default": 20, "label": "Top K"},
+    "chunk_top_k":       {"type": "integer", "default": 10, "label": "Chunk Top K"}
+  }
+}
