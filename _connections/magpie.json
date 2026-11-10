@@ -1,0 +1,782 @@
+{
+ "_meta": {
+  "schema_version": "2.0",
+  "connection_type": "magpie",
+  "display_name": "Magpie node",
+  "icon": "&#x25CF;",
+  "description": "A node of this portal's resource pool: one connection and one key for everything it runs. What it can do, what it could do if installed, and where its files are all come from the node itself. A listing or a status check never starts anything."
+ },
+ "prefix_breaking_fields": [
+  "model",
+  "system_prompt",
+  "num_ctx",
+  "kv_cache_type"
+ ],
+ "connection": {
+  "host": {
+   "type": "string",
+   "label": "Host",
+   "default": "127.0.0.1",
+   "required": true
+  },
+  "port": {
+   "type": "integer",
+   "label": "Port",
+   "default": 8790,
+   "required": true
+  },
+  "tls": {
+   "type": "boolean",
+   "label": "Use HTTPS",
+   "default": false
+  },
+  "base_path": {
+   "type": "string",
+   "label": "Base Path",
+   "default": ""
+  },
+  "api_key": {
+   "type": "secret",
+   "label": "API Key",
+   "default": "",
+   "hint": "The node's key: its data/state/first_admin.key on first start, MAGPIE_ADMIN_KEY, or POST /keys. Scope infer is enough for work; installing, settings, files and Fleet actions need admin."
+  },
+  "timeout_s": {
+   "type": "integer",
+   "label": "Request Timeout (s)",
+   "default": 36000
+  }
+ },
+ "live_capabilities": {
+  "path": "/node/capabilities",
+  "ttl_s": 60,
+  "subject": [
+   "chat",
+   "generate",
+   "embed",
+   "decide",
+   "tool_calling",
+   "lora_adapters",
+   "context_cache_save",
+   "context_cache_restore",
+   "context_cache_list",
+   "context_cache_purge",
+   "context_cache_last_restore",
+   "speech_to_text",
+   "text_to_speech",
+   "voice_list",
+   "stt_languages",
+   "speaker_embed",
+   "flux2_image",
+   "flux2_text",
+   "text_to_video",
+   "image_to_video",
+   "start_end_to_video",
+   "video_join",
+   "image_generate",
+   "image_sequence",
+   "text_encode",
+   "image_status",
+   "image_load",
+   "image_unload",
+   "image_stop"
+  ],
+  "map": {
+   "tool_calling": "chat",
+   "lora_adapters": "lora",
+   "context_cache_save": "kv_cache",
+   "context_cache_restore": "kv_cache",
+   "context_cache_list": "kv_cache",
+   "context_cache_purge": "kv_cache",
+   "context_cache_last_restore": "kv_cache",
+   "flux2_image": "image_generate",
+   "flux2_text": "text_encode"
+  }
+ },
+ "capabilities": {
+  "list_models": true,
+  "chat": true,
+  "generate": true,
+  "embed": true,
+  "decide": true,
+  "streaming": true,
+  "model_list": true,
+  "model_info": true,
+  "model_delete": true,
+  "model_pull_hf": true,
+  "context_cache_save": {
+   "models": {}
+  },
+  "context_cache_restore": {
+   "models": {}
+  },
+  "context_cache_list": true,
+  "context_cache_purge": true,
+  "context_cache_last_restore": true,
+  "lora_adapters": true,
+  "tool_calling": {
+   "models": {}
+  },
+  "node_status": true,
+  "request_cancel": true,
+  "node_kill": true,
+  "node_info": true,
+  "speech_to_text": true,
+  "text_to_speech": true,
+  "voice_list": true,
+  "stt_languages": true,
+  "speaker_embed": true,
+  "flux2_image": true,
+  "flux2_text": true,
+  "text_to_video": true,
+  "image_to_video": true,
+  "start_end_to_video": true,
+  "video_join": true,
+  "fleet_events": true,
+  "fleet_state": true,
+  "fleet_apply": true,
+  "fleet_test": true,
+  "fleet_test_cancel": true,
+  "service_control": true,
+  "policy_get": true,
+  "policy_set": true,
+  "module_list": true,
+  "module_activate": true,
+  "image_generate": true,
+  "image_sequence": true,
+  "text_encode": true,
+  "image_status": true,
+  "image_load": true,
+  "image_unload": true,
+  "image_stop": true,
+  "module_info": true,
+  "module_install": true,
+  "module_deactivate": true,
+  "module_remove": true,
+  "setting_set": true,
+  "location_list": true,
+  "location_set": true,
+  "file_list": true,
+  "file_move": true,
+  "file_copy": true,
+  "file_send": true,
+  "file_delete": true,
+  "file_fetch_url": true,
+  "interface": true,
+  "network": true,
+  "channel_list": true,
+  "channel_set": true,
+  "channel_close": true,
+  "rerank": true
+ },
+ "request_id_header": "X-Request-Id",
+ "liveness": {
+  "capability": "node_status",
+  "after_s": 60
+ },
+ "endpoints": {
+  "health": {
+   "method": "GET",
+   "path": "/health"
+  },
+  "list_models": {
+   "method": "GET",
+   "path": "/api/tags"
+  },
+  "chat": {
+   "method": "POST",
+   "path": "/run/chat?shape=ollama",
+   "body": {
+    "model": "{model}",
+    "messages": "{messages}",
+    "stream": true,
+    "think": "{think}",
+    "options": "{options}",
+    "tools": "{tools}"
+   }
+  },
+  "embed": {
+   "method": "POST",
+   "path": "/run/embed",
+   "body": {
+    "model": "{model}",
+    "input": "{input}"
+   }
+  },
+  "decide": {
+   "method": "POST",
+   "path": "/run/decide",
+   "body": {
+    "model": "{model}",
+    "input": "{input}",
+    "choices": "{choices}",
+    "system": "{system}"
+   }
+  },
+  "model_list": {
+   "method": "GET",
+   "path": "/models"
+  },
+  "model_info": {
+   "method": "POST",
+   "path": "/api/show",
+   "body": {
+    "name": "{name}"
+   }
+  },
+  "model_delete": {
+   "method": "DELETE",
+   "path": "/api/delete",
+   "body": {
+    "name": "{name}",
+    "confirm": "{confirm}"
+   }
+  },
+  "model_pull_hf": {
+   "method": "POST",
+   "path": "/api/pull",
+   "body": {
+    "repo": "{repo}",
+    "quant": "{quant}",
+    "filenames": "{filenames}"
+   }
+  },
+  "context_cache_save": {
+   "method": "POST",
+   "path": "/api/cache/save",
+   "body": {
+    "cache_session": "{session}"
+   }
+  },
+  "context_cache_restore": {
+   "method": "POST",
+   "path": "/api/cache/restore",
+   "body": {
+    "cache_session": "{session}"
+   }
+  },
+  "context_cache_list": {
+   "method": "GET",
+   "path": "/api/cache/list"
+  },
+  "context_cache_purge": {
+   "method": "DELETE",
+   "path": "/api/cache",
+   "body": {
+    "file": "{file}"
+   }
+  },
+  "context_cache_last_restore": {
+   "method": "GET",
+   "path": "/api/cache/last_restore"
+  },
+  "lora_available": {
+   "method": "GET",
+   "path": "/api/lora/available"
+  },
+  "lora_list": {
+   "method": "GET",
+   "path": "/api/lora/list"
+  },
+  "lora_set": {
+   "method": "POST",
+   "path": "/api/lora/set",
+   "body": {
+    "adapters": "{adapters}"
+   }
+  },
+  "node_status": {
+   "method": "GET",
+   "path": "/control/status"
+  },
+  "node_info": {
+   "method": "GET",
+   "path": "/node"
+  },
+  "request_cancel": {
+   "method": "POST",
+   "path": "/control/cancel",
+   "body": {
+    "request_id": "{request_id}"
+   }
+  },
+  "node_kill": {
+   "method": "POST",
+   "path": "/control/kill",
+   "body": {
+    "scope": "{scope}",
+    "service": "{service}"
+   }
+  },
+  "speech_to_text": {
+   "method": "POST",
+   "path": "/run/speech_to_text",
+   "body": {
+    "audio_b64": "{audio_b64}",
+    "language": "{language}",
+    "model": "{model}",
+    "vad_filter": "{vad_filter}",
+    "initial_prompt": "{initial_prompt}"
+   }
+  },
+  "text_to_speech": {
+   "method": "POST",
+   "path": "/run/text_to_speech",
+   "body": {
+    "text": "{text}",
+    "voice": "{voice}",
+    "length_scale": "{length_scale}"
+   }
+  },
+  "voice_list": {
+   "method": "GET",
+   "path": "/info/voice_list"
+  },
+  "stt_languages": {
+   "method": "GET",
+   "path": "/info/stt_languages"
+  },
+  "speaker_embed": {
+   "method": "POST",
+   "path": "/run/speaker_embed",
+   "body": {
+    "audio_b64": "{audio_b64}"
+   }
+  },
+  "text_to_video": {
+   "method": "POST",
+   "path": "/run/text_to_video",
+   "body": {
+    "model": "{model}",
+    "prompt": "{prompt}",
+    "negative_prompt": "{negative_prompt}",
+    "width": "{width}",
+    "height": "{height}",
+    "num_frames": "{num_frames}",
+    "fps": "{fps}",
+    "steps": "{steps}",
+    "guidance_scale": "{guidance_scale}",
+    "scheduler": "{scheduler}",
+    "dynamic_cfg": "{dynamic_cfg}",
+    "seed": "{seed}",
+    "formats": "{formats}",
+    "keep_frames": "{keep_frames}",
+    "offload_mode": "{offload_mode}",
+    "name": "{name}"
+   }
+  },
+  "image_to_video": {
+   "method": "POST",
+   "path": "/run/image_to_video",
+   "body": {
+    "model": "{model}",
+    "prompt": "{prompt}",
+    "negative_prompt": "{negative_prompt}",
+    "start_image": "{start_image}",
+    "width": "{width}",
+    "height": "{height}",
+    "num_frames": "{num_frames}",
+    "fps": "{fps}",
+    "steps": "{steps}",
+    "guidance_scale": "{guidance_scale}",
+    "scheduler": "{scheduler}",
+    "dynamic_cfg": "{dynamic_cfg}",
+    "noise_aug_strength": "{noise_aug_strength}",
+    "seed": "{seed}",
+    "formats": "{formats}",
+    "keep_frames": "{keep_frames}",
+    "offload_mode": "{offload_mode}",
+    "name": "{name}"
+   }
+  },
+  "start_end_to_video": {
+   "method": "POST",
+   "path": "/run/start_end_to_video",
+   "body": {
+    "model": "{model}",
+    "prompt": "{prompt}",
+    "negative_prompt": "{negative_prompt}",
+    "start_image": "{start_image}",
+    "end_image": "{end_image}",
+    "width": "{width}",
+    "height": "{height}",
+    "num_frames": "{num_frames}",
+    "fps": "{fps}",
+    "steps": "{steps}",
+    "guidance_scale": "{guidance_scale}",
+    "scheduler": "{scheduler}",
+    "dynamic_cfg": "{dynamic_cfg}",
+    "noise_aug_strength": "{noise_aug_strength}",
+    "seed": "{seed}",
+    "formats": "{formats}",
+    "keep_frames": "{keep_frames}",
+    "offload_mode": "{offload_mode}",
+    "name": "{name}"
+   }
+  },
+  "video_join": {
+   "method": "POST",
+   "path": "/run/video_join",
+   "body": {
+    "clips": "{clips}",
+    "fps": "{fps}",
+    "formats": "{formats}",
+    "drop_shared": "{drop_shared}",
+    "name": "{name}"
+   }
+  },
+  "fleet_events": {
+   "method": "POST",
+   "path": "/fleet/events",
+   "body": {
+    "after": "{after}",
+    "limit": "{limit}"
+   }
+  },
+  "fleet_state": {
+   "method": "GET",
+   "path": "/fleet/state"
+  },
+  "fleet_apply": {
+   "method": "POST",
+   "path": "/fleet/apply",
+   "body": {
+    "id": "{id}",
+    "action": "{action}",
+    "args": "{args}",
+    "dry_run": "{dry_run}",
+    "source": "{source}",
+    "wait": "{wait}"
+   }
+  },
+  "fleet_test": {
+   "method": "POST",
+   "path": "/fleet/test",
+   "body": {
+    "kind": "{kind}",
+    "params": "{params}",
+    "id": "{id}"
+   }
+  },
+  "fleet_test_cancel": {
+   "method": "POST",
+   "path": "/fleet/test/cancel"
+  },
+  "service_control": {
+   "method": "POST",
+   "path": "/services/{name}/{verb}"
+  },
+  "policy_get": {
+   "method": "GET",
+   "path": "/policy"
+  },
+  "policy_set": {
+   "method": "PUT",
+   "path": "/policy",
+   "body": {
+    "rules": "{rules}",
+    "source": "{source}"
+   }
+  },
+  "module_list": {
+   "method": "GET",
+   "path": "/modules"
+  },
+  "module_activate": {
+   "method": "POST",
+   "path": "/modules/{name}/activate"
+  },
+  "image_generate": {
+   "method": "POST",
+   "path": "/run/image_generate",
+   "body_all": true
+  },
+  "image_sequence": {
+   "method": "POST",
+   "path": "/run/image_sequence",
+   "body_all": true
+  },
+  "text_encode": {
+   "method": "POST",
+   "path": "/run/text_encode",
+   "body_all": true
+  },
+  "image_status": {
+   "method": "GET",
+   "path": "/info/image_status"
+  },
+  "image_load": {
+   "method": "POST",
+   "path": "/act/image_load",
+   "body": {
+    "model_path": "{model_path}",
+    "vae_path": "{vae_path}"
+   }
+  },
+  "image_unload": {
+   "method": "POST",
+   "path": "/act/image_unload"
+  },
+  "image_stop": {
+   "method": "POST",
+   "path": "/act/image_stop"
+  },
+  "module_info": {
+   "method": "GET",
+   "path": "/modules/{name}"
+  },
+  "module_install": {
+   "method": "POST",
+   "path": "/modules/{name}/install",
+   "body": {
+    "driver": "{driver}",
+    "options": "{options}",
+    "activate": "{activate}"
+   }
+  },
+  "module_deactivate": {
+   "method": "POST",
+   "path": "/modules/{name}/deactivate"
+  },
+  "module_remove": {
+   "method": "DELETE",
+   "path": "/modules/{name}"
+  },
+  "setting_set": {
+   "method": "PATCH",
+   "path": "/settings",
+   "body": {
+    "path": "{path}",
+    "value": "{value}",
+    "source": "{source}"
+   }
+  },
+  "location_list": {
+   "method": "GET",
+   "path": "/locations"
+  },
+  "location_set": {
+   "method": "PUT",
+   "path": "/locations/{name}",
+   "body": {
+    "path": "{path}",
+    "kind": "{kind}",
+    "move": "{move}"
+   }
+  },
+  "file_list": {
+   "method": "GET",
+   "path": "/files/{location}"
+  },
+  "file_move": {
+   "method": "POST",
+   "path": "/files/move",
+   "body": {
+    "from": "{from}",
+    "to": "{to}",
+    "overwrite": "{overwrite}",
+    "free": "{free}"
+   }
+  },
+  "file_copy": {
+   "method": "POST",
+   "path": "/files/copy",
+   "body": {
+    "from": "{from}",
+    "to": "{to}",
+    "overwrite": "{overwrite}",
+    "free": "{free}"
+   }
+  },
+  "file_send": {
+   "method": "POST",
+   "path": "/files/send",
+   "body": {
+    "from": "{from}",
+    "to": "{to}",
+    "overwrite": "{overwrite}",
+    "free": "{free}",
+    "delete_after": "{delete_after}"
+   }
+  },
+  "file_delete": {
+   "method": "POST",
+   "path": "/files/delete",
+   "body": {
+    "location": "{location}",
+    "path": "{path}",
+    "confirm": "{confirm}"
+   }
+  },
+  "file_fetch_url": {
+   "method": "POST",
+   "path": "/files/fetch",
+   "body_all": true
+  },
+  "interface": {
+   "method": "GET",
+   "path": "/interface"
+  },
+  "network": {
+   "method": "GET",
+   "path": "/network"
+  },
+  "channel_list": {
+   "method": "GET",
+   "path": "/channels"
+  },
+  "channel_set": {
+   "method": "PUT",
+   "path": "/channels/{name}",
+   "body": {
+    "mode": "{mode}",
+    "port": "{port}",
+    "host": "{host}",
+    "allow": "{allow}",
+    "service": "{service}",
+    "to_port": "{to_port}"
+   }
+  },
+  "channel_close": {
+   "method": "DELETE",
+   "path": "/channels/{name}"
+  },
+  "rerank": {
+   "method": "POST",
+   "path": "/run/rerank",
+   "body": {
+    "model": "{model}",
+    "query": "{query}",
+    "documents": "{documents}"
+   }
+  }
+ },
+ "model_list_parser": {
+  "root_key": "models",
+  "name_field": "name",
+  "size_field": "size",
+  "modified_field": "modified_at",
+  "details_field": "details"
+ },
+ "file_fetch": {
+  "path": "/files/outputs/{path}"
+ },
+ "options_schema": {
+  "temperature": {
+   "type": "float",
+   "default": 0.8,
+   "min": 0.0,
+   "max": 2.0
+  },
+  "top_p": {
+   "type": "float",
+   "default": 0.9,
+   "min": 0.0,
+   "max": 1.0
+  },
+  "top_k": {
+   "type": "integer",
+   "default": 40,
+   "min": 1,
+   "max": 200
+  },
+  "min_p": {
+   "type": "float",
+   "default": null
+  },
+  "repeat_penalty": {
+   "type": "float",
+   "default": 1.1,
+   "min": 0.5,
+   "max": 2.0
+  },
+  "num_ctx": {
+   "type": "integer",
+   "default": 16384,
+   "min": 1,
+   "max": 13107200,
+   "hint": "Context window in tokens"
+  },
+  "num_predict": {
+   "type": "integer",
+   "default": -1,
+   "min": -1,
+   "max": 1000000,
+   "hint": "-1 = unlimited (the node applies an engine's own ceiling where it needs one)"
+  },
+  "seed": {
+   "type": "integer",
+   "default": -1,
+   "hint": "-1 = random"
+  },
+  "stop": {
+   "type": "list",
+   "default": []
+  },
+  "kv_cache_type": {
+   "type": "string",
+   "default": "q8_0",
+   "hint": "f16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl"
+  },
+  "cache_session": {
+   "type": "string",
+   "default": "",
+   "hint": "Saved-context key (ring). Blank = shared 'default'"
+  },
+  "ubatch_size": {
+   "type": "integer",
+   "default": null
+  },
+  "batch_size": {
+   "type": "integer",
+   "default": null
+  },
+  "num_gpu": {
+   "type": "integer",
+   "default": null,
+   "hint": "Layers offloaded to GPU"
+  },
+  "flash_attn": {
+   "type": "string",
+   "default": null
+  },
+  "optimize": {
+   "type": "string",
+   "default": null,
+   "hint": "ON | SET | UPPER | LOWER | OFF"
+  },
+  "lora_paths": {
+   "type": "list",
+   "default": [],
+   "hint": "File names in the node's loras folder"
+  },
+  "priority": {
+   "type": "integer",
+   "default": null,
+   "hint": "Above 0: does not wait behind work for what is loaded"
+  }
+ },
+ "supports_thinking": true,
+ "response_parser": {
+  "stream_format": "jsonl",
+  "content_path": "message.content",
+  "thinking_path": "message.thinking",
+  "tool_calls_path": "message.tool_calls"
+ },
+ "status_map": {
+  "success_codes": [
+   200
+  ],
+  "error_key": "error",
+  "stream_done_sentinel": {
+   "key": "done",
+   "value": true
+  }
+ },
+ "knowledge": {
+  "_doc": "A node holding many knowledge groups: listed at groups_path, each reached at base_path, all speaking the wire format named in endpoints_from.",
+  "endpoints_from": "lightrag",
+  "base_path": "/knowledge/{group}",
+  "groups_path": "/knowledge"
+ }
+}
